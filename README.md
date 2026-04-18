@@ -153,7 +153,7 @@ canscope/
 
 ## Code Signing Policy
 
-Release builds are signed by **GDLabs** via SignPath Foundation.
+⚠️ At present the release builds are unsigned. Windows may show a SmartScreen warning — click More info → Run anyway.
 
 ---
 
