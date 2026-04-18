@@ -21,6 +21,16 @@
 | CSV (narrow or wide columnar) | `.csv` | No — pre-decoded |
 
 ---
+## Screenshots
+Stacked plot:
+<img width="3000" height="1500" alt="Stacked_plot" src="https://github.com/user-attachments/assets/91ec3794-cbb9-46ba-a6d2-531d02278bd2" />
+
+Multiple Axis plot:
+<img width="2376" height="1300" alt="Multi_plot" src="https://github.com/user-attachments/assets/efc7b429-befa-4344-bed3-4d5c2151ca98" />
+
+Full tool view:
+<img width="2556" height="1400" alt="BLF Viewer full view" src="https://github.com/user-attachments/assets/239b7dd1-948a-498b-a309-07e967dcc94d" />
+---
 
 ## Features
 
