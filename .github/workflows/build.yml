@@ -1,0 +1,81 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build portable EXE
+        run: pyinstaller CANScope.spec
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\CANScope\CANScope.exe")) {
+            Write-Error "Build failed: CANScope.exe not found"
+            exit 1
+          }
+          Write-Host "Build succeeded."
+
+      - name: Zip dist folder
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zipName = "CANScope_${tag}_Windows.zip"
+          Compress-Archive -Path "dist\CANScope\*" -DestinationPath $zipName
+          Write-Host "Created: $zipName"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CANScope_*_Windows.zip
+          generate_release_notes: false
+          body: |
+            ## CAN Scope ${{ github.ref_name }}
+
+            ### Installation
+            1. Download `CANScope_${{ github.ref_name }}_Windows.zip`
+            2. Unzip anywhere
+            3. Run `CANScope.exe` — no Python installation required
+
+            ### Supported formats
+            - Vector BLF (`.blf`) — requires DBC
+            - Vector ASC (`.asc`) — requires DBC
+            - ASAM MF4 (`.mf4`) — no DBC needed
+            - ASAM MDF (`.mdf`) — no DBC needed
+            - CSV signal files (`.csv`) — no DBC needed
+
+            > ⚠️ This release is unsigned. Windows may show a SmartScreen warning — click **More info → Run anyway**.
+
+            ### Requirements
+            - Windows 10 or later (64-bit)
+
+            ### Changes
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
