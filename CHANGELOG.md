@@ -7,6 +7,52 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.05] — 2025-04-19
+
+### Added
+- **Elapsed time logging** — total file load + decode time is now printed in
+  the Log tab and appended to the Diagnostics tab after every decode.
+  Format: `elapsed: X.X s` (or `X.X min` for long files).
+
+### Performance — MF4/MDF (10–20× improvement)
+- **Vectorised channel-array fast path** — `MDFReader.iter_channel_arrays()`
+  yields one `(meta, ts_arr, num_arr, disp_list)` tuple per channel using
+  numpy operations.  `SignalStore.add_series_bulk()` inserts the entire
+  channel via `array.array.frombytes(ndarray.tobytes())` — a single C-level
+  memcopy.  The old path allocated one Python `DecodedSignalSample` object
+  per sample; for a 500-channel × 10k-sample MF4 that was 5 million heap
+  allocations per decode.
+- **Timestamp normalisation vectorised** — `ts_arr - base_ts` (numpy
+  subtraction) replaces the old per-sample Python subtraction.
+- **Memory** — `del ts_arr / num_arr / eng_arr` after each channel yield
+  frees the source arrays before the next `mdf.get()` call; peak heap RAM
+  is now bounded to ~2 channels at a time regardless of file size.
+- **Streaming intervals adjusted for MDF** — tree update fires once per
+  channel (instant signal discovery); plot refresh every 10 channels;
+  progress log every 50 channels.  Previously intervals were in samples
+  (2k/5k/10k) which caused hundreds of Qt widget rebuilds per channel.
+- **BLF/ASC unaffected** — CAN-raw path is unchanged; same intervals (2k
+  frames / 5k frames / 10k frames).
+
+---
+
+## [v00.00.04] — 2025-04-18
+
+### Fixed
+- **MF4/MDF enum signal plotting** — channels returning string labels
+  (`"ControlMode"`, `"ReadyMode"` etc.) now plot correctly as integer step
+  values.  Root cause: `asammdf` with `raw=False` returns the display string
+  for enum channels, making `float(label)` fail and setting
+  `numeric_value = nan` so nothing appeared on the plot.
+  Fix: detect string-dtype arrays (`dtype.kind in "OUS"`) and fetch the
+  same channel a second time with `raw=True` to obtain the integer key for
+  plotting.  Numeric channels are unaffected (no extra I/O).
+  The cursor table still shows the human-readable label (`value` field);
+  the plot now shows the integer step (`numeric_value` field) — identical
+  behaviour to enum signals decoded from BLF via DBC.
+
+---
+
 ## [v00.00.03] — 2025-04-18
 
 ### Fixed

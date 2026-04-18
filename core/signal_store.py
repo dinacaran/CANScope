@@ -178,6 +178,64 @@ class SignalStore:
                     series.values.append(float('nan'))
             self.total_samples += 1
 
+    def add_series_bulk(
+        self,
+        channel: int | None,
+        message_name: str,
+        message_id: int,
+        signal_name: str,
+        unit: str,
+        timestamps: "np.ndarray",
+        values: "np.ndarray",
+        raw_values: list,
+    ) -> None:
+        """
+        Insert a complete channel time-series in one bulk operation.
+
+        Uses ``array.array.frombytes(ndarray.tobytes())`` which is a single
+        C-level memcopy — no per-sample Python loop, no temporary list.
+        Called by the LoadWorker MDF/CSV fast path.
+
+        Parameters
+        ----------
+        timestamps : float64 ndarray, already normalised (t=0 at recording start)
+        values     : float64 ndarray of numeric values (integer keys for enum)
+        raw_values : list of display values (string labels or floats)
+        """
+        if len(timestamps) == 0:
+            return
+
+        key = self._make_key(channel, message_name, signal_name)
+        if key not in self._series_by_key:
+            series = SignalSeries(
+                channel=channel,
+                message_name=message_name,
+                message_id=message_id,
+                signal_name=signal_name,
+                unit=unit,
+            )
+            self._series_by_key[key] = series
+            sigs = self._signals_by_channel_message[channel][message_name]
+            if signal_name not in sigs:
+                sigs.append(signal_name)
+        else:
+            series = self._series_by_key[key]
+
+        series = self._series_by_key[key]
+
+        # C-level memcopy — no Python loop, no object allocation per sample
+        ts_bytes  = np.asarray(timestamps, dtype=np.float64).tobytes()
+        val_bytes = np.asarray(values,     dtype=np.float64).tobytes()
+        series.timestamps.frombytes(ts_bytes)
+        series.values.frombytes(val_bytes)
+        series.raw_values.extend(raw_values)
+
+        n = len(timestamps)
+        self.total_samples  += n
+        self.decoded_frames += 1        # one "frame" per bulk channel insert
+        self.channels.add(channel)
+        self.message_hits[(channel, message_name)] += n
+
     def add_raw_frame(self, frame: RawFrame, samples: Iterable[DecodedSignalSample]) -> None:
         # Bug 3 fix: stop accumulating after cap to prevent OOM on large BLF files.
         if self._raw_frames_capped:

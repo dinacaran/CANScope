@@ -10,7 +10,7 @@ from gui.main_window import MainWindow
 
 
 APP_NAME = "CAN Scope"
-APP_VERSION = "v00.00.03"
+APP_VERSION = "v00.00.05"
 
 
 def main() -> int:

@@ -56,7 +56,8 @@ class CSVSignalReader:
         Always ``False``.
     """
 
-    has_raw_frames: bool = False
+    has_raw_frames:     bool = False
+    has_channel_arrays: bool = False  # uses sample loop
 
     def __init__(self, csv_path: str | Path) -> None:
         self._path = Path(csv_path)
