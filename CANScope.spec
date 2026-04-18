@@ -20,7 +20,7 @@ hiddenimports = [
     "pyqtgraph",
     "can.io.blf",
     "can.io.asc",
-    "asammdf",,
+    "asammdf",
     "cantools.database",
 ]
 

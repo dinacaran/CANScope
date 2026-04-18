@@ -7,6 +7,14 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.03] — 2025-04-18
+
+### Fixed
+- `CANScope.spec`: syntax error (`"asammdf",,` double comma) that crashed
+  the PyInstaller build step in GitHub Actions
+
+---
+
 ## [v00.00.02] — 2025-04-18
 
 ### Added
