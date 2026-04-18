@@ -177,11 +177,22 @@ class MDFReader:
                 # Ensure float64 timestamps (memcopy-safe for array.array)
                 ts_arr = np.asarray(ts_arr, dtype=np.float64)
 
-                # ── Detect enum / text channel ────────────────────────────
-                is_enum = (
-                    hasattr(eng_arr, "dtype") and
-                    eng_arr.dtype.kind in ("O", "U", "S")
-                )
+                # ── Detect enum / text / bytes channel ───────────────────
+                # dtype.kind 'S' = fixed-length bytes, 'U' = unicode,
+                # 'O' = object array (may hold str, bytes, or np.bytes_).
+                # Also probe the first element: asammdf sometimes returns an
+                # object array whose elements are np.bytes_ scalars — dtype
+                # says "O" but the values are not numeric.
+                def _is_text(arr) -> bool:
+                    if not hasattr(arr, "dtype"):
+                        return False
+                    if arr.dtype.kind in ("U", "S"):
+                        return True
+                    if arr.dtype.kind == "O" and len(arr) > 0:
+                        first = arr.flat[0]
+                        return isinstance(first, (str, bytes, bytearray, np.bytes_))
+                    return False
+                is_enum = _is_text(eng_arr)
 
                 if is_enum:
                     # --- Numeric values: raw integer keys -----------------
@@ -195,30 +206,39 @@ class MDFReader:
                         raw_int = None
 
                     if raw_int is not None:
-                        num_arr = np.asarray(raw_int, dtype=np.float64)
+                        try:
+                            num_arr = np.asarray(raw_int, dtype=np.float64)
+                        except (TypeError, ValueError):
+                            # raw=True also returned text for this channel
+                            num_arr = np.arange(len(ts_arr), dtype=np.float64)
                     else:
                         # Fallback: zeros (at least the plot shows something)
                         num_arr = np.zeros(len(ts_arr), dtype=np.float64)
 
-                    # Display list: decode bytes/strings
+                    # Display list: decode bytes / np.bytes_ / strings
                     disp_list = [
                         v.decode("utf-8", errors="replace").strip()
-                        if isinstance(v, (bytes, bytearray))
+                        if isinstance(v, (bytes, bytearray, np.bytes_))
                         else (v.strip() if isinstance(v, str) else str(v))
                         for v in eng_arr
                     ]
 
                 else:
                     # --- Pure numeric channel (fast path) -----------------
-                    # Single numpy cast — no Python loop
                     try:
                         num_arr = np.asarray(eng_arr, dtype=np.float64)
+                        disp_list = num_arr.tolist()
                     except (TypeError, ValueError):
-                        num_arr = np.full(len(ts_arr), float("nan"),
-                                          dtype=np.float64)
-
-                    # Display list: just the float values (list comp, fast)
-                    disp_list = num_arr.tolist()
+                        # Cast failed — channel contains non-numeric values
+                        # (e.g. np.bytes_ in an object array that the dtype
+                        # probe above missed). Treat as text.
+                        num_arr = np.arange(len(ts_arr), dtype=np.float64)
+                        disp_list = [
+                            v.decode("utf-8", errors="replace").strip()
+                            if isinstance(v, (bytes, bytearray, np.bytes_))
+                            else (v.strip() if isinstance(v, str) else str(v))
+                            for v in eng_arr
+                        ]
 
                 # ── Yield then immediately free source arrays ─────────────
                 # Releasing ts_arr/num_arr/eng_arr before the next mdf.get()

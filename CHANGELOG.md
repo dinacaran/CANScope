@@ -7,6 +7,25 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.06] — 2025-04-19
+
+### Fixed
+- **MF4 crash on large files** — `ValueError: could not convert string to float: np.bytes_(b"")`
+  in `_iter_arrays` when a channel's object array contains `np.bytes_` scalars.
+  Three-layer hardening:
+  1. **Better detection** — `_is_text()` helper probes `arr.flat[0]` for
+     `np.bytes_` / `bytes` / `str` values, not just `dtype.kind` which
+     reported `"O"` without inspecting the element type.
+  2. **Guarded `raw=True` cast** — `np.asarray(raw_int, dtype=float64)` now
+     wraps in `try/except`; if the raw fetch also returns bytes the channel
+     gets an index-based numeric array instead of crashing.
+  3. **Numeric-path fallback** — if the engineering-value cast fails for
+     any other reason, the channel is silently re-routed through the text
+     path rather than raising an unhandled `ValueError`.
+  All three paths now handle `np.bytes_` consistently in the display list.
+
+---
+
 ## [v00.00.05] — 2025-04-19
 
 ### Added
