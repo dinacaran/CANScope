@@ -93,7 +93,6 @@ the latest `CANScope_vXX.XX.XX_Windows.zip`. Unzip and run `CANScope.exe`.
 | `Delete` | Remove selected signal |
 | `Ctrl+S` | Save configuration |
 | `Ctrl+Up/Down` | Reorder signal |
-| `Ctrl+Shift+R` | Raw Frames viewer (BLF/ASC only) |
 
 ---
 
