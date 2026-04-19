@@ -7,6 +7,54 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.08] — 2025-04-19
+
+### Fixed
+- **Raw frame timestamp double-subtraction** — `normalize_timestamps
+  (already_normalized=True)` was subtracting `base_ts` a second time from
+  `RawFrameEntry.time_s`, which was already normalised by LoadWorker before
+  `add_raw_frame()` was called. Result was large negative values (~−1.29e9 s).
+  Fix: the `already_normalized=True` path now returns immediately with no
+  further arithmetic.
+- **Start of Frame column removed** — column was redundant (always identical
+  to Time) and wasted space. Dialog is now 7 columns:
+  `Time (s) | Chn | ID | Name | Dir | DLC | Data / Value`.
+- **Raw frame dialog slow loading** — `addTopLevelItem()` called per row
+  triggered one Qt layout recalculation per frame; 100k frames meant 100k
+  reflows.  Fix: build all `QTreeWidgetItem` objects in memory first, then
+  call `insertTopLevelItems(0, items)` once inside a
+  `setUpdatesEnabled(False/True)` block — single layout pass regardless of
+  row count.  Display is capped at **5,000 visible rows** with a status line
+  showing "Showing X of Y matching frames — narrow the search to see more".
+  Filtering (search, channel, decoded/undecoded) now runs on the raw list
+  before any Qt objects are created, so searches on large files are fast.
+
+---
+
+## [v00.00.07] — 2025-04-19
+
+### Security
+- **Exclude `diskcache` from PyInstaller EXE** — cantools lists `diskcache`
+  as a dependency for its optional DBC caching feature, but CAN Scope never
+  passes `cache_dir` to `cantools.database.load_file()`, so the cache is
+  never created or read.  Added `excludes=['diskcache']` to `CANScope.spec`
+  so the package is not bundled in the portable EXE, eliminating the
+  pickle-deserialization attack surface (Dependabot alert #1, CVE diskcache
+  ≤ 5.6.3).
+
+### Added
+- **Signal name display options** in the selected-signal panel right-click menu.
+  New sub-menu **Signal name display** with two checkboxes:
+  - **Show channel** — prepends `CH0::` to the signal label
+  - **Show message** — prepends `EEC1::` to the signal label
+  Default is signal name only (e.g. `EngSpeed`).  Any combination works
+  (`EEC1::EngSpeed`, `CH0::EngSpeed`, `CH0::EEC1::EngSpeed`).
+  The full `CH::MSG::SIG` key is still stored internally so drag-and-drop,
+  config save/load, cursor values, and all other features are unaffected.
+  Selection is persisted in the configuration JSON.
+
+---
+
 ## [v00.00.06] — 2025-04-19
 
 ### Fixed

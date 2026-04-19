@@ -64,6 +64,9 @@ class PlotPanel(QWidget):
         ])
         self._background_color = '#000000'
         self._cursor1_enabled: bool = True   # mirrors button default
+        # Signal name display flags (default: signal name only)
+        self._name_show_channel: bool = False
+        self._name_show_message: bool = False
         self._cursor2_enabled: bool = False
         self.setAcceptDrops(True)
 
@@ -910,11 +913,32 @@ class PlotPanel(QWidget):
 
     # ── Table ─────────────────────────────────────────────────────────────
 
+    def _format_signal_label(self, key: str) -> str:
+        """
+        Build the display label for a signal in the selected-signal table.
+        Default: signal name only.  Channel and/or message name are prepended
+        when the corresponding display flags are on.
+
+        Key format: 'CH0::EEC1::EngSpeed'  →  parts[0]=CH0, [1]=EEC1, [2]=EngSpeed
+        """
+        parts = key.split('::')
+        if len(parts) < 3:
+            return key   # unexpected format — show as-is
+        ch_part  = parts[0]       # e.g. CH0
+        msg_part = parts[1]       # e.g. EEC1
+        sig_part = '::'.join(parts[2:])  # signal name (may contain :: itself)
+        label = sig_part
+        if self._name_show_message:
+            label = msg_part + '::' + label
+        if self._name_show_channel:
+            label = ch_part + '::' + label
+        return label
+
     def _refresh_table(self) -> None:
         self.table.setRowCount(len(self._items))
         for row, (key, plotted) in enumerate(self._items.items()):
-            signal_item  = QTableWidgetItem(key)
-            signal_item.setData(Qt.ItemDataRole.UserRole, key)
+            signal_item  = QTableWidgetItem(self._format_signal_label(key))
+            signal_item.setData(Qt.ItemDataRole.UserRole, key)   # key unchanged
             cursor1_item = QTableWidgetItem('')
             cursor2_item = QTableWidgetItem('')
             unit_item    = QTableWidgetItem(plotted.series.unit)
@@ -1154,12 +1178,33 @@ class PlotPanel(QWidget):
         rm = QAction(rm_label, menu)
         rm.triggered.connect(self.remove_selected_series)
         menu.addAction(rm)
-        # Fix 1: Set plot background accessible from table right-click
+        # Signal display sub-menu
+        menu.addSeparator()
+        disp_menu = self._make_menu(menu)
+        disp_menu.setTitle('Signal name display')
+        ch_act = QAction('Show channel', disp_menu, checkable=True)
+        ch_act.setChecked(self._name_show_channel)
+        ch_act.triggered.connect(self._toggle_name_channel)
+        disp_menu.addAction(ch_act)
+        msg_act = QAction('Show message', disp_menu, checkable=True)
+        msg_act.setChecked(self._name_show_message)
+        msg_act.triggered.connect(self._toggle_name_message)
+        disp_menu.addAction(msg_act)
+        menu.addMenu(disp_menu)
+        # Set plot background accessible from table right-click
         menu.addSeparator()
         bg_act = QAction('Set plot background color...', menu)
         bg_act.triggered.connect(self._choose_plot_background_color)
         menu.addAction(bg_act)
         menu.exec(global_pos)
+
+    def _toggle_name_channel(self, checked: bool) -> None:
+        self._name_show_channel = bool(checked)
+        self._refresh_table()
+
+    def _toggle_name_message(self, checked: bool) -> None:
+        self._name_show_message = bool(checked)
+        self._refresh_table()
 
     def _on_stacked_scene_click(self, event) -> None:
         """Right-click in stacked plot — detect row and show signal menu."""

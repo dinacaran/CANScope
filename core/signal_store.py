@@ -276,11 +276,10 @@ class SignalStore:
         only the raw_frames need correcting (their timestamps were set before subtraction).
         """
         if already_normalized:
-            # Timestamps in SignalSeries are already correct (subtracted in LoadWorker).
-            # raw_frames store the original absolute timestamps → correct them now.
-            for frame in self.raw_frames:
-                frame.time_s           -= self.base_ts
-                frame.start_of_frame_s -= self.base_ts
+            # SignalSeries timestamps AND raw_frame timestamps are already correct:
+            # LoadWorker does frame.timestamp -= base_ts BEFORE calling
+            # add_raw_frame(), so time_s is already 0-based at storage time.
+            # Nothing to do here.
             return
 
         # Legacy path: full normalisation pass (used if called without LoadWorker)

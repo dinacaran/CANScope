@@ -304,7 +304,9 @@ class MainWindow(QMainWindow):
             'multi_axis': self.btn_multi_axis.isChecked(),
             'stacked': self.btn_stacked.isChecked(),
             'cursor1': self.btn_cursor1.isChecked(),
-            'cursor2': self.btn_cursor2.isChecked(),           # Fix 4
+            'cursor2': self.btn_cursor2.isChecked(),
+            'name_show_channel': self.plot_panel._name_show_channel,
+            'name_show_message': self.plot_panel._name_show_message,           # Fix 4
             'table_column_widths': self.plot_panel.table_column_widths(),  # Fix 2
         }
         path, _ = QFileDialog.getSaveFileName(self, 'Save configuration', 'canscope_config.json', 'JSON Files (*.json)')
@@ -358,6 +360,8 @@ class MainWindow(QMainWindow):
         self.btn_stacked.setChecked(bool(data.get('stacked', False)))     # Fix 4
         self.btn_cursor1.setChecked(bool(data.get('cursor1', True)))
         self.btn_cursor2.setChecked(bool(data.get('cursor2', False)))
+        self.plot_panel._name_show_channel = bool(data.get('name_show_channel', False))
+        self.plot_panel._name_show_message = bool(data.get('name_show_message', False))
         col_widths = data.get('table_column_widths')                       # Fix 2
         if col_widths:
             self.plot_panel.set_table_column_widths([int(w) for w in col_widths])
