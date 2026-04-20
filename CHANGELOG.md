@@ -7,6 +7,25 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.09] — 2025-04-20
+
+### Fixed
+- **EXE crash on startup** — `No module named 'diskcache'` when running the
+  portable build (v00.00.07 regression).  cantools imports `diskcache`
+  unconditionally at module level in its `__init__.py`, so PyInstaller must
+  bundle it even though CAN Scope never activates the cache.
+  Reverted `excludes=['diskcache']` in `CANScope.spec`.
+  The Dependabot pickle-deserialization alert (diskcache ≤ 5.6.3) does not
+  apply: `cache_dir` is never passed to `cantools.database.load_file()`, so
+  no cache directory is ever created or read.  Dismissed with a comment on
+  the GitHub alert.
+
+### Includes all changes from v00.00.08_test01
+- Stacked plot axis labels bottom-anchored and clipped at row top
+  (`_BottomClippedTextItem`, `_StackedLeftAxis`)
+
+---
+
 ## [v00.00.08] — 2025-04-19
 
 ### Fixed

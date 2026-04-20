@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QGraphicsTextItem,
     QColorDialog,
     QGridLayout,
     QHeaderView,
@@ -34,6 +35,87 @@ class PlottedSignal:
     color: str
     axis: Any = None
     view_box: Any = None
+
+
+
+class _BottomClippedTextItem(QGraphicsTextItem):
+    """
+    QGraphicsTextItem that clips itself to a caller-specified local x-extent.
+
+    After pyqtgraph rotates the axis label -90 degrees (CCW):
+      local +x  →  screen UP
+      local +y  →  screen RIGHT (toward data)
+
+    Clipping local x to [0, _max_x] means the label text is only visible
+    from the bottom of the row upward for max_x pixels — it never bleeds
+    into the row above.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._max_x: float = 1e9   # effectively no clip until set_clip_x called
+
+    def set_clip_x(self, max_x: float) -> None:
+        self._max_x = max(0.0, max_x)
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        if self._max_x < 1e8:
+            br = self.boundingRect()
+            # Clip in LOCAL (pre-rotation) space:
+            #   x  [0, _max_x]  — along text direction (= screen UP after rotation)
+            #   y  covers full font height with generous padding
+            painter.setClipRect(
+                QRectF(0, br.y() - 4, self._max_x, br.height() + 8)
+            )
+        super().paint(painter, option, widget)
+
+
+class _StackedLeftAxis(pg.AxisItem):
+    """
+    Left axis for stacked mode:
+    1. Label anchored to BOTTOM of row  (text start = bottom edge)
+    2. Label clipped at TOP of row      (no overflow into row above)
+
+    Coordinate reasoning (pyqtgraph left axis, rotation = -90° CCW):
+      In the AxisItem's local coordinate frame:
+        label.pos().y()  is the screen-y of the text START
+        screen_y = axis_height  →  bottom edge of the row
+      After setting pos to (x, ax_h - MARGIN), the text starts at the
+      bottom and reads upward.  The clip limits local_x to [0, ax_h - 2*MARGIN]
+      so the text stops exactly at the top edge.
+    """
+    _MARGIN = 3   # pixels gap from top/bottom edges
+
+    def __init__(self, orientation, *args, **kwargs):
+        super().__init__(orientation, *args, **kwargs)
+        # Replace pyqtgraph's plain QGraphicsTextItem with our clippable subclass.
+        # The old label is hidden; pyqtgraph will update self.label going forward.
+        if hasattr(self, 'label') and self.label is not None:
+            self.label.setVisible(False)          # hide original
+            new_lbl = _BottomClippedTextItem(self)  # child of AxisItem
+            new_lbl.setRotation(self.label.rotation())
+            self.label = new_lbl                  # pyqtgraph uses this reference
+
+    def resizeEvent(self, ev=None):
+        # super() positions label at center (y = ax_h / 2)
+        super().resizeEvent(ev)
+        self._anchor_label_bottom()
+
+    def _anchor_label_bottom(self) -> None:
+        if not isinstance(getattr(self, 'label', None), _BottomClippedTextItem):
+            return
+        ax_h = self.size().height()
+        if ax_h <= 0:
+            return
+        m = self._MARGIN
+        label = self.label
+
+        # Keep x (axis-width centering set by super) — change only y
+        label.setPos(label.pos().x(), ax_h - m)
+
+        # Clip: prevent text going above top of row
+        # Screen_y of text top = ax_h - m - local_x; want >= m → local_x <= ax_h - 2m
+        label.set_clip_x(max(0.0, ax_h - 2 * m))
 
 
 class PlotPanel(QWidget):
@@ -482,7 +564,12 @@ class PlotPanel(QWidget):
             plotted = self._items[key]
             series  = plotted.series
 
-            p: pg.PlotItem = self.glw.addPlot(row=idx, col=0)
+            # Use custom axis: bottom-anchored, row-clipped label
+            _left_ax = _StackedLeftAxis('left')
+            p: pg.PlotItem = self.glw.addPlot(
+                row=idx, col=0,
+                axisItems={'left': _left_ax}
+            )
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMenuEnabled(False)
 
@@ -497,8 +584,7 @@ class PlotPanel(QWidget):
             else:
                 ylabel = series.signal_name
             # Fix 2: vertical-align middle via CSS on the axis label
-            p.setLabel('left', ylabel, color=plotted.color,
-                        **{'vertical-align': 'middle'})
+            p.setLabel('left', ylabel, color=plotted.color)
             p.getAxis('left').setTextPen(pg.mkPen(plotted.color))
             p.getAxis('left').setWidth(85)
             p.showAxis('right', False)

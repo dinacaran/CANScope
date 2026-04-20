@@ -36,7 +36,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['diskcache'],  # cantools optional caching — not used by CAN Scope
+    # diskcache is listed as a cantools dependency and is imported unconditionally
+    # by cantools at startup. It must be bundled even though CAN Scope never
+    # activates the cache (cache_dir is never passed to load_file()).
+    # The Dependabot pickle-deserialization alert (CVE diskcache <=5.6.3) does
+    # not apply here: no cache directory is ever created or read by this app.
+    excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
