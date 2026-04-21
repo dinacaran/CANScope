@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 APP_NAME    = "CAN Scope"
-APP_VERSION = "v00.00.14"
+APP_VERSION = "v00.00.15"
 
 
 def main() -> int:
@@ -15,7 +15,12 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
 
-    icon_path = Path(__file__).resolve().parent / "resources" / "app_icon.ico"
+    # Resolve resource path for both dev and frozen EXE
+    _res_root = (
+        Path(sys._MEIPASS) if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+        else Path(__file__).resolve().parent
+    )
+    icon_path = _res_root / "resources" / "app_icon.ico"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

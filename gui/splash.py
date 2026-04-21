@@ -11,6 +11,7 @@ something immediately even on slow machines where heavy imports take time.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore  import Qt, QTimer
@@ -18,6 +19,18 @@ from PySide6.QtGui   import (
     QColor, QFont, QFontMetrics, QPainter, QPixmap
 )
 from PySide6.QtWidgets import QSplashScreen, QApplication
+
+
+def _resource_root() -> Path:
+    """
+    Return the root directory where bundled resources live.
+
+    * Frozen EXE (PyInstaller):  sys._MEIPASS  — the temp extraction folder
+    * Development / source run:  the project root (parent of gui/)
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parents[1]
 
 
 # ── Layout constants (tuned to 1635 × 962 splash image) ──────────────────
@@ -55,7 +68,7 @@ class CANScopeSplash(QSplashScreen):
     """
 
     def __init__(self, version: str = '') -> None:
-        img_path = Path(__file__).resolve().parents[1] / 'resources' / 'splashscreen.png'
+        img_path = _resource_root() / 'resources' / 'splashscreen.png'
         if img_path.exists():
             base_pixmap = QPixmap(str(img_path))
         else:

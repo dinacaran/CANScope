@@ -13,6 +13,11 @@ datas = []
 if icon_file.exists():
     datas.append((str(icon_file), "resources"))
 
+# Always bundle the splash screen image
+splash_file = project_root / "resources" / "splashscreen.png"
+if splash_file.exists():
+    datas.append((str(splash_file), "resources"))
+
 hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",

@@ -7,6 +7,23 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.15] — 2025-04-21
+
+### Fixed
+- **Blank splash screen in portable EXE** — two root causes:
+  1. `resources/splashscreen.png` was not listed in `CANScope.spec`'s
+     `datas` — only `app_icon.ico` was conditionally added.  Added an
+     unconditional entry for `splashscreen.png` so PyInstaller always
+     bundles it into the `resources/` subfolder of the extraction directory.
+  2. `gui/splash.py` resolved the image path using
+     `Path(__file__).resolve().parents[1]` which points to the source tree
+     in dev mode but is wrong inside a frozen EXE (where `__file__` is
+     inside `sys._MEIPASS`).  Added `_resource_root()` helper that returns
+     `Path(sys._MEIPASS)` when frozen and the project root otherwise.
+     Same fix applied to the icon path in `app.py`.
+
+---
+
 ## [v00.00.14] — 2025-04-21
 
 ### Changed
