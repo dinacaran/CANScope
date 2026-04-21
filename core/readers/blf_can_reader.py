@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
-from core.blf_reader import BLFReaderService, RawFrame
-from core.dbc_decoder import DBCDecoder, DecodedSignalSample
+from core.blf_reader import BLFReaderService
+from core.models import RawFrame
+from core.dbc_decoder import DBCDecoder
+from core.models import DecodedSignalSample
 
 
 class BLFCANReader:

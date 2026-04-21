@@ -5,8 +5,9 @@ from typing import Iterator
 
 import can
 
-from core.blf_reader import RawFrame
-from core.dbc_decoder import DBCDecoder, DecodedSignalSample
+from core.models import RawFrame
+from core.dbc_decoder import DBCDecoder
+from core.models import DecodedSignalSample
 
 
 class ASCReadError(RuntimeError):

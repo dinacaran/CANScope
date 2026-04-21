@@ -5,7 +5,7 @@ from typing import Iterator
 
 import numpy as np
 
-from core.dbc_decoder import DecodedSignalSample
+from core.models import DecodedSignalSample
 
 
 class MDFImportError(RuntimeError):

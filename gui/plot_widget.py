@@ -145,6 +145,11 @@ class PlotPanel(QWidget):
             '#a65628', '#f781bf', '#17becf', '#bcbd22', '#1f77b4',
         ])
         self._background_color = '#000000'
+        # Undo stack — stores (items_snapshot, current_key) tuples
+        # Each snapshot is a shallow copy of _items key order + color.
+        # Limited to _UNDO_DEPTH entries (oldest dropped first).
+        self._undo_stack: list[tuple[dict, str | None]] = []
+        self._UNDO_DEPTH: int = 3
         self._cursor1_enabled: bool = True   # mirrors button default
         # Signal name display flags (default: signal name only)
         self._name_show_channel: bool = False
@@ -196,8 +201,8 @@ class PlotPanel(QWidget):
         # ── Cursor 1: draggable vertical line (ON by default) ─────────────
         self.v_line = pg.InfiniteLine(
             angle=90, movable=True,
-            pen=pg.mkPen(color='#f0e040', width=1.5),
-            label='C1', labelOpts={'color': '#f0e040', 'position': 0.95}
+            pen=pg.mkPen(color='#0000ff', width=1.5),
+            label='C1', labelOpts={'color': '#0000ff', 'position': 0.95}
         )
         self.h_line = pg.InfiniteLine(angle=0, movable=False,
                                       pen=pg.mkPen(color='#555', width=1))
@@ -208,8 +213,8 @@ class PlotPanel(QWidget):
         # ── Cursor 2: draggable, off by default ──────────────────────────
         self.v_line2 = pg.InfiniteLine(
             angle=90, movable=True,
-            pen=pg.mkPen(color='#40c0f0', width=1.5, style=Qt.PenStyle.DashLine),
-            label='C2', labelOpts={'color': '#40c0f0', 'position': 0.85}
+            pen=pg.mkPen(color='#0000ff', width=1.5, style=Qt.PenStyle.DashLine),
+            label='C2', labelOpts={'color': '#0000ff', 'position': 0.85}
         )
         self.v_line2.sigPositionChanged.connect(self._on_cursor2_moved)
         # v_line2 not added to plot until cursor 2 is enabled
@@ -313,12 +318,13 @@ class PlotPanel(QWidget):
         if enabled:
             self.v_line.setPos(cx)
             if self._stacked_mode:
-                # Stacked: show/move per-row lines (already in plots from _rebuild_stacked)
-                for line in self._stacked_c1_lines:
+                # Stacked: show/move per-row lines; label only on bottom row
+                last = len(self._stacked_c1_lines) - 1
+                for i, line in enumerate(self._stacked_c1_lines):
                     line.setPos(cx)
-                    line.setPen(pg.mkPen(color='#f0e040', width=1.5))
+                    line.setPen(pg.mkPen(color='#0000ff', width=1.5))
                     if hasattr(line, 'label') and line.label is not None:
-                        line.label.setVisible(True)
+                        line.label.setVisible(i == last)
             else:
                 # Normal/multi-axis: v_line lives in self.plot only
                 try: self.plot.addItem(self.v_line, ignoreBounds=True)
@@ -356,12 +362,13 @@ class PlotPanel(QWidget):
                 # Rebuild stacked rows with C2 lines (triggers _rebuild_curves)
                 # If lines already exist, just show them
                 if self._stacked_c2_lines:
-                    for line in self._stacked_c2_lines:
+                    last2 = len(self._stacked_c2_lines) - 1
+                    for i, line in enumerate(self._stacked_c2_lines):
                         line.setPos(cx2)
-                        line.setPen(pg.mkPen(color='#40c0f0', width=1.5,
+                        line.setPen(pg.mkPen(color='#0000ff', width=1.5,
                                              style=Qt.PenStyle.DashLine))
                         if hasattr(line, 'label') and line.label is not None:
-                            line.label.setVisible(True)
+                            line.label.setVisible(i == last2)
                 else:
                     # Rebuild to add C2 lines to all rows
                     self._rebuild_curves(preserve_selection=True)
@@ -393,6 +400,7 @@ class PlotPanel(QWidget):
     def add_series(self, key: str, series: SignalSeries, color: str | None = None) -> None:
         if key in self._items:
             return
+        self._push_undo()
         color = color or next(self._color_cycle)
         self._items[key] = PlottedSignal(key=key, series=series, curve=None, color=color)
         if self._current_key is None:
@@ -446,8 +454,8 @@ class PlotPanel(QWidget):
         # Recreate draggable cursor lines preserving movable=True
         self.v_line = pg.InfiniteLine(
             angle=90, movable=True,
-            pen=pg.mkPen(color='#f0e040', width=1.5),
-            label='C1', labelOpts={'color': '#f0e040', 'position': 0.95}
+            pen=pg.mkPen(color='#0000ff', width=1.5),
+            label='C1', labelOpts={'color': '#0000ff', 'position': 0.95}
         )
         self.h_line = pg.InfiniteLine(angle=0, movable=False,
                                       pen=pg.mkPen(color='#555', width=1))
@@ -462,8 +470,8 @@ class PlotPanel(QWidget):
                 pass
             self.v_line2 = pg.InfiniteLine(
                 angle=90, movable=True,
-                pen=pg.mkPen(color='#40c0f0', width=1.5, style=Qt.PenStyle.DashLine),
-                label='C2', labelOpts={'color': '#40c0f0', 'position': 0.85}
+                pen=pg.mkPen(color='#0000ff', width=1.5, style=Qt.PenStyle.DashLine),
+                label='C2', labelOpts={'color': '#0000ff', 'position': 0.85}
             )
             self.v_line2.sigPositionChanged.connect(self._on_cursor2_moved)
             self.plot.addItem(self.v_line2, ignoreBounds=True)
@@ -615,10 +623,12 @@ class PlotPanel(QWidget):
             # Each row gets its own InfiniteLine instance.
             # A QGraphicsItem can only belong to ONE scene — sharing across
             # GLW rows causes crashes. Sync is done in _on_stacked_c1/c2_moved.
+            _c1_label     = 'C1' if idx == n - 1 else ''
+            _c1_labelOpts = {'color': '#0000ff', 'position': 0.95} if idx == n - 1 else {}
             c1 = pg.InfiniteLine(
                 angle=90, movable=True,
-                pen=pg.mkPen(color='#f0e040', width=1.5),
-                label='C1', labelOpts={'color': '#f0e040', 'position': 0.95}
+                pen=pg.mkPen(color='#0000ff', width=1.5),
+                label=_c1_label, labelOpts=_c1_labelOpts
             )
             c1.setPos(self.v_line.value())
             c1.sigPositionChanged.connect(self._on_stacked_c1_moved)
@@ -632,11 +642,13 @@ class PlotPanel(QWidget):
             self._stacked_c1_lines.append(c1)
 
             if self._cursor2_enabled:
+                _c2_label     = 'C2' if idx == n - 1 else ''
+                _c2_labelOpts = {'color': '#0000ff', 'position': 0.85} if idx == n - 1 else {}
                 c2 = pg.InfiniteLine(
                     angle=90, movable=True,
-                    pen=pg.mkPen(color='#40c0f0', width=1.5,
+                    pen=pg.mkPen(color='#0000ff', width=1.5,
                                  style=Qt.PenStyle.DashLine),
-                    label='C2', labelOpts={'color': '#40c0f0', 'position': 0.85}
+                    label=_c2_label, labelOpts=_c2_labelOpts
                 )
                 c2.setPos(self.v_line2.value())
                 c2.sigPositionChanged.connect(self._on_stacked_c2_moved)
@@ -933,6 +945,7 @@ class PlotPanel(QWidget):
     def set_series_color(self, key: str, color: str) -> None:
         if key not in self._items:
             return
+        self._push_undo()
         self._items[key].color = color
         self._apply_curve_style(self._items[key])
         self._refresh_table()
@@ -1052,9 +1065,45 @@ class PlotPanel(QWidget):
 
     # ── Series management ─────────────────────────────────────────────────
 
+    # ── Undo ──────────────────────────────────────────────────────────────
+
+    def _push_undo(self) -> None:
+        """
+        Snapshot current plot state onto the undo stack.
+        Snapshot captures: signal key order, per-signal color, current selection.
+        SeriesSignal objects are NOT deep-copied (their data is immutable after load).
+        """
+        snapshot = {
+            k: PlottedSignal(
+                key=v.key, series=v.series,
+                curve=None,          # curves are always rebuilt
+                color=v.color,
+                axis=None,
+                view_box=None,
+            )
+            for k, v in self._items.items()
+        }
+        self._undo_stack.append((snapshot, self._current_key))
+        if len(self._undo_stack) > self._UNDO_DEPTH:
+            self._undo_stack.pop(0)
+
+    def undo(self) -> None:
+        """Restore the previous plot state (up to _UNDO_DEPTH levels)."""
+        if not self._undo_stack:
+            return
+        snapshot, prev_key = self._undo_stack.pop()
+        self._items = snapshot
+        self._current_key = prev_key if prev_key in snapshot else next(iter(snapshot), None)
+        self._rebuild_curves(preserve_selection=False)
+        self._set_axis_label(self._current_key)
+        self._update_empty_state_ui()
+        if self._items:
+            self.fit_to_window()
+
     def remove_series(self, key: str) -> None:
         if key not in self._items:
             return
+        self._push_undo()
         self._items.pop(key)
         if self._current_key == key:
             self._current_key = next(iter(self._items), None)
@@ -1064,6 +1113,7 @@ class PlotPanel(QWidget):
         self.fit_to_window()
 
     def remove_selected_series(self) -> None:
+        self._push_undo()
         for key in list(self.selected_keys()):
             self._items.pop(str(key), None)
         self._current_key = next(iter(self._items), None)
@@ -1073,6 +1123,7 @@ class PlotPanel(QWidget):
         self.fit_to_window()
 
     def clear_all(self) -> None:
+        self._push_undo()
         self._items.clear()
         self._clear_rendered_items()
         self.table.setRowCount(0)
@@ -1091,6 +1142,7 @@ class PlotPanel(QWidget):
         keys  = self.selected_keys()
         if not keys:
             return
+        self._push_undo()
         order = list(self._items.keys())
         if direction < 0:
             for key in keys:

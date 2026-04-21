@@ -7,6 +7,83 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.14] — 2025-04-21
+
+### Changed
+- **Reverted lazy import of cantools** — restored v00.00.11 startup behaviour.
+  `core/readers/base.py` re-links to `core.dbc_decoder` (which imports
+  `cantools` at startup) rather than the lightweight `core.models`.
+  Reason: the first BLF/ASC file load felt slightly slower in v00.00.13
+  because cantools was deferred until that point; startup + first-load
+  combined felt less responsive than the original eager-load pattern.
+  Splash screen (`gui/splash.py`, `resources/splashscreen.png`) is retained.
+  `core/models.py` is retained (used by all other modules).
+
+---
+
+## [v00.00.13] — 2025-04-20
+
+### Fixed
+- **BLF/ASC load crash** — `SyntaxError: from __future__ imports must occur
+  at the beginning of the file` in `blf_reader.py`.  Caused by the v00.00.12
+  refactor that prepended `from core.models import RawFrame` before the
+  `from __future__ import annotations` line.  Fixed ordering so
+  `from __future__` is always line 1.
+
+---
+
+## [v00.00.12] — 2025-04-20
+
+### Added
+- **Splash screen** — displayed immediately on launch before any heavy
+  modules are loaded.  Shows the `resources/splashscreen.png` image scaled
+  to 60% of screen height, with a live loading-status line rendered inside
+  the frosted-glass panel area and the version string overlaid in the
+  bottom-right corner.  Dismisses automatically when `MainWindow` is ready.
+
+### Performance — startup time improvement
+- **Lazy import of heavy dependencies** — extracted `RawFrame` and
+  `DecodedSignalSample` dataclasses into a new `core/models.py` module that
+  has zero heavy dependencies.  Previously, the import chain
+  `app → main_window → load_worker → readers/base → dbc_decoder → cantools`
+  caused `cantools` (and transitively `diskcache`) to be imported eagerly at
+  startup even though they are only needed when a BLF/ASC file is actually
+  loaded.  Now `cantools` and `python-can` are only imported inside
+  `reader_factory()` when the first file is opened.
+- **Splash shown before heavy imports** — `app.py` now shows the splash
+  screen before `from gui.main_window import MainWindow`, so the user sees
+  the splash image immediately while pyqtgraph, cantools and other packages
+  finish loading in the background.
+
+---
+
+## [v00.00.11] — 2025-04-20
+
+### Added
+- **Undo** (`Ctrl+Z`) — restores the previous plot state, up to 3 levels deep.
+  Covered actions: add signal, remove signal, remove selected, clear all plots,
+  reorder (move up/down), change signal colour.  Each undo step restores signal
+  key order and per-signal colour; signal data is never re-decoded.
+  Undo history is cleared when a new file is loaded.
+- **Shortcuts dialog** — new **Shortcuts** button on the toolbar (after Clear
+  Plots). Opens a popup listing all keyboard shortcuts with descriptions.
+  All shortcuts defined in one `_SHORTCUTS` list so the dialog is always in
+  sync with the actual bindings.
+
+---
+
+## [v00.00.10] — 2025-04-20
+
+### Changed
+- **Cursor line colour** — both C1 and C2 are now blue (`#0000ff`).
+  C1 = solid blue, C2 = dashed blue. Previously C1 was yellow and C2 cyan.
+- **Stacked plot cursor labels** — "C1" / "C2" text labels now appear only
+  on the **bottom-most row** instead of every row.  Every other row still
+  shows the cursor line itself; the label clutter is gone.
+  This applies both at initial render and when toggling cursors on/off.
+
+---
+
 ## [v00.00.09] — 2025-04-20
 
 ### Fixed

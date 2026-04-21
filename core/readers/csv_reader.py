@@ -6,7 +6,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Iterator
 
-from core.dbc_decoder import DecodedSignalSample
+from core.models import DecodedSignalSample
 
 
 class CSVReadError(RuntimeError):

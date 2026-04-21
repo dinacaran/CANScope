@@ -7,8 +7,8 @@ from typing import Iterable
 
 import numpy as np
 
-from core.blf_reader import RawFrame
-from core.dbc_decoder import DecodedSignalSample
+from core.models import RawFrame
+from core.models import DecodedSignalSample
 
 # ── Bug 3 fix: cap raw frame storage to avoid OOM on large BLF files ──────
 _MAX_RAW_FRAMES = 100_000

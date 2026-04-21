@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Iterator, Protocol, runtime_checkable
 
-from core.dbc_decoder import DecodedSignalSample
+from core.dbc_decoder import DecodedSignalSample  # eager import — cantools loads at startup
 
 
 class UnsupportedFormatError(ValueError):

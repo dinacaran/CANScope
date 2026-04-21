@@ -1,22 +1,13 @@
 from __future__ import annotations
 
+from core.models import RawFrame  # noqa: F401 — re-exported
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
 import can
 
-
-@dataclass(slots=True)
-class RawFrame:
-    timestamp: float
-    channel: int | None
-    arbitration_id: int
-    is_extended_id: bool
-    is_fd: bool
-    dlc: int
-    data: bytes
-    direction: str
 
 
 class BLFReadError(RuntimeError):

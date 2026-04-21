@@ -6,11 +6,8 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from gui.main_window import MainWindow
-
-
-APP_NAME = "CAN Scope"
-APP_VERSION = "v00.00.09"
+APP_NAME    = "CAN Scope"
+APP_VERSION = "v00.00.14"
 
 
 def main() -> int:
@@ -22,8 +19,23 @@ def main() -> int:
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
-    window = MainWindow(app_name=APP_NAME, version=APP_VERSION)
+    # ── Show splash immediately — before any heavy imports ────────────────
+    # gui.splash only imports PySide6 (already loaded) + pathlib.
+    # All heavy modules (cantools, python-can, asammdf, pyqtgraph) are
+    # imported lazily when MainWindow / PlotPanel are first constructed.
+    from gui.splash import CANScopeSplash
+    splash = CANScopeSplash(version=APP_VERSION)
+    splash.show()
+    app.processEvents()
+
+    splash.set_status('Loading UI components...')
+    from gui.main_window import MainWindow   # ← heavy imports happen here
+
+    splash.set_status('Building main window...')
+    window = MainWindow(app_name=APP_NAME, version=APP_VERSION, splash=splash)
+
     window.show()
+    splash.finish(window)
     return app.exec()
 
 

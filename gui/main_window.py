@@ -7,6 +7,7 @@ from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -15,6 +16,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QToolBar,
     QToolButton,
@@ -22,6 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
     QDockWidget,
     QSplitter,
+    QHeaderView,
+    QAbstractItemView,
 )
 
 from core.export import ExportService
@@ -34,13 +39,14 @@ from gui.raw_frame_dialog import RawFrameDialog
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, app_name: str, version: str, parent: QWidget | None = None) -> None:
+    def __init__(self, app_name: str, version: str, parent: QWidget | None = None, splash=None) -> None:
         super().__init__(parent)
         self.app_name = app_name
         self.version = version
         self.setWindowTitle(f'{app_name} {version}')
         self.resize(1700, 950)
 
+        self._splash = splash
         self.measurement_path: str | None = None
         self.dbc_path: str | None = None
         # backward-compat alias used in save_configuration
@@ -53,13 +59,20 @@ class MainWindow(QMainWindow):
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
+        self._splash_status('Initialising plot panel...')
         self._build_ui()
+        self._splash_status('Building toolbar...')
         self._build_toolbar()
         self._build_shortcuts()
         self._set_ready_status()
         self._log(f'{self.app_name} {self.version} started.')
         self._log(f'Dev log file: {self._log_file_path}')
         self._update_measurement_tab()
+
+    def _splash_status(self, message: str) -> None:
+        """Forward a status message to the splash screen if still visible."""
+        if self._splash is not None:
+            self._splash.set_status(message)
 
     def _build_ui(self) -> None:
         self.signal_tree = SignalTreeWidget()
@@ -205,6 +218,10 @@ class MainWindow(QMainWindow):
             toolbar.addAction(act)
             if text in {'Load + Decode', 'Load Config'}:
                 toolbar.addSeparator()
+        toolbar.addSeparator()
+        shortcuts_act = QAction('Shortcuts', self)
+        shortcuts_act.triggered.connect(self.show_shortcuts)
+        toolbar.addAction(shortcuts_act)
 
     def _build_shortcuts(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.plot_panel.remove_selected_series)
@@ -216,6 +233,7 @@ class MainWindow(QMainWindow):
         # Raw Frames hidden from GUI to prevent hang on large files — accessible via shortcut
         QShortcut(QKeySequence('Ctrl+Shift+R'), self, activated=self.show_raw_frames)
         QShortcut(QKeySequence('Ctrl+Down'), self, activated=self.plot_panel.move_selected_down)
+        QShortcut(QKeySequence('Ctrl+Z'), self, activated=self.plot_panel.undo)
 
     def choose_blf(self) -> None:
         """Open any supported measurement file (BLF, ASC, MF4, MDF, CSV)."""
@@ -464,6 +482,43 @@ class MainWindow(QMainWindow):
             self._log(f'Exported CSV: {path}')
         except Exception as exc:
             QMessageBox.critical(self, 'Export failed', str(exc))
+
+    # ── Shortcuts dialog ──────────────────────────────────────────────────
+
+    # Single source-of-truth for all keyboard shortcuts
+    _SHORTCUTS: list[tuple[str, str]] = [
+        ('F',               'Fit to Window — rescale X and Y to all data'),
+        ('V',               'Fit Vertical — rescale Y only (keep current X)'),
+        ('Space',           'Plot selected signal(s) from the signal tree'),
+        ('Delete',          'Remove selected signal from plot'),
+        ('Ctrl + Z',        'Undo last plot action (up to 3 levels)'),
+        ('Ctrl + S',        'Save current configuration to JSON'),
+        ('Ctrl + Up',       'Move selected signal up in the plot list'),
+        ('Ctrl + Down',     'Move selected signal down in the plot list'),
+        ('Ctrl + Shift + R','Open Raw CAN Frame viewer (BLF / ASC only)'),
+    ]
+
+    def show_shortcuts(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Keyboard Shortcuts')
+        dlg.resize(560, 340)
+        tbl = QTableWidget(len(self._SHORTCUTS), 2, dlg)
+        tbl.setHorizontalHeaderLabels(['Shortcut', 'Action'])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.setAlternatingRowColors(True)
+        for row, (key, desc) in enumerate(self._SHORTCUTS):
+            tbl.setItem(row, 0, QTableWidgetItem(key))
+            tbl.setItem(row, 1, QTableWidgetItem(desc))
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(tbl)
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
 
     def _on_worker_progress(self, message: str) -> None:
         self._log(message)

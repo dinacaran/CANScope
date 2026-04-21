@@ -8,21 +8,7 @@ import inspect
 import cantools
 from cantools.database.errors import DecodeError
 
-from core.blf_reader import RawFrame
-
-
-@dataclass(slots=True)
-class DecodedSignalSample:
-    timestamp: float
-    channel: int | None
-    message_id: int
-    message_name: str
-    signal_name: str
-    value: float | int | str      # display value (label string for enum signals)
-    unit: str
-    is_extended_id: bool
-    direction: str
-    numeric_value: float | None = None  # numeric key for plotting (always set)
+from core.models import RawFrame, DecodedSignalSample
 
 
 class DBCLoadError(RuntimeError):
