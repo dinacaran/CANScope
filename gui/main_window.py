@@ -64,6 +64,7 @@ class MainWindow(QMainWindow):
         self._splash_status('Building toolbar...')
         self._build_toolbar()
         self._build_shortcuts()
+        self._update_action_states()  # grey-out on startup
         self._set_ready_status()
         self._log(f'{self.app_name} {self.version} started.')
         self._log(f'Dev log file: {self._log_file_path}')
@@ -104,7 +105,7 @@ class MainWindow(QMainWindow):
         self.btn_stacked.setCheckable(True)
         self.btn_cursor1 = QPushButton('Cursor 1')
         self.btn_cursor1.setCheckable(True)
-        self.btn_cursor1.setChecked(True)   # ON by default
+        self.btn_cursor1.setChecked(False)  # OFF by default
         self.btn_cursor2 = QPushButton('Cursor 2')
         self.btn_cursor2.setCheckable(True)
         self.btn_points = QPushButton('Show Data Points')
@@ -204,24 +205,30 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar('Main')
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
+        self._toolbar_actions: dict[str, QAction] = {}
         for text, slot in [
-            ('Open File', self.choose_blf),
-            ('Open DBC', self.choose_dbc),
-            ('Load + Decode', self.load_data),
-            ('Save Config', self.save_configuration),
-            ('Load Config', self.load_configuration),
-            ('Export CSV', self.export_selected_csv),
-            ('Clear Plots', self.plot_panel.clear_all),
+            ('Open File',    self.choose_blf),
+            ('Open DBC',     self.choose_dbc),
+            ('Load + Decode',self.load_data),
+            ('Save Config',  self.save_configuration),
+            ('Load Config',  self.load_configuration),
+            ('Export CSV',   self.export_selected_csv),
+            ('Clear Plots',  self.plot_panel.clear_all),
         ]:
             act = QAction(text, self)
             act.triggered.connect(slot)
             toolbar.addAction(act)
+            self._toolbar_actions[text] = act
             if text in {'Load + Decode', 'Load Config'}:
                 toolbar.addSeparator()
         toolbar.addSeparator()
         shortcuts_act = QAction('Shortcuts', self)
         shortcuts_act.triggered.connect(self.show_shortcuts)
         toolbar.addAction(shortcuts_act)
+        self._act_can_trace = QAction('CAN Trace', self)
+        self._act_can_trace.triggered.connect(self.show_raw_frames)
+        self._act_can_trace.setEnabled(False)  # enabled after decode
+        toolbar.addAction(self._act_can_trace)
 
     def _build_shortcuts(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.plot_panel.remove_selected_series)
@@ -259,6 +266,7 @@ class MainWindow(QMainWindow):
         if not needs_dbc:
             self._log('DBC not required for this format.')
         self._update_measurement_tab()
+        self._update_action_states()
         self._update_status(
             'Measurement file selected', self._next_step_message()
         )
@@ -376,7 +384,7 @@ class MainWindow(QMainWindow):
             self.plot_panel.set_background_color(str(bg))
         self.btn_multi_axis.setChecked(bool(data.get('multi_axis', False)))
         self.btn_stacked.setChecked(bool(data.get('stacked', False)))     # Fix 4
-        self.btn_cursor1.setChecked(bool(data.get('cursor1', True)))
+        self.btn_cursor1.setChecked(bool(data.get('cursor1', False)))
         self.btn_cursor2.setChecked(bool(data.get('cursor2', False)))
         self.plot_panel._name_show_channel = bool(data.get('name_show_channel', False))
         self.plot_panel._name_show_message = bool(data.get('name_show_message', False))
@@ -424,6 +432,7 @@ class MainWindow(QMainWindow):
         self.signal_tree.set_payload({})
         self.diagnostics_box.clear()
         self.store = None
+        self._update_action_states()
         self._update_measurement_tab(frames='0', decoded='0', samples='0', channels='0')
         self._log(f'Loading: {mpath}')
         self._update_status('Loading and decoding...', 'Wait for decode to finish, then inspect Diagnostics and plot signals')
@@ -537,6 +546,7 @@ class MainWindow(QMainWindow):
 
     def _on_worker_finished(self, store: SignalStore) -> None:
         self.store = store
+        self._update_action_states()
         # Expose store immediately so pending plots and post-decode plots work
         self.signal_tree.set_payload(store.build_tree_payload())
         self.diagnostics_box.setPlainText(store.diagnostics_text)
@@ -624,6 +634,29 @@ class MainWindow(QMainWindow):
         self.status_state_label.setText(f'State: {state}')
         self.status_next_step_label.setText(f'Next: {next_step}')
         self.plot_panel.set_status_overlay(f'State: {state}', f'Next: {next_step}')
+
+    # Actions enabled/disabled per app state
+    # needs_file  = requires measurement file to be selected
+    # needs_store = requires decode to have completed
+    _ACTS_NEEDS_FILE  = {'Open DBC', 'Load + Decode'}
+    _ACTS_NEEDS_STORE = {'Save Config', 'Export CSV', 'Clear Plots'}
+
+    def _update_action_states(self) -> None:
+        """Grey out toolbar actions that are not yet usable."""
+        has_file  = bool(self.measurement_path or self.blf_path)
+        has_store = self.store is not None
+        for name, act in self._toolbar_actions.items():
+            if name in self._ACTS_NEEDS_STORE:
+                act.setEnabled(has_store)
+            elif name in self._ACTS_NEEDS_FILE:
+                act.setEnabled(has_file)
+            # else: Open File, Load Config — always enabled
+        # CAN Trace button requires raw frames (BLF/ASC with store)
+        has_trace = has_store and bool(
+            getattr(self.store, 'raw_frames', None)
+        )
+        if hasattr(self, '_act_can_trace'):
+            self._act_can_trace.setEnabled(has_trace)
 
     def _next_step_message(self) -> str:
         mpath = self.measurement_path or self.blf_path

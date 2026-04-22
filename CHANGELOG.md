@@ -7,6 +7,82 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.19] — 2025-04-22
+
+### Added
+- **CAN Trace toolbar button** — sits next to Shortcuts; opens the Raw CAN
+  Frame viewer directly.  Greyed out until a BLF/ASC file has been decoded
+  (MF4/CSV have no raw frames so it stays grey for those formats).
+
+### Changed
+- **Cursors off by default** — both Cursor 1 and Cursor 2 start unchecked
+  when the application opens.  Config save/load defaults updated to match.
+- **Toolbar greyed-out states** — actions that are not yet usable are
+  disabled (visually greyed) until the required precondition is met:
+  - Always enabled: Open File, Load Config
+  - Enabled after measurement file is selected: Open DBC, Load + Decode
+  - Enabled after decode completes: Save Config, Export CSV, Clear Plots
+  - CAN Trace: enabled only after a BLF/ASC decode (raw frames present)
+  `_update_action_states()` is called at startup, on file select, on decode
+  complete, and when the store is cleared.
+
+---
+
+## [v00.00.18] — 2025-04-22
+
+### Fixed
+- **Jump field not accepting keyboard input** — replaced `QDoubleSpinBox`
+  (which intercepts arrow keys and competes with the tree widget for focus)
+  with a plain `QLineEdit`.  Type any value in seconds and press Enter or
+  click Go.  Invalid input turns the border red; it clears on the next valid
+  entry.  Accepts formats like `33.5`, `33.456`, `0`.
+- **Hang when scrolling after Expand All** — `_set_window()` now checks
+  `_is_expanded` and calls `tree.collapseAll()` (instant C++ operation)
+  before rebuilding the window.  Without this, clearing and reinserting
+  5,000 top-level items each carrying 8 expanded children (≈40,000 visible
+  rows) caused a multi-second freeze on every scroll step.  The tree
+  auto-collapses on any navigation action; the user can re-expand the new
+  window contents at will.  The Collapse All button also clears the flag.
+
+---
+
+## [v00.00.17] — 2025-04-21
+
+### Changed
+- **Raw frame dialog — scrollbar now visible** — styled the section scrollbar
+  to match button height (30 px), with a clear `#4a6080` border, blue-toned
+  drag handle, hover/press states, and always-visible arrow buttons on both
+  ends.  Previously it rendered as a near-invisible 1 px line on dark themes.
+- **Raw frame dialog — removed Filter dropdown** — the
+  "All Frames / Decoded Only / Undecoded Only" combo added little value and
+  cluttered the toolbar.  Removed entirely; search + channel filter are
+  sufficient for narrowing frames.
+
+---
+
+## [v00.00.16] — 2025-04-21
+
+### Changed
+- **Raw CAN Frame viewer — full sliding window navigation**
+  - Removed the hard 5,000-row cap that previously prevented viewing the
+    rest of the file.  All matching frames are accessible via navigation.
+  - **Section scrollbar** spans the entire filtered frame list; dragging it
+    moves the 5,000-row visible window to any position in the data.
+  - **Time-labelled nav buttons** — each button shows the absolute timestamp
+    of its destination above it:
+    - `[◀◀ Start]` → shows recording start time (e.g. `0.000 s`)
+    - `[◀ −1000]`  → shows time 1,000 frames before current window
+    - `[+1000 ▶]`  → shows time 1,000 frames after current window
+    - `[End ▶▶]`   → shows recording end time
+  - **Jump to time** — type any timestamp in seconds and press Go (or Enter)
+    to centre the window on the nearest frame.  Binary search used for speed.
+  - **Status bar** shows current frame range and time span:
+    `Showing frames 12,450–17,450 of 29,015 matching  (33.450 s → 38.512 s)`
+  - **Expand All** operates only on the visible 5,000-row window,
+    not the entire file.
+
+---
+
 ## [v00.00.15] — 2025-04-21
 
 ### Fixed
