@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 APP_NAME    = "CAN Scope"
-APP_VERSION = "v00.00.19"
+APP_VERSION = "v00.00.23"
 
 
 def main() -> int:

@@ -28,9 +28,13 @@ class BLFReaderService:
             with can.BLFReader(str(self.path)) as reader:
                 for msg in reader:
                     data = bytes(msg.data or b"")
+                    raw_ch = getattr(msg, "channel", None)
+                    # python-can returns 0-indexed channels from BLF binary.
+                    # Vector hardware/software uses 1-indexed (CAN 1, CAN 2).
+                    channel = (int(raw_ch) + 1) if isinstance(raw_ch, (int, float)) else raw_ch
                     yield RawFrame(
                         timestamp=float(msg.timestamp),
-                        channel=getattr(msg, "channel", None),
+                        channel=channel,
                         arbitration_id=int(msg.arbitration_id),
                         is_extended_id=bool(getattr(msg, "is_extended_id", False)),
                         is_fd=bool(getattr(msg, "is_fd", False)),

@@ -305,10 +305,11 @@ class MainWindow(QMainWindow):
                             'Drag C2 line to measure time delta between cursors')
 
     def show_raw_frames(self) -> None:
-        if not self.store or not getattr(self.store, 'raw_frames', None):
-            QMessageBox.information(self, 'No raw frames', 'Load and decode a BLF/DBC first.')
+        rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
+        if not rfs or len(rfs) == 0:
+            QMessageBox.information(self, 'No raw frames', 'Load and decode a BLF/ASC file first.')
             return
-        self._raw_frame_dialog = RawFrameDialog(self.store.raw_frames, self)
+        self._raw_frame_dialog = RawFrameDialog(rfs, self)
         self._raw_frame_dialog.show()
         self._raw_frame_dialog.raise_()
         self._raw_frame_dialog.activateWindow()
@@ -652,9 +653,8 @@ class MainWindow(QMainWindow):
                 act.setEnabled(has_file)
             # else: Open File, Load Config — always enabled
         # CAN Trace button requires raw frames (BLF/ASC with store)
-        has_trace = has_store and bool(
-            getattr(self.store, 'raw_frames', None)
-        )
+        _rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
+        has_trace = has_store and _rfs is not None and len(_rfs) > 0
         if hasattr(self, '_act_can_trace'):
             self._act_can_trace.setEnabled(has_trace)
 

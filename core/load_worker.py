@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from core.readers import reader_factory
 from core.readers.base import MeasurementReader
 from core.signal_store import SignalStore
+from core.raw_frame_store import RawFrameStore
 
 # ── CAN-raw streaming constants (counts = CAN frames) ─────────────────────
 _CAN_TREE_INTERVAL     = 2_000
@@ -108,6 +109,10 @@ class LoadWorker(QObject):
         base_ts: float | None = None
         index = 0
 
+        # On-disk indexed store — no frame cap, temp file auto-deleted on close
+        rfs = RawFrameStore()
+        store.raw_frame_store = rfs
+
         for frame, samples in reader.iter_with_frames():
             index += 1
             if base_ts is None:
@@ -118,9 +123,21 @@ class LoadWorker(QObject):
                 s.timestamp -= base_ts
 
             store.note_frame(frame)
+            # Store EVERY frame on disk — decoded or not (no cap)
+            rfs.append(
+                timestamp   = frame.timestamp,
+                channel     = frame.channel,
+                arb_id      = frame.arbitration_id,
+                dlc         = frame.dlc,
+                direction   = frame.direction,
+                is_extended = frame.is_extended_id,
+                is_fd       = frame.is_fd,
+                data        = frame.data,
+                frame_name  = samples[0].message_name if samples else '',
+                decoded     = bool(samples),
+            )
             if samples:
                 store.add_samples_direct(samples)
-                store.add_raw_frame(frame, samples)
             else:
                 store.unmatched_frames += 1
 
@@ -135,8 +152,12 @@ class LoadWorker(QObject):
                     f"samples: {store.total_samples:,}"
                 )
 
+        # Seal: flush + mmap the data file for random access
+        rfs.seal()
+        decoder = getattr(reader, 'decoder', None)
+        rfs.decoder = decoder   # dialog uses this for on-demand signal decode
+
         store.normalize_timestamps(already_normalized=True)
-        decoder = getattr(reader, "decoder", None)
         dbc_diag = decoder.diagnostics_text() if decoder else ""
         store.diagnostics_text = (
             store.channel_summary_text()

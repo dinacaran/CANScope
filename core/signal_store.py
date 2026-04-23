@@ -3,38 +3,11 @@ from __future__ import annotations
 import array as _array
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 
 from core.models import RawFrame
 from core.models import DecodedSignalSample
-
-# ── Bug 3 fix: cap raw frame storage to avoid OOM on large BLF files ──────
-_MAX_RAW_FRAMES = 100_000
-
-
-@dataclass(slots=True)
-class RawFrameSignalView:
-    signal_name: str
-    physical_value: object
-    unit: str
-    raw_value: object = ""
-
-
-@dataclass(slots=True)
-class RawFrameEntry:
-    time_s: float
-    start_of_frame_s: float
-    channel: int | None
-    arbitration_id: int
-    frame_name: str
-    direction: str
-    dlc: int
-    data_hex: str
-    decoded: bool
-    signals: list[RawFrameSignalView] = field(default_factory=list)
-
 
 @dataclass(slots=True)
 class SignalSeries:
@@ -82,9 +55,8 @@ class SignalStore:
         self.unmatched_frames = 0
         self.first_frame_ids: list[str] = []
         self.diagnostics_text: str = ""
-        # Bug 3 fix: bounded; stops storing after _MAX_RAW_FRAMES
-        self.raw_frames: list[RawFrameEntry] = []
-        self._raw_frames_capped = False
+        # On-disk indexed frame store (Option B: no cap, temp file on disk)
+        self.raw_frame_store = None   # set to RawFrameStore by LoadWorker
         self.base_ts: float = 0.0  # set by LoadWorker for streaming
 
     def note_frame(self, frame: RawFrame, decoded: bool = False) -> None:
@@ -236,39 +208,6 @@ class SignalStore:
         self.channels.add(channel)
         self.message_hits[(channel, message_name)] += n
 
-    def add_raw_frame(self, frame: RawFrame, samples: Iterable[DecodedSignalSample]) -> None:
-        # Bug 3 fix: stop accumulating after cap to prevent OOM on large BLF files.
-        if self._raw_frames_capped:
-            return
-        if len(self.raw_frames) >= _MAX_RAW_FRAMES:
-            self._raw_frames_capped = True
-            return
-        sample_list = list(samples)
-        frame_name  = sample_list[0].message_name if sample_list else ""
-        signal_views = [
-            RawFrameSignalView(
-                signal_name=s.signal_name,
-                physical_value=s.value,
-                unit=s.unit,
-                raw_value=s.value,
-            )
-            for s in sample_list
-        ]
-        self.raw_frames.append(
-            RawFrameEntry(
-                time_s=frame.timestamp,
-                start_of_frame_s=frame.timestamp,
-                channel=frame.channel,
-                arbitration_id=frame.arbitration_id,
-                frame_name=frame_name,
-                direction=frame.direction,
-                dlc=frame.dlc,
-                data_hex=" ".join(f"{b:02X}" for b in frame.data),
-                decoded=bool(sample_list),
-                signals=signal_views,
-            )
-        )
-
     def normalize_timestamps(self, already_normalized: bool = False) -> None:
         """
         Shift all timestamps so that t=0 is the start of the recording.
@@ -295,9 +234,7 @@ class SignalStore:
             if series.timestamps:
                 new_ts = _array.array('d', (t - min_ts for t in series.timestamps))
                 series.timestamps = new_ts
-        for frame in self.raw_frames:
-            frame.time_s           -= min_ts
-            frame.start_of_frame_s -= min_ts
+        # raw_frame_store timestamps are normalised inline by LoadWorker
 
     def get_series(self, key: str) -> SignalSeries | None:
         return self._series_by_key.get(key)
@@ -325,8 +262,10 @@ class SignalStore:
             f"({self.channel_frame_counts.get(ch, 0):,} frames)"
             for ch in ordered
         ]
-        suffix = f"  [raw frame display capped at {_MAX_RAW_FRAMES:,}]" if self._raw_frames_capped else ""
-        return f"Channels: {len(ordered)} | " + ', '.join(parts) + suffix
+        rfs = self.raw_frame_store
+        total_raw = len(rfs) if rfs is not None else 0
+        raw_note = f"  | CAN Trace: {total_raw:,} frames" if total_raw else ""
+        return f"Channels: {len(ordered)} | " + ', '.join(parts) + raw_note
 
     @staticmethod
     def _make_key(channel: int | None, message_name: str, signal_name: str) -> str:

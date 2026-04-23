@@ -7,6 +7,58 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.23] — 2025-04-23
+
+### Changed — Option B: on-disk indexed raw frame store (no frame cap)
+
+Replaced the 100,000-frame in-memory `list[RawFrameEntry]` with an
+on-disk indexed store (`core/raw_frame_store.py`).  All CAN frames are
+now stored regardless of file size.
+
+**Architecture:**
+
+| | Before (capped list) | After (on-disk index) |
+|---|---|---|
+| Storage | Python objects in RAM | Compact arrays + temp file |
+| RAM / frame | ~700 B → ~70 MB/100k | 18 B → ~54 MB / 3M frames |
+| Disk / frame | — | 64 B → ~192 MB / 3M frames |
+| Frame cap | 100,000 | **None** |
+| Filter | Python loop over RawFrameEntry | Vectorised numpy on in-memory arrays |
+| Signal decode | Pre-stored per frame | Lazy on-demand when row is expanded |
+
+**`core/raw_frame_store.py`** (new):
+- In-memory per frame (18 B): `timestamps`, `channels`, `arb_ids`, `dlcs`,
+  `directions`, `flags`, `name_ids` — all `array.array`, no Python objects.
+- `name_table`: list of unique message names (~100–500 entries).
+- Disk temp file: 64 raw data bytes per frame, `mmap`-accessed for O(1)
+  random reads.  Auto-deleted on `close()` / GC.
+- `build_match_mask(needle, channel)`: returns numpy bool array using
+  vectorised operations — no Python loop, no disk access for most filters.
+- `get_window(indices)`: reads exactly the visible 5,000 frames from disk.
+- `seal()`: called after decode to open the mmap for random access.
+
+**Signal decode**: clicking ▶ on a row now decodes that single frame
+on-demand using the warm `DBCDecoder` cache (~1 ms per frame).  Previously
+all 5,000 signal children were pre-rendered on every window change.
+
+---
+
+## [v00.00.22] — 2025-04-23
+
+### Baseline
+- Rolled back to v00.00.19 as baseline.
+  All v00.00.20 and v00.00.21 DBC matching changes reverted.
+  Original broad matching (exact + &0x1FFFFFFF + &0x7FF + J1939 PGN
+  fallback) restored.
+
+### Fixed
+- **Channel numbering starts from 1** — python-can returns 0-indexed
+  channels from BLF/ASC files; Vector hardware uses 1-indexed (CAN 1,
+  CAN 2…).  Fixed in `core/blf_reader.py` and
+  `core/readers/asc_can_reader.py`.
+
+---
+
 ## [v00.00.19] — 2025-04-22
 
 ### Added

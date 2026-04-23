@@ -64,9 +64,12 @@ class ASCCANReader:
                         "Tx" if is_rx is False else
                         "Unknown"
                     )
+                    raw_ch = getattr(msg, 'channel', None)
+                    # ASC also returns 0-indexed channels from python-can
+                    ch_1idx = (int(raw_ch) + 1) if isinstance(raw_ch, (int, float)) else raw_ch
                     frame = RawFrame(
                         timestamp     = float(msg.timestamp),
-                        channel       = getattr(msg, "channel", None),
+                        channel       = ch_1idx,
                         arbitration_id= int(msg.arbitration_id),
                         is_extended_id= bool(getattr(msg, "is_extended_id", False)),
                         is_fd         = bool(getattr(msg, "is_fd", False)),

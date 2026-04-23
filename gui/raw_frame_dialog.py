@@ -1,48 +1,28 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
+import array as _array
+
+import numpy as np
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox,
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QScrollBar,
-    QSizePolicy,
-    QSpacerItem,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QVBoxLayout,
-    QWidget,
+    QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QScrollBar, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
-from core.signal_store import RawFrameEntry
+from core.raw_frame_store import RawFrameStore
 
-# Visible window size — rows shown at once
-_WINDOW   = 5_000
-# Step size for ±step buttons (frames)
-_STEP     = 1_000
-# Column index constants
-_COL_COUNT = 7
+_WINDOW = 5_000
+_STEP   = 1_000
+_COL    = 7
 
 
-def _fmt_t(t: float) -> str:
-    """Format a timestamp as '123.456 s', or '—' for sentinel."""
-    if t is None:
-        return '—'
-    return f'{t:.3f} s'
+def _fmt_t(t: float | None) -> str:
+    return f'{t:.3f} s' if t is not None else '—'
 
 
 class _NavButton(QWidget):
-    """
-    A navigation button with a time label displayed above it.
-
-        ┌──────────┐
-        │ 0.000 s  │  ← time label (updates dynamically)
-        │[◀◀ Start]│  ← QPushButton
-        └──────────┘
-    """
+    """Button with a time label displayed above it."""
     def __init__(self, label: str, parent=None) -> None:
         super().__init__(parent)
         self.time_lbl = QLabel('—')
@@ -57,7 +37,7 @@ class _NavButton(QWidget):
         lay.addWidget(self.btn)
 
     def set_time(self, t: float | None) -> None:
-        self.time_lbl.setText(_fmt_t(t) if t is not None else '—')
+        self.time_lbl.setText(_fmt_t(t))
 
     def clicked_connect(self, slot) -> None:
         self.btn.clicked.connect(slot)
@@ -65,46 +45,40 @@ class _NavButton(QWidget):
 
 class RawFrameDialog(QDialog):
     """
-    Raw CAN Frame viewer with a sliding window and time-labelled navigation.
+    Raw CAN Frame viewer — on-disk sliding window, no frame cap.
 
-    Navigation bar layout:
-        [0.000 s]  [33.450 s]              [38.512 s]  [60.123 s]
-        [◀◀ Start] [◀ −1000] ──●────────── [+1000 ▶]  [End ▶▶]  Jump:[___s][Go]
-
-    The QScrollBar spans the entire filtered frame list.  The visible
-    QTreeWidget always contains exactly _WINDOW rows (or fewer at the ends).
-    Expand All / Collapse All operate only on the visible window.
-    Signal children are rendered for all visible rows (decode already done
-    at load time; rendering is the only cost, capped by _WINDOW).
+    Accepts a RawFrameStore (Option B architecture):
+    - Filtering uses vectorised numpy on in-memory arrays — no disk access
+    - Rendering reads only the visible 5,000-frame window from disk
+    - Signals decoded on-demand when a row is expanded
     """
 
-    def __init__(self, raw_frames: list[RawFrameEntry], parent=None) -> None:
+    def __init__(self, raw_store: RawFrameStore, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle('Raw CAN Frame Table')
         self.resize(1260, 750)
 
-        self.raw_frames: list[RawFrameEntry] = list(raw_frames)
-        self._matching:  list[RawFrameEntry] = []   # filtered view
-        self._win_start: int = 0                    # index into _matching
-        self._is_expanded: bool = False             # True after Expand All
+        self._raw_store = raw_store
+        self._win_start = 0
+        self._is_expanded = False
+
+        # _matching: None = all frames; array('I') = filtered indices
+        self._matching: _array.array | None = None
 
         # ── Filter controls ───────────────────────────────────────────────
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(
-            'Search frame name, ID, data, value...'
+            'Search frame name, ID, data, direction…'
         )
 
         self.channel_combo = QComboBox()
         self.channel_combo.addItem('All Channels', None)
-        channels = sorted(
-            {rf.channel for rf in self.raw_frames},
-            key=lambda x: (999_999 if x is None else x),
+        chs_seen = sorted(
+            {int(c) for c in raw_store.channels if c != 255},
+            key=lambda x: x,
         )
-        for ch in channels:
-            self.channel_combo.addItem(
-                f'CH{ch}' if ch is not None else 'CH?', ch
-            )
-
+        for ch in chs_seen:
+            self.channel_combo.addItem(f'CAN {ch}', ch)
 
         self.expand_btn   = QPushButton('Expand All')
         self.collapse_btn = QPushButton('Collapse All')
@@ -117,17 +91,16 @@ class RawFrameDialog(QDialog):
         top_row.addWidget(self.expand_btn)
         top_row.addWidget(self.collapse_btn)
 
-        # ── Status line ───────────────────────────────────────────────────
+        # ── Status ────────────────────────────────────────────────────────
         self.status_label = QLabel()
         self.status_label.setStyleSheet('color: #8B949E; font-size: 11px;')
 
         # ── Navigation bar ────────────────────────────────────────────────
-        self._nb_start  = _NavButton('◀◀ Start')
-        self._nb_back   = _NavButton('◀ −1000')
-        self._nb_fwd    = _NavButton('+1000 ▶')
-        self._nb_end    = _NavButton('End ▶▶')
+        self._nb_start = _NavButton('◀◀ Start')
+        self._nb_back  = _NavButton('◀ −1000')
+        self._nb_fwd   = _NavButton('+1000 ▶')
+        self._nb_end   = _NavButton('End ▶▶')
 
-        # Section scrollbar — full filtered range
         self._scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self._scrollbar.setMinimum(0)
         self._scrollbar.setPageStep(_WINDOW)
@@ -135,98 +108,68 @@ class RawFrameDialog(QDialog):
         self._scrollbar.setMinimumHeight(30)
         self._scrollbar.setStyleSheet("""
             QScrollBar:horizontal {
-                border: 1px solid #4a6080;
-                background: #1a2a3a;
-                height: 30px;
-                border-radius: 4px;
+                border: 1px solid #4a6080; background: #1a2a3a;
+                height: 30px; border-radius: 4px;
             }
             QScrollBar::handle:horizontal {
-                background: #3a6090;
-                min-width: 24px;
-                border-radius: 3px;
-                border: 1px solid #5080b0;
+                background: #3a6090; min-width: 24px;
+                border-radius: 3px; border: 1px solid #5080b0;
             }
-            QScrollBar::handle:horizontal:hover {
-                background: #5090c0;
-            }
-            QScrollBar::handle:horizontal:pressed {
-                background: #60a0d0;
-            }
+            QScrollBar::handle:horizontal:hover  { background: #5090c0; }
+            QScrollBar::handle:horizontal:pressed { background: #60a0d0; }
             QScrollBar::add-line:horizontal {
-                border: 1px solid #4a6080;
-                background: #253545;
-                width: 20px;
-                border-radius: 2px;
-                subcontrol-position: right;
-                subcontrol-origin: margin;
-                image: url(none);
+                border: 1px solid #4a6080; background: #253545;
+                width: 20px; border-radius: 2px;
+                subcontrol-position: right; subcontrol-origin: margin;
             }
             QScrollBar::sub-line:horizontal {
-                border: 1px solid #4a6080;
-                background: #253545;
-                width: 20px;
-                border-radius: 2px;
-                subcontrol-position: left;
-                subcontrol-origin: margin;
-                image: url(none);
-            }
-            QScrollBar::left-arrow:horizontal {
-                width: 8px; height: 8px;
-                background: #8ab4d4;
-                clip-path: polygon(100% 0%, 100% 100%, 0% 50%);
-            }
-            QScrollBar::right-arrow:horizontal {
-                width: 8px; height: 8px;
-                background: #8ab4d4;
-                clip-path: polygon(0% 0%, 100% 50%, 0% 100%);
+                border: 1px solid #4a6080; background: #253545;
+                width: 20px; border-radius: 2px;
+                subcontrol-position: left; subcontrol-origin: margin;
             }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background: #1e2e3e;
             }
         """)
 
-        # Jump-to-time widgets
         self._jump_edit = QLineEdit()
         self._jump_edit.setFixedWidth(90)
         self._jump_edit.setPlaceholderText('time (s)')
-        self._jump_edit.setToolTip(
-            'Type a time in seconds and press Enter or Go'
-        )
-        self._jump_btn  = QPushButton('Go')
+        self._jump_edit.setToolTip('Type a time in seconds and press Enter or Go')
+        self._jump_btn = QPushButton('Go')
         self._jump_btn.setFixedWidth(36)
 
-        nav_top   = QHBoxLayout()   # time labels row
-        nav_top.addWidget(self._nb_start)
-        nav_top.addWidget(self._nb_back)
-        nav_top.addWidget(self._scrollbar, 1)
-        nav_top.addWidget(self._nb_fwd)
-        nav_top.addWidget(self._nb_end)
-        nav_top.addSpacing(8)
-        nav_top.addWidget(QLabel('Jump:'))
-        nav_top.addWidget(self._jump_edit)
-        nav_top.addWidget(self._jump_btn)
+        nav_row = QHBoxLayout()
+        nav_row.addWidget(self._nb_start)
+        nav_row.addWidget(self._nb_back)
+        nav_row.addWidget(self._scrollbar, 1)
+        nav_row.addWidget(self._nb_fwd)
+        nav_row.addWidget(self._nb_end)
+        nav_row.addSpacing(8)
+        nav_row.addWidget(QLabel('Jump:'))
+        nav_row.addWidget(self._jump_edit)
+        nav_row.addWidget(self._jump_btn)
 
         # ── Tree ──────────────────────────────────────────────────────────
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(_COL_COUNT)
+        self.tree.setColumnCount(_COL)
         self.tree.setHeaderLabels(
             ['Time (s)', 'Chn', 'ID', 'Name', 'Dir', 'DLC', 'Data / Value']
         )
         self.tree.setAlternatingRowColors(True)
-        self.tree.setUniformRowHeights(True)
+        self.tree.setUniformRowHeights(False)
         self.tree.setRootIsDecorated(True)
 
         # ── Layout ────────────────────────────────────────────────────────
         layout = QVBoxLayout(self)
         layout.addLayout(top_row)
         layout.addWidget(self.status_label)
-        layout.addLayout(nav_top)
+        layout.addLayout(nav_row)
         layout.addWidget(self.tree, 1)
 
         # ── Connections ───────────────────────────────────────────────────
         self.search_edit.textChanged.connect(self._on_filter_changed)
         self.channel_combo.currentIndexChanged.connect(self._on_filter_changed)
-
         self._nb_start.clicked_connect(self._go_start)
         self._nb_back.clicked_connect(self._go_back)
         self._nb_fwd.clicked_connect(self._go_fwd)
@@ -234,64 +177,49 @@ class RawFrameDialog(QDialog):
         self._scrollbar.valueChanged.connect(self._on_scroll)
         self._jump_btn.clicked.connect(self._go_jump)
         self._jump_edit.returnPressed.connect(self._go_jump)
-
         self.expand_btn.clicked.connect(self._expand_window)
         self.collapse_btn.clicked.connect(self._collapse_all)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
 
-        # Initial render
         self._on_filter_changed()
 
     # ── Filter ────────────────────────────────────────────────────────────
 
     def _on_filter_changed(self) -> None:
-        """Rebuild the filtered list and reset window to start."""
         needle         = self.search_edit.text().strip().lower()
         channel_filter = self.channel_combo.currentData()
 
-        self._matching = [
-            e for e in self.raw_frames
-            if self._match_entry(e, needle, channel_filter)
-        ]
+        mask = self._raw_store.build_match_mask(needle, channel_filter)
+        if mask is None:
+            # All frames match — use None sentinel (zero extra RAM)
+            self._matching = None
+        else:
+            indices = np.where(mask)[0].astype(np.uint32)
+            self._matching = _array.array('I', indices.tolist())
+
         self._win_start = 0
         self._update_scrollbar()
         self._render_window()
 
-    def _match_entry(
-        self,
-        entry: RawFrameEntry,
-        needle: str,
-        channel_filter,
-    ) -> bool:
-        if channel_filter is not None and entry.channel != channel_filter:
-            return False
-        if not needle:
-            return True
-        hay = ' '.join([
-            f'{entry.time_s:.6f}',
-            f'CH{entry.channel}' if entry.channel is not None else 'CH?',
-            f'{entry.arbitration_id:X}',
-            entry.frame_name,
-            entry.direction,
-            str(entry.dlc),
-            entry.data_hex,
-        ]).lower()
-        if needle in hay:
-            return True
-        for sig in entry.signals:
-            if needle in f'{sig.signal_name} {sig.physical_value} {sig.unit} {sig.raw_value}'.lower():
-                return True
-        return False
+    def _total_matching(self) -> int:
+        if self._matching is None:
+            return len(self._raw_store)
+        return len(self._matching)
+
+    def _frame_index(self, pos: int) -> int:
+        """Map a position in the matching list to a RawFrameStore index."""
+        if self._matching is None:
+            return pos
+        return int(self._matching[pos])
 
     # ── Navigation ────────────────────────────────────────────────────────
 
     def _go_start(self)  -> None: self._set_window(0)
-    def _go_end(self)    -> None: self._set_window(max(0, len(self._matching) - _WINDOW))
+    def _go_end(self)    -> None: self._set_window(max(0, self._total_matching() - _WINDOW))
     def _go_back(self)   -> None: self._set_window(max(0, self._win_start - _STEP))
     def _go_fwd(self)    -> None:
-        self._set_window(min(
-            max(0, len(self._matching) - _WINDOW),
-            self._win_start + _STEP
-        ))
+        self._set_window(min(max(0, self._total_matching() - _WINDOW),
+                             self._win_start + _STEP))
 
     def _on_scroll(self, value: int) -> None:
         if value != self._win_start:
@@ -299,116 +227,177 @@ class RawFrameDialog(QDialog):
 
     def _go_jump(self) -> None:
         text = self._jump_edit.text().strip().rstrip('s').strip()
-        if not text or not self._matching:
+        if not text:
             return
         try:
             target_t = float(text)
         except ValueError:
             self._jump_edit.setStyleSheet('border: 1px solid #c04040;')
             return
-        self._jump_edit.setStyleSheet('')   # clear error state
-        # Binary search for nearest frame
-        lo, hi = 0, len(self._matching) - 1
+        self._jump_edit.setStyleSheet('')
+
+        n = self._total_matching()
+        if n == 0:
+            return
+        ts_store = np.frombuffer(self._raw_store.timestamps, dtype=np.float64)
+
+        # Binary search in the matching subset
+        lo, hi = 0, n - 1
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._matching[mid].time_s < target_t:
+            if ts_store[self._frame_index(mid)] < target_t:
                 lo = mid + 1
             else:
                 hi = mid
-        # Centre the window on that frame
-        idx = max(0, min(lo, len(self._matching) - 1))
-        start = max(0, min(idx - _WINDOW // 2,
-                           len(self._matching) - _WINDOW))
+
+        start = max(0, min(lo - _WINDOW // 2, n - _WINDOW))
         self._set_window(start)
 
     def _set_window(self, start: int, update_scrollbar: bool = True) -> None:
-        n = len(self._matching)
+        n = self._total_matching()
         self._win_start = max(0, min(start, max(0, n - _WINDOW)))
         if update_scrollbar:
             self._scrollbar.blockSignals(True)
             self._scrollbar.setValue(self._win_start)
             self._scrollbar.blockSignals(False)
-        # If tree is expanded, collapse first to avoid rebuilding
-        # thousands of signal children during the clear() call.
         if self._is_expanded:
             self.tree.collapseAll()
             self._is_expanded = False
         self._render_window()
 
-    # ── Scrollbar ─────────────────────────────────────────────────────────
-
     def _update_scrollbar(self) -> None:
-        n = len(self._matching)
+        n       = self._total_matching()
         max_val = max(0, n - _WINDOW)
         self._scrollbar.setMaximum(max_val)
         self._scrollbar.setValue(0)
-        # Update jump spin max
 
     # ── Render window ─────────────────────────────────────────────────────
 
     def _render_window(self) -> None:
-        n       = len(self._matching)
+        n       = self._total_matching()
         w_start = self._win_start
         w_end   = min(w_start + _WINDOW, n)
-        visible = self._matching[w_start:w_end]
 
-        # ── Build QTreeWidgetItems in memory ──────────────────────────────
+        # Collect frame indices for this window
+        indices = [self._frame_index(i) for i in range(w_start, w_end)]
+
+        # Fetch records from store (disk read for data bytes)
+        records = self._raw_store.get_window(indices)
+
         top_items: list[QTreeWidgetItem] = []
-        for entry in visible:
-            ch_text = f'CAN {entry.channel}' if entry.channel is not None else 'CAN ?'
+        for rec in records:
+            ch_text = f'CAN {rec.channel}' if rec.channel is not None else 'CAN ?'
+            id_text = f'{rec.arbitration_id:X}'
+            data_hex = ' '.join(f'{b:02X}' for b in rec.data[:rec.dlc])
+
             top = QTreeWidgetItem([
-                f'{entry.time_s:.6f}',
+                f'{rec.time_s:.6f}',
                 ch_text,
-                f'{entry.arbitration_id:X}',
-                entry.frame_name or '(unmatched)',
-                entry.direction,
-                str(entry.dlc),
-                entry.data_hex,
+                id_text,
+                rec.frame_name or ('(decoded)' if rec.decoded else '(unmatched)'),
+                rec.direction,
+                str(rec.dlc),
+                data_hex,
             ])
-            for sig in entry.signals:
-                phys = f'{sig.physical_value} {sig.unit}'.strip()
-                top.addChild(QTreeWidgetItem(
-                    ['', '', '', sig.signal_name, '', '', phys]
-                ))
+            # Store store-index in item data for lazy signal decode
+            top.setData(0, Qt.ItemDataRole.UserRole, indices[len(top_items)])
+            # Placeholder child so the expand arrow appears for decoded frames
+            if rec.decoded:
+                placeholder = QTreeWidgetItem(['…'])
+                placeholder.setData(0, Qt.ItemDataRole.UserRole, -1)  # sentinel
+                top.addChild(placeholder)
             top_items.append(top)
 
-        # ── Single bulk insert ────────────────────────────────────────────
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         self.tree.insertTopLevelItems(0, top_items)
         self.tree.setUpdatesEnabled(True)
 
-        for col in range(_COL_COUNT):
+        for col in range(_COL):
             self.tree.resizeColumnToContents(col)
 
-        # ── Update nav button time labels ─────────────────────────────────
-        t_first = self._matching[0].time_s      if self._matching else None
-        t_last  = self._matching[-1].time_s     if self._matching else None
-        t_back  = self._matching[max(0, w_start - _STEP)].time_s   if self._matching else None
-        t_fwd_i = min(w_start + _WINDOW + _STEP - 1, n - 1)
-        t_fwd   = self._matching[t_fwd_i].time_s if self._matching else None
+        # Update nav button time labels
+        ts_arr = np.frombuffer(self._raw_store.timestamps, dtype=np.float64)
+        n_store = len(self._raw_store)
 
-        self._nb_start.set_time(t_first)
-        self._nb_back.set_time(t_back)
-        self._nb_fwd.set_time(t_fwd)
-        self._nb_end.set_time(t_last)
+        def _ts(pos: int) -> float | None:
+            idx = self._frame_index(pos) if 0 <= pos < n else None
+            return float(ts_arr[idx]) if idx is not None and 0 <= idx < n_store else None
 
-        # ── Status line ───────────────────────────────────────────────────
-        t_win_start = visible[0].time_s  if visible else 0.0
-        t_win_end   = visible[-1].time_s if visible else 0.0
+        t_win_s = _ts(w_start)
+        t_win_e = _ts(w_end - 1)
+        self._nb_start.set_time(_ts(0))
+        self._nb_back.set_time(_ts(max(0, w_start - _STEP)))
+        self._nb_fwd.set_time(_ts(min(n - 1, w_start + _WINDOW + _STEP - 1)))
+        self._nb_end.set_time(_ts(n - 1))
+
         self.status_label.setText(
             f'Showing frames {w_start+1:,}–{w_end:,} of {n:,} matching  '
-            f'({_fmt_t(t_win_start)} → {_fmt_t(t_win_end)})  '
-            f'| Total in file: {len(self.raw_frames):,}'
+            f'({_fmt_t(t_win_s)} → {_fmt_t(t_win_e)})  '
+            f'| Total in file: {n_store:,}'
         )
 
-    # ── Expand window only ────────────────────────────────────────────────
+    # ── Lazy signal decode on expand ──────────────────────────────────────
+
+    def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """Decode signals for this frame on first expand."""
+        # Check if placeholder is still present
+        if item.childCount() == 0:
+            return
+        first_child = item.child(0)
+        if first_child is None or first_child.data(0, Qt.ItemDataRole.UserRole) != -1:
+            return   # already decoded
+
+        store_idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if store_idx is None or store_idx < 0:
+            return
+
+        # Remove placeholder
+        item.removeChild(first_child)
+
+        decoder = getattr(self._raw_store, 'decoder', None)
+        if decoder is None:
+            item.addChild(QTreeWidgetItem(['', '', '', '(no DBC)', '', '', '']))
+            return
+
+        # Reconstruct a minimal RawFrame for the decoder
+        from core.models import RawFrame
+        records = self._raw_store.get_window([store_idx])
+        if not records:
+            return
+        rec = records[0]
+
+        raw_frame = RawFrame(
+            timestamp=rec.time_s,
+            channel=rec.channel,
+            arbitration_id=rec.arbitration_id,
+            is_extended_id=rec.is_extended,
+            is_fd=rec.is_fd,
+            dlc=rec.dlc,
+            data=rec.data[:rec.dlc],
+            direction=rec.direction,
+        )
+        try:
+            samples = decoder.decode_frame(raw_frame)
+        except Exception:
+            samples = []
+
+        if not samples:
+            item.addChild(QTreeWidgetItem(['', '', '', '(no signals)', '', '', '']))
+            return
+
+        for s in samples:
+            val_str = f'{s.value} {s.unit}'.strip()
+            child = QTreeWidgetItem(['', '', '', s.signal_name, '', '', val_str])
+            child.setData(0, Qt.ItemDataRole.UserRole, -2)
+            item.addChild(child)
+
+    # ── Expand / Collapse ─────────────────────────────────────────────────
+
+    def _expand_window(self) -> None:
+        self._is_expanded = True
+        self.tree.expandAll()
 
     def _collapse_all(self) -> None:
         self._is_expanded = False
         self.tree.collapseAll()
-
-    def _expand_window(self) -> None:
-        """Expand all rows in the current visible window (not all 29k+)."""
-        self._is_expanded = True
-        self.tree.expandAll()
