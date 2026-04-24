@@ -182,14 +182,34 @@ class MainWindow(QMainWindow):
         self.bottom_dock.visibilityChanged.connect(self._sync_panel_toggle_buttons)
 
         self.left_edge_btn = QToolButton(self)
-        self.left_edge_btn.setAutoRaise(True)
-        self.left_edge_btn.setFixedWidth(18)
+        self.left_edge_btn.setFixedWidth(22)
+        self.left_edge_btn.setMinimumHeight(36)
+        self.left_edge_btn.setStyleSheet("""
+QToolButton {
+    background-color: #2d3a4a; color: #e0e8f0;
+    border: 1px solid #4a6080; border-radius: 4px;
+    font-size: 11px; font-weight: bold; padding: 2px;
+}
+QToolButton:hover { background-color: #3a5070; border-color: #6090b0; }
+QToolButton:pressed { background-color: #1a2a3a; }
+""")
+        self.left_edge_btn.setToolTip('Show / hide signal panel')
         self.left_edge_btn.clicked.connect(self._toggle_left_panel)
         self.left_edge_btn.show()
 
         self.bottom_edge_btn = QToolButton(self)
-        self.bottom_edge_btn.setAutoRaise(True)
-        self.bottom_edge_btn.setFixedHeight(18)
+        self.bottom_edge_btn.setFixedHeight(22)
+        self.bottom_edge_btn.setMinimumWidth(36)
+        self.bottom_edge_btn.setStyleSheet("""
+QToolButton {
+    background-color: #2d3a4a; color: #e0e8f0;
+    border: 1px solid #4a6080; border-radius: 4px;
+    font-size: 11px; font-weight: bold; padding: 2px;
+}
+QToolButton:hover { background-color: #3a5070; border-color: #6090b0; }
+QToolButton:pressed { background-color: #1a2a3a; }
+""")
+        self.bottom_edge_btn.setToolTip('Show / hide log panel')
         self.bottom_edge_btn.clicked.connect(self._toggle_bottom_panel)
         self.bottom_edge_btn.show()
 

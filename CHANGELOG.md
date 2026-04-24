@@ -7,6 +7,75 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.26] — 2025-04-24
+
+### Fixed
+- **Selected signal stays thick after clicking plot area** (v00.00.25 regression).
+  Root cause: `table.clearSelection()` removes the visual highlight but
+  `table.currentRow()` keeps returning the last-clicked row number.
+  When `clearSelection()` fired `itemSelectionChanged` → `_emit_selection`,
+  `currentRow()` still pointed at the old row, so the curve was immediately
+  re-thickened.
+  Two fixes applied:
+  1. `_emit_selection` now calls `item.isSelected()` before treating a row
+     as active — if the row exists but is no longer selected, it calls
+     `_refresh_highlight()` and returns without re-highlighting anything.
+  2. Both deselect paths (`_on_plot_area_click` and the stacked left-click
+     handler) now wrap the clear in `table.blockSignals(True/False)` and
+     also call `table.setCurrentCell(-1, -1)` to truly clear the current
+     row before calling `_refresh_highlight()`.
+
+---
+
+## [v00.00.25] — 2025-04-24
+
+### Added
+- **Selected signal drawn thicker** — when a signal is selected in the
+  selected-signal panel, its curve is drawn at width 5.0 (normal = 2.8),
+  making it immediately visible in all plot modes (normal, multi-axis,
+  stacked).
+- **Click anywhere in plot area to deselect** — left-clicking the plot
+  area (normal / multi-axis mode) or the stacked plot area clears the
+  table selection and restores all curves to normal thickness.  The
+  mechanism: `sigMouseClicked` on the main ViewBox + left-button handling
+  in the stacked scene click handler.
+
+### Implementation notes
+- `_apply_curve_style(plotted, selected=False)` — added `selected`
+  parameter; `width = 5.0 if selected else 2.8`.
+- `_refresh_highlight()` — new lightweight method that iterates `_items`
+  and calls `_apply_curve_style` with the correct flag.  Updates only the
+  pen, no data reload or layout recalculation.
+- Called from: `_emit_selection` (table click), `_rebuild_curves` (after
+  add/remove/reorder), `_on_plot_area_click` (plot left-click),
+  `_on_stacked_scene_click` left-button path.
+
+---
+
+## [v00.00.24] — 2025-04-24
+
+### Fixed
+- **Panel toggle buttons invisible on light/white background** —
+  `left_edge_btn` and `bottom_edge_btn` used `setAutoRaise(True)` which
+  renders the button as a flat, transparent widget inheriting the system
+  theme.  On light or white plot backgrounds the Unicode arrow text blended
+  in and disappeared.  Both buttons now have an explicit QSS stylesheet:
+  dark charcoal background (`#2d3a4a`), white text (`#e0e8f0`), a visible
+  `1px solid #4a6080` border, and blue hover/pressed states.  Visible on
+  any plot background color, light or dark.  Tooltips added.
+
+- **Right-click on signal table does nothing after decode** — `_show_table_menu`
+  returned early when `selected_keys` was empty, so right-clicking without
+  first selecting a signal silently did nothing.  Menu now always opens.
+  Signal-specific actions are present but **greyed out** when nothing is
+  selected:
+  - *Change signal color* — disabled unless exactly one signal selected
+  - *Move selected up / down* — disabled unless a signal is selected
+  - *Remove selected signal* — disabled unless a signal is selected
+  - *Signal name display*, *Set plot background color* — **always enabled**
+
+---
+
 ## [v00.00.23] — 2025-04-23
 
 ### Changed — Option B: on-disk indexed raw frame store (no frame cap)

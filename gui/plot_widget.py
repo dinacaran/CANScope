@@ -164,6 +164,7 @@ class PlotPanel(QWidget):
         self.plot.setLabel('bottom', 'Time (seconds)')
         self.plot.setBackground(self._background_color)
         self._install_plot_background_menu()
+        self._install_plot_click_deselect()
 
         self.plot_host = QWidget()
         _host_layout = QGridLayout(self.plot_host)
@@ -514,6 +515,7 @@ class PlotPanel(QWidget):
         self._update_empty_state_ui()
         if selected:
             self._restore_selection(selected)
+        self._refresh_highlight()
         self._setup_mouse_proxy()
 
     def _rebuild_overlay(self) -> None:
@@ -659,17 +661,18 @@ class PlotPanel(QWidget):
 
     # ── Curve style ───────────────────────────────────────────────────────
 
-    def _apply_curve_style(self, plotted: PlottedSignal) -> None:
+    def _apply_curve_style(self, plotted: PlottedSignal,
+                           selected: bool = False) -> None:
         """
-        Bug 2 fix: PlotDataItem.setData accepts all kwargs including symbol.
-        This works identically for the main plot, extra ViewBoxes, and stacked rows.
+        Apply pen style.  Selected curves are drawn thicker (5.0 vs 2.8).
         """
         if plotted.curve is None:
             return
         ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
         vs = np.asarray(plotted.series.values,     dtype=np.float64)
+        width = 5.0 if selected else 2.8
         kwargs: dict = {
-            'pen':     pg.mkPen(color=plotted.color, width=2.8),
+            'pen':     pg.mkPen(color=plotted.color, width=width),
             'connect': 'finite',
         }
         if self._show_points:
@@ -682,6 +685,12 @@ class PlotPanel(QWidget):
         else:
             kwargs['symbol'] = None
         plotted.curve.setData(ts, vs, **kwargs)
+
+    def _refresh_highlight(self) -> None:
+        """Update curve thickness to reflect current table selection."""
+        sel = set(self.selected_keys())
+        for key, plotted in self._items.items():
+            self._apply_curve_style(plotted, selected=(key in sel))
 
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
@@ -1052,16 +1061,22 @@ class PlotPanel(QWidget):
 
     def _emit_selection(self) -> None:
         row = self.table.currentRow()
-        if row < 0:
+        # currentRow() keeps the last row even after clearSelection() —
+        # check the row is genuinely selected before treating it as active.
+        if row < 0 or not self.table.item(row, 0):
+            self._refresh_highlight()
             return
         item = self.table.item(row, 0)
-        if not item:
+        if not item.isSelected():
+            # Row exists but is no longer selected (deselect path)
+            self._refresh_highlight()
             return
         key = item.data(Qt.ItemDataRole.UserRole)
         if key:
             self._current_key = str(key)
             self._set_axis_label(self._current_key)
             self.selectionChanged.emit(str(key))
+        self._refresh_highlight()
 
     # ── Series management ─────────────────────────────────────────────────
 
@@ -1291,30 +1306,39 @@ class PlotPanel(QWidget):
         key  = item.data(Qt.ItemDataRole.UserRole) if item else None
         if key and str(key) not in selected_keys:
             selected_keys = [str(key)]
-        if not selected_keys:
-            return
+        # Always show the menu — signal-specific actions are greyed when
+        # nothing is selected, but background/display options work always.
         self._show_signal_menu(selected_keys, self.table.viewport().mapToGlobal(position))
 
     def _show_signal_menu(self, selected_keys: list, global_pos) -> None:
         """Shared signal context menu used by table and stacked plot right-click."""
         menu = self._make_menu()
-        if len(selected_keys) == 1:
-            act = QAction('Change signal color...', menu)
-            act.triggered.connect(lambda: self._choose_color_for_key(str(selected_keys[0])))
-            menu.addAction(act)
-            menu.addSeparator()
+        has_sel   = bool(selected_keys)
+        has_one   = len(selected_keys) == 1
+        has_items = bool(self._items)   # any signal plotted at all
+
+        # Change color — only when exactly one signal selected
+        act_color = QAction('Change signal color...', menu)
+        if has_one:
+            act_color.triggered.connect(lambda: self._choose_color_for_key(str(selected_keys[0])))
+        act_color.setEnabled(has_one)
+        menu.addAction(act_color)
+        menu.addSeparator()
+
         for label, slot in [
             ('Move selected up',   self.move_selected_up),
             ('Move selected down', self.move_selected_down),
         ]:
             a = QAction(label, menu)
             a.triggered.connect(slot)
+            a.setEnabled(has_sel)
             menu.addAction(a)
         menu.addSeparator()
         rm_label = ('Remove selected signals' if len(selected_keys) > 1
                     else 'Remove selected signal')
         rm = QAction(rm_label, menu)
         rm.triggered.connect(self.remove_selected_series)
+        rm.setEnabled(has_sel)
         menu.addAction(rm)
         # Signal display sub-menu
         menu.addSeparator()
@@ -1345,10 +1369,17 @@ class PlotPanel(QWidget):
         self._refresh_table()
 
     def _on_stacked_scene_click(self, event) -> None:
-        """Right-click in stacked plot — detect row and show signal menu."""
+        """Left-click → clear selection. Right-click → signal context menu."""
         try:
             btn = event.button()
         except Exception:
+            return
+        if btn == Qt.MouseButton.LeftButton:
+            self.table.blockSignals(True)
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
+            self.table.blockSignals(False)
+            self._refresh_highlight()
             return
         if btn != Qt.MouseButton.RightButton:
             return
@@ -1367,6 +1398,34 @@ class PlotPanel(QWidget):
                     except Exception:
                         pass
                 return
+
+    def _install_plot_click_deselect(self) -> None:
+        """Left-click anywhere in the plot area clears selection and resets highlight."""
+        try:
+            vb = self.plot.plotItem.vb
+            vb.scene().sigMouseClicked.connect(self._on_plot_area_click)
+        except Exception:
+            pass
+
+    def _on_plot_area_click(self, event) -> None:
+        """Left-click in any non-stacked plot area → clear selection and reset thickness."""
+        try:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+        except Exception:
+            return
+        try:
+            vb = self.plot.plotItem.vb
+            if not vb.sceneBoundingRect().contains(event.scenePos()):
+                return
+        except Exception:
+            pass
+        # Block itemSelectionChanged so _emit_selection can't re-highlight
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.table.blockSignals(False)
+        self._refresh_highlight()
 
     def _install_plot_background_menu(self) -> None:
         pi   = getattr(self.plot, 'plotItem', None)
