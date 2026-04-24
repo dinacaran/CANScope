@@ -32,7 +32,7 @@ CAN Trace/ Raw Frame:
 <img width="1543" height="1019" alt="CANScope_RawCAN Frame" src="https://github.com/user-attachments/assets/69ad9749-ecec-445d-a31f-4b47901855cf" />
 
 Full tool view:
-<img width="2859" height="1811" alt="CANScope Viewer full view" src="https://github.com/user-attachments/assets/c357fd33-3fff-49f7-a75a-2095a47498ea" />
+<img width="2811" height="1663" alt="CANScope Viewer full view" src="https://github.com/user-attachments/assets/48ebceab-5fbc-47d8-9c9c-452452d2df57" />
 
 ---
 
