@@ -28,8 +28,12 @@ Stacked plot:
 Multiple Axis plot:
 <img width="2376" height="1300" alt="Multi_plot" src="https://github.com/user-attachments/assets/efc7b429-befa-4344-bed3-4d5c2151ca98" />
 
+CAN Trace/ Raw Frame:
+<img width="1543" height="1019" alt="CANScope_RawCAN Frame" src="https://github.com/user-attachments/assets/69ad9749-ecec-445d-a31f-4b47901855cf" />
+
 Full tool view:
-<img width="2556" height="1400" alt="BLF Viewer full view" src="https://github.com/user-attachments/assets/239b7dd1-948a-498b-a309-07e967dcc94d" />
+<img width="2859" height="1811" alt="CANScope Viewer full view" src="https://github.com/user-attachments/assets/c357fd33-3fff-49f7-a75a-2095a47498ea" />
+
 ---
 
 ## Features
