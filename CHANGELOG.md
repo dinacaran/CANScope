@@ -7,6 +7,146 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.31] — 2025-04-25
+
+### Fixed — DBC Manager match quality: J1939 PGN fallback
+
+Exact ID matching alone gave near-0% match for J1939 files because
+ECUs broadcast on different source addresses than the DBC template value
+(e.g. DBC defines `0x18FEBD00`, file contains `0x18FEBDFE`).
+Result: "3 / 549 IDs" at 0% for a fully compatible DBC.
+
+`_compute_match` now uses a two-pass strategy (match display only — actual
+decode via DBCDecoder remains exact-match):
+
+1. **Pass 1 — Exact 29-bit ID match** (standard and J1939 specific-source)
+2. **Pass 2 — J1939 PGN fallback** for IDs that didn't match exactly.
+   For extended frames where `PF >= 0xF0` (J1939 PDU2 format), the
+   source address byte is stripped and only the PGN (`bits 8–23`) is
+   compared.  `0x18FEBD00` and `0x18FEBDFE` both yield PGN `0xFEBD` →
+   counted as a match.
+
+The match bar now shows realistic percentages for J1939 files with
+mixed source addresses.
+
+---
+
+## [v00.00.30] — 2025-04-25
+
+### Fixed — DBC Manager Refresh Match not working
+
+Root cause: `_ids_per_channel` was captured once at dialog open time.
+Clicking "↻ Refresh Match" called `_refresh_all_matches()` but re-used the
+same empty dict — so match quality stayed 0/0 regardless.
+
+Fix: `data_provider` callable pattern.
+
+- `MainWindow._collect_channel_data()` — new reusable method that reads
+  channel numbers and per-channel arb-ID sets from `raw_frame_store`
+  (most accurate) or `store.channels` (fallback).
+- `DBCManagerDialog` accepts an optional `data_provider` kwarg (a callable
+  returning `(channels, ids_per_channel)`).
+- `_refresh_all_matches()` calls `self._data_provider()` first to fetch
+  **live** data from the main window at refresh time.  This works even if
+  decode completed after the dialog was opened.
+- New channels discovered on refresh are added to each row's channel dropdown.
+- If still no measurement data, a clear message is shown:
+  *"Load and decode a BLF/ASC measurement first, then click Refresh Match."*
+
+---
+
+## [v00.00.29] — 2025-04-25
+
+### Fixed — DBC Manager: channel list and match quality
+
+- **Only one channel shown on first open** — `channels_in_file` was built
+  only from `raw_frame_store`, which is `None` before a file is decoded.
+  `choose_dbc` now collects channels from three sources in priority order:
+  1. `raw_frame_store` arrays (most accurate — per-channel arb IDs available)
+  2. `store.channels` set (available after any decode, including MF4/CSV)
+  3. Fallback: `[1, 2]` minimum so the user can still assign DBCs before
+     any measurement is loaded.
+- **Match quality bar always 0% after loading a DBC** — `_compute_match`
+  ran once at row creation time but `_ids_per_channel` was empty when the
+  dialog opened before a file was decoded.  Two fixes:
+  - `_refresh_all_matches()` — new method that recomputes match quality and
+    updates each row's bar and auto-suggest channel dropdown.  Called
+    automatically when the dialog opens if `ids_per_channel` is non-empty.
+  - **"↻ Refresh Match" button** — manual trigger so the user can re-run
+    the match computation at any time (e.g. after loading a new measurement
+    while the dialog is still open, or after adding a DBC via "+ Add DBC").
+  - `_bar` and `_match_lbl` are now stored as instance attributes on
+    `_DBCRow` so `update_match(pct, text)` can update them externally.
+
+---
+
+## [v00.00.28] — 2025-04-25
+
+### Added — Multi-DBC channel configuration
+
+**New: `core/channel_config.py` — ChannelConfig**
+- Maps CAN channel numbers to DBC file paths.  Separates the "vehicle
+  configuration" (which DBC goes on which bus) from the "measurement session"
+  (which file to analyse + which signals to plot).
+- `ALL_CHANNELS_KEY = 0` — assign a DBC as fallback for any channel not
+  explicitly configured.
+- DBCDecoder instances are created lazily and cached per DBC path — the same
+  DBC shared across two channels reuses one decoder (saves RAM + parse time).
+- Saved as a standalone `.canscope_ch` JSON file; loadable independently of
+  the session config.
+- `ChannelConfig.from_single_dbc(path)` — backward-compatible factory for
+  the old single-DBC workflow.
+
+**New: `gui/dbc_manager.py` — DBC Manager dialog**
+- Replaces the single "Open DBC file" picker.
+- Shows one row per DBC with: file name, channel assignment dropdown,
+  match quality bar (% of DBC IDs seen in the measurement), and match
+  count label (e.g. "34 / 37 IDs").
+- Channel assignment is **auto-suggested**: the channel with the most
+  matching IDs is pre-selected — user only needs to correct mistakes.
+- "All Channels" option in each dropdown for DBC files covering multiple buses.
+- **Save Channel Config…** / **Load Channel Config…** buttons save/load the
+  mapping as a `.canscope_ch` file, independent of the session config.
+
+**Changed: `core/load_worker.py`**
+- Accepts `ChannelConfig` instead of a single `dbc_path`.
+- Per-frame decode: `cfg.decoder_for(frame.channel)` selects the right
+  DBCDecoder before calling `decode_frame()`.
+- All decoders are pre-built before the decode loop (`build_all_decoders()`)
+  so no frame pays the DBC parse cost.
+
+**Changed: `gui/main_window.py`**
+- `self.channel_config: ChannelConfig` persists between measurement loads —
+  loading a new BLF file does **not** clear the DBC mapping.
+- "Open DBC" button opens the DBC Manager dialog instead of a plain picker.
+- `save_configuration` includes the full channel config in JSON.
+- `load_configuration` restores it; falls back to `from_single_dbc` for
+  configs saved by older versions (backward compatible).
+- "Open DBC" is now always enabled (previously greyed until a file was selected).
+
+**Workflow for repeated measurements:**
+  1. Load any measurement, click Open DBC → configure channel mapping once.
+  2. Click Save Channel Config → `MyVehicle.canscope_ch`.
+  3. Load next measurement → DBC mapping is already in memory, click
+     Load + Decode immediately.
+  4. Or: Load Channel Config to restore a previously saved mapping.
+
+---
+
+## [v00.00.27] — 2025-04-24
+
+### Added
+- **Application icon** — `resources/app_icon.ico` (multi-resolution:
+  256 / 128 / 64 / 48 / 32 / 16 px, all embedded in one ICO file) and
+  `resources/CANScope_ICON.png` (full 1254×1254 RGBA source).
+  Both files are bundled in the portable EXE via `CANScope.spec`.
+  At runtime `app.py` loads the PNG first (sharper on HiDPI displays),
+  falling back to the ICO.  The ICO is embedded in the EXE binary by
+  PyInstaller so Windows Explorer, the taskbar, and Alt+Tab all show
+  the icon without the app being running.
+
+---
+
 ## [v00.00.26] — 2025-04-24
 
 ### Fixed

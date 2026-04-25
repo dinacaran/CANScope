@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 APP_NAME    = "CAN Scope"
-APP_VERSION = "v00.00.26"
+APP_VERSION = "v00.00.31"
 
 
 def main() -> int:
@@ -20,9 +20,12 @@ def main() -> int:
         Path(sys._MEIPASS) if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
         else Path(__file__).resolve().parent
     )
-    icon_path = _res_root / "resources" / "app_icon.ico"
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
+    # Prefer PNG (full RGBA, sharp on HiDPI); fall back to ICO
+    for _icon_name in ('CANScope_ICON.png', 'app_icon.ico'):
+        _icon_path = _res_root / 'resources' / _icon_name
+        if _icon_path.exists():
+            app.setWindowIcon(QIcon(str(_icon_path)))
+            break
 
     # ── Show splash immediately — before any heavy imports ────────────────
     # gui.splash only imports PySide6 (already loaded) + pathlib.

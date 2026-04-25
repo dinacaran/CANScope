@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
 from core.export import ExportService
 from core.load_worker import LoadWorker
 from core.readers import dbc_required_for, ALL_SUFFIXES
+from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
+from gui.dbc_manager import DBCManagerDialog
 from core.signal_store import SignalStore
 from gui.plot_widget import PlotPanel
 from gui.signal_tree import SignalTreeWidget
@@ -48,8 +50,10 @@ class MainWindow(QMainWindow):
 
         self._splash = splash
         self.measurement_path: str | None = None
+        # Multi-DBC channel configuration — persists between measurement loads
+        self.channel_config: ChannelConfig = ChannelConfig()
+        # Legacy single-DBC alias for config backward-compat
         self.dbc_path: str | None = None
-        # backward-compat alias used in save_configuration
         self.blf_path: str | None = None  # deprecated alias
         self.store: SignalStore | None = None
         self._thread: QThread | None = None
@@ -291,14 +295,52 @@ QToolButton:pressed { background-color: #1a2a3a; }
             'Measurement file selected', self._next_step_message()
         )
 
+    def _collect_channel_data(self) -> tuple[list[int], dict[int, set[int]]]:
+        """
+        Collect CAN channel numbers and per-channel arbitration ID sets
+        from all available sources.  Used by the DBC Manager on open and
+        on Refresh Match.
+        """
+        ids_per_channel: dict[int, set[int]] = {}
+        channels_in_file: list[int] = []
+        rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
+        if rfs is not None and len(rfs) > 0:
+            import numpy as np
+            chs  = np.frombuffer(rfs.channels, dtype=np.uint8)
+            aids = np.frombuffer(rfs.arb_ids,  dtype=np.uint32)
+            for ch_val in np.unique(chs):
+                if ch_val == 255:
+                    continue
+                ch_int = int(ch_val)
+                channels_in_file.append(ch_int)
+                ids_per_channel[ch_int] = set(int(x) for x in aids[chs == ch_val])
+        if not channels_in_file and self.store is not None:
+            for ch in sorted(self.store.channels):
+                if ch is not None:
+                    channels_in_file.append(int(ch))
+        return channels_in_file, ids_per_channel
+
     def choose_dbc(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, 'Open DBC file', '', 'DBC Files (*.dbc)')
-        if not path:
+        """Open the DBC Manager dialog to assign DBCs to channels."""
+        channels_in_file, ids_per_channel = self._collect_channel_data()
+
+        dlg = DBCManagerDialog(
+            channel_config   = self.channel_config,
+            channels_in_file = channels_in_file,
+            ids_per_channel  = ids_per_channel,
+            parent           = self,
+            data_provider    = self._collect_channel_data,
+        )
+        if dlg.exec() != DBCManagerDialog.DialogCode.Accepted:
             return
-        self.dbc_path = path
-        self._log(f'Selected DBC: {path}')
+
+        self.channel_config = dlg.result_config()
+        paths = self.channel_config.all_dbc_paths()
+        self.dbc_path = paths[0] if paths else None
+        self._log(self.channel_config.summary())
         self._update_measurement_tab()
-        self._update_status('DBC selected', self._next_step_message())
+        self._update_action_states()
+        self._update_status('DBC configured', self._next_step_message())
 
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
@@ -343,7 +385,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         config = {
             'version': self.version,
             'blf_path': self.measurement_path or self.blf_path,
-            'dbc_path': self.dbc_path,
+            'dbc_path': self.dbc_path,  # legacy single-DBC
+            'channel_config': {
+                'name': self.channel_config.name,
+                'channels': {str(k): v for k, v in self.channel_config.channels.items()},
+            },
             'signals': self.plot_panel.plotted_keys(),
             'show_data_points': self.btn_points.isChecked(),
             'plot_background_color': self.plot_panel.background_color(),
@@ -380,6 +426,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
         cfg_blf = data.get('blf_path')
         # measurement_path is the canonical name; blf_path kept for config backward-compat
         cfg_dbc = data.get('dbc_path')
+        # Restore channel_config (new format) or fall back to single-DBC compat
+        cfg_ch = data.get('channel_config')
+        if cfg_ch and isinstance(cfg_ch, dict):
+            self.channel_config = ChannelConfig(
+                name=cfg_ch.get('name', 'Unnamed'),
+                channels={int(k): v for k, v in cfg_ch.get('channels', {}).items()},
+            )
+        elif cfg_dbc:
+            self.channel_config = ChannelConfig.from_single_dbc(cfg_dbc)
         pending_keys   = list(data.get('signals') or [])
         pending_colors = dict(data.get('signal_colors') or {})
 
@@ -442,12 +497,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._update_status('Waiting for input', self._next_step_message())
             return
         # DBC required only for CAN-raw formats
-        if dbc_required_for(mpath) and not self.dbc_path:
-            QMessageBox.warning(self, 'Missing DBC',
-                'This format requires a DBC file for signal decoding.\n'
-                'Please click \'Open DBC\' first.')
-            self._update_status('Waiting for input', self._next_step_message())
-            return
+        if dbc_required_for(mpath) and self.channel_config.is_empty():
+            reply = QMessageBox.question(
+                self, 'No DBC configured',
+                'This format requires a DBC for signal decoding.\n'
+                'No DBC is configured yet.\n\n'
+                'Open DBC Manager now?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.choose_dbc()
+            if self.channel_config.is_empty():
+                self._update_status('Waiting for input', self._next_step_message())
+                return
         self._pending_plot_keys = list(pending_plot_keys or [])
         self.plot_panel.clear_all()
         self.signal_tree.set_payload({})
@@ -458,7 +521,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._log(f'Loading: {mpath}')
         self._update_status('Loading and decoding...', 'Wait for decode to finish, then inspect Diagnostics and plot signals')
         self._thread = QThread(self)
-        self._worker = LoadWorker(mpath, self.dbc_path or None)
+        self._worker = LoadWorker(mpath, self.channel_config if not self.channel_config.is_empty() else None)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_worker_progress)
@@ -659,7 +722,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
     # Actions enabled/disabled per app state
     # needs_file  = requires measurement file to be selected
     # needs_store = requires decode to have completed
-    _ACTS_NEEDS_FILE  = {'Open DBC', 'Load + Decode'}
+    _ACTS_NEEDS_FILE  = {'Load + Decode'}
     _ACTS_NEEDS_STORE = {'Save Config', 'Export CSV', 'Clear Plots'}
 
     def _update_action_states(self) -> None:
@@ -682,8 +745,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         mpath = self.measurement_path or self.blf_path
         if not mpath:
             return "Click 'Open File' to load BLF / ASC / MF4 / MDF / CSV."
-        if dbc_required_for(mpath) and not self.dbc_path:
-            return "DBC required for this format — click 'Open DBC'."
+        if dbc_required_for(mpath) and self.channel_config.is_empty():
+            return "DBC required — click 'Open DBC' to configure channel mapping."
         return "Click 'Load + Decode', then select signal(s) to plot."
 
     def _update_measurement_tab(self, channels: str = '', frames: str = '', decoded: str = '', samples: str = '') -> None:

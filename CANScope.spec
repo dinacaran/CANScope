@@ -18,6 +18,11 @@ splash_file = project_root / "resources" / "splashscreen.png"
 if splash_file.exists():
     datas.append((str(splash_file), "resources"))
 
+# Bundle app icon PNG for runtime window icon
+icon_png = project_root / "resources" / "CANScope_ICON.png"
+if icon_png.exists():
+    datas.append((str(icon_png), "resources"))
+
 hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",
@@ -65,7 +70,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon=str(icon_file) if icon_file.exists() else None,
+    icon=str(project_root / 'resources' / 'app_icon.ico'),
 )
 
 coll = COLLECT(
