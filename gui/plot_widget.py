@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QInputDialog,
     QGraphicsTextItem,
     QColorDialog,
     QGridLayout,
@@ -35,6 +36,8 @@ class PlottedSignal:
     color: str
     axis: Any = None
     view_box: Any = None
+    visible: bool = True   # checkbox state — False hides curve and stacked row
+    group: str = ''        # '' = ungrouped; any string = group name
 
 
 
@@ -154,7 +157,9 @@ class PlotPanel(QWidget):
         # Signal name display flags (default: signal name only)
         self._name_show_channel: bool = False
         self._name_show_message: bool = False
+        self._collapsed_groups: dict[str, bool] = {}
         self._cursor2_enabled: bool = False
+        self._group_vis_changed: bool = False  # True when itemChanged fired before cellClicked
         self.setAcceptDrops(True)
 
         # ── Normal / multi-axis plot ──────────────────────────────────────
@@ -221,12 +226,15 @@ class PlotPanel(QWidget):
         # v_line2 not added to plot until cursor 2 is enabled
 
         # ── Signal table ──────────────────────────────────────────────────
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ['Signal', 'Cursor 1', 'Cursor 2', 'Unit'])
+            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemSelectionChanged.connect(self._emit_selection)
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self.table.itemDoubleClicked.connect(self._on_table_item_double_clicked)
+        self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
         self.table.verticalHeader().setVisible(False)
@@ -234,15 +242,18 @@ class PlotPanel(QWidget):
         hdr.setStretchLastSection(False)
         hdr.setStretchLastSection(False)
         # Fix 1: all three columns user-resizable
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 200)   # Signal
-        self.table.setColumnWidth(1, 90)    # Cursor 1
-        self.table.setColumnWidth(2, 90)    # Cursor 2
-        self.table.setColumnWidth(3, 55)    # Unit
-        self.table.setColumnHidden(2, True) # hidden until cursor 2 enabled
+        hdr.setMinimumSectionSize(0)  # allow col 0 to be as narrow as we set it
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)      # ☑
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive) # Signal
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive) # Cursor 1
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive) # Cursor 2
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive) # Unit
+        self.table.setColumnWidth(0, 36)    # ☑ checkbox + group arrow
+        self.table.setColumnWidth(1, 190)   # Signal
+        self.table.setColumnWidth(2, 90)    # Cursor 1
+        self.table.setColumnWidth(3, 90)    # Cursor 2
+        self.table.setColumnWidth(4, 55)    # Unit
+        self.table.setColumnHidden(3, True) # hidden until cursor 2 enabled
 
         self.table_panel = QWidget()
         _tbl_layout = QVBoxLayout(self.table_panel)
@@ -331,7 +342,7 @@ class PlotPanel(QWidget):
                 try: self.plot.addItem(self.v_line, ignoreBounds=True)
                 except Exception: pass
             if self._items:
-                self._update_table_values(cx, col=1)
+                self._update_table_values(cx, col=2)
         else:
             if self._stacked_mode:
                 # Hide by making invisible (don't remove — rebuild re-adds them)
@@ -376,9 +387,9 @@ class PlotPanel(QWidget):
             else:
                 try: self.plot.addItem(self.v_line2, ignoreBounds=True)
                 except Exception: pass
-            self.table.setColumnHidden(2, False)
+            self.table.setColumnHidden(3, False)
             if self._items:
-                self._update_table_values(cx2, col=2)
+                self._update_table_values(cx2, col=3)
         else:
             if self._stacked_mode:
                 for line in self._stacked_c2_lines:
@@ -388,7 +399,7 @@ class PlotPanel(QWidget):
             else:
                 try: self.plot.removeItem(self.v_line2)
                 except Exception: pass
-            self.table.setColumnHidden(2, True)
+            self.table.setColumnHidden(3, True)
             self.cursor2_label.hide()
         self._update_cursor_labels()
 
@@ -452,12 +463,17 @@ class PlotPanel(QWidget):
         self.plot.setLabel('left', 'Value')
         self.plot.getAxis('left').setWidth(55)
 
+        # Save cursor positions before destroying the old InfiniteLines
+        _saved_c1 = self.v_line.value() if hasattr(self, 'v_line') else 0.0
+        _saved_c2 = self.v_line2.value() if (self._cursor2_enabled and hasattr(self, 'v_line2')) else 0.0
+
         # Recreate draggable cursor lines preserving movable=True
         self.v_line = pg.InfiniteLine(
             angle=90, movable=True,
             pen=pg.mkPen(color='#0000ff', width=1.5),
             label='C1', labelOpts={'color': '#0000ff', 'position': 0.95}
         )
+        self.v_line.setPos(_saved_c1)   # restore position immediately
         self.h_line = pg.InfiniteLine(angle=0, movable=False,
                                       pen=pg.mkPen(color='#555', width=1))
         self.v_line.sigPositionChanged.connect(self._on_cursor1_moved)
@@ -474,6 +490,7 @@ class PlotPanel(QWidget):
                 pen=pg.mkPen(color='#0000ff', width=1.5, style=Qt.PenStyle.DashLine),
                 label='C2', labelOpts={'color': '#0000ff', 'position': 0.85}
             )
+            self.v_line2.setPos(_saved_c2)  # restore position immediately
             self.v_line2.sigPositionChanged.connect(self._on_cursor2_moved)
             self.plot.addItem(self.v_line2, ignoreBounds=True)
 
@@ -496,6 +513,20 @@ class PlotPanel(QWidget):
 
     def _rebuild_curves(self, preserve_selection: bool = False) -> None:
         selected = self.selected_keys() if preserve_selection else []
+
+        # Save X view range and cursor positions before destroying rendered items
+        _saved_xr: list | None = None
+        if self._stacked_mode and self._stacked_plots:
+            try:
+                _saved_xr = list(self._stacked_plots[0].vb.viewRange()[0])
+            except Exception:
+                pass
+        elif not self._stacked_mode:
+            try:
+                _saved_xr = list(self.plot.plotItem.vb.viewRange()[0])
+            except Exception:
+                pass
+
         self._clear_rendered_items()
 
         if not self._items:
@@ -506,9 +537,21 @@ class PlotPanel(QWidget):
         if self._stacked_mode:
             self.view_stack.setCurrentIndex(1)
             self._rebuild_stacked()
+            # Restore X range so the view doesn't jump when rows are added/removed
+            if _saved_xr and self._stacked_plots:
+                try:
+                    self._stacked_plots[0].setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                except Exception:
+                    pass
         else:
             self.view_stack.setCurrentIndex(0)
             self._rebuild_overlay()
+            # Restore X range for overlay mode
+            if _saved_xr:
+                try:
+                    self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                except Exception:
+                    pass
 
         self._set_axis_label(self._current_key)
         self._refresh_table()
@@ -517,11 +560,22 @@ class PlotPanel(QWidget):
             self._restore_selection(selected)
         self._refresh_highlight()
         self._setup_mouse_proxy()
+        # Repopulate cursor value columns — _refresh_table wipes them to ''
+        self._update_table_values(self.v_line.value(), col=2)
+        if self._cursor2_enabled:
+            self._update_table_values(self.v_line2.value(), col=3)
 
     def _rebuild_overlay(self) -> None:
         """Normal or multi-axis: all signals on one PlotWidget, extra axes to the left."""
-        for idx, key in enumerate(self._items):
+        vis_idx = 0  # count only visible signals for multi-axis numbering
+        for key in self._items:
             plotted = self._items[key]
+            idx = vis_idx
+
+            if not plotted.visible:
+                plotted.curve = None
+                continue
+            vis_idx += 1
 
             if self._multi_axis and idx > 0:
                 # ── BUG 1 FIX ──
@@ -566,7 +620,8 @@ class PlotPanel(QWidget):
             Line 2: name  → rotates to LEFT side  → outer (furthest from data)
         - Both lines are part of the same axis label, so no TextItem tracking needed.
         """
-        order = list(self._items.keys())
+        # Only stack visible signals — invisible ones are completely hidden
+        order = [k for k, p in self._items.items() if p.visible]
         n = len(order)
         ref_plot: pg.PlotItem | None = None
 
@@ -690,7 +745,8 @@ class PlotPanel(QWidget):
         """Update curve thickness to reflect current table selection."""
         sel = set(self.selected_keys())
         for key, plotted in self._items.items():
-            self._apply_curve_style(plotted, selected=(key in sel))
+            if plotted.curve is not None and plotted.visible:
+                self._apply_curve_style(plotted, selected=(key in sel))
 
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
@@ -753,7 +809,7 @@ class PlotPanel(QWidget):
             if line is not self.sender():
                 line.setPos(x)
         self._syncing_c1 = False
-        self._update_table_values(x, col=1)
+        self._update_table_values(x, col=2)
         self._update_cursor_labels()
 
     def _on_stacked_c2_moved(self) -> None:
@@ -765,20 +821,20 @@ class PlotPanel(QWidget):
         for line in self._stacked_c2_lines:
             if line is not self.sender():
                 line.setPos(x)
-        self._update_table_values(x, col=2)
+        self._update_table_values(x, col=3)
         self._update_cursor_labels()
 
     def _on_cursor1_moved(self) -> None:
         """Called when Cursor 1 InfiniteLine is dragged."""
         x = self.v_line.value()
-        self._update_table_values(x, col=1)
+        self._update_table_values(x, col=2)
         self._update_cursor_labels()
 
     def _on_cursor2_moved(self) -> None:
         """Called when Cursor 2 InfiniteLine is dragged."""
         if not self._cursor2_enabled:
             return
-        self._update_table_values(self.v_line2.value(), col=2)
+        self._update_table_values(self.v_line2.value(), col=3)
         self._update_cursor_labels()
 
     def _update_cursor_labels(self) -> None:
@@ -809,14 +865,18 @@ class PlotPanel(QWidget):
         mp = self.plot.plotItem.vb.mapSceneToView(pos)
         self.h_line.setPos(mp.y())
 
-    def _update_table_values(self, x: float, col: int = 1) -> None:
-        """Update Cursor 1 (col=1) or Cursor 2 (col=2) value column."""
+    def _update_table_values(self, x: float, col: int = 2) -> None:
+        """Update Cursor 1 (col=2) or Cursor 2 (col=3) value column."""
         row_lookup: dict[str, int] = {}
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
+            item = self.table.item(row, 1)   # signal key is now col 1
             if item:
-                row_lookup[str(item.data(Qt.ItemDataRole.UserRole))] = row
+                key = str(item.data(Qt.ItemDataRole.UserRole))
+                if not key.startswith('__'):
+                    row_lookup[key] = row
         for key, plotted in self._items.items():
+            if not plotted.visible:
+                continue   # hidden signal — no cursor value shown
             idx = self._nearest_index(plotted.series.timestamps, x)
             if idx is None:
                 continue
@@ -842,7 +902,8 @@ class PlotPanel(QWidget):
                 self.plot.autoRange()
             return
 
-        all_ts = [ts for it in self._items.values() for ts in it.series.timestamps]
+        vis = [p for p in self._items.values() if p.visible]
+        all_ts = [ts for p in (vis or self._items.values()) for ts in p.series.timestamps]
         if not all_ts:
             return
         x_min, x_max = min(all_ts), max(all_ts)
@@ -850,9 +911,11 @@ class PlotPanel(QWidget):
             x_max += 1.0
 
         if self._stacked_mode:
-            for i, (key, plotted) in enumerate(self._items.items()):
+            order = [k for k, p in self._items.items() if p.visible]
+            for i, key in enumerate(order):
                 if i >= len(self._stacked_plots):
                     break
+                plotted = self._items[key]
                 p = self._stacked_plots[i]
                 p.setXRange(x_min, x_max, padding=0.02)
                 vals = [v for v in plotted.series.values if v == v]
@@ -862,15 +925,19 @@ class PlotPanel(QWidget):
                     p.setYRange(y_min - pad, y_max + pad, padding=0)
         elif self._multi_axis:
             self.plot.setXRange(x_min, x_max, padding=0.02)
-            for idx, (key, plotted) in enumerate(self._items.items()):
+            # Geometry must be current before setYRange on floating ViewBoxes
+            self._update_multi_axis_views()
+            for key, plotted in self._items.items():
+                if not plotted.visible:
+                    continue
                 vals = [v for v in plotted.series.values if v == v]
                 if not vals:
                     continue
                 y_min, y_max = min(vals), max(vals)
                 pad = (y_max - y_min) * 0.05 if y_min != y_max else (1.0 if y_min == 0 else abs(y_min) * 0.05)
-                target = self.plot.plotItem.vb if (idx == 0 or plotted.view_box is None) else plotted.view_box
+                target = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
+                target.disableAutoRange()
                 target.setYRange(y_min - pad, y_max + pad, padding=0)
-            self._update_multi_axis_views()
         else:
             self.plot.setXRange(x_min, x_max, padding=0.02)
             numeric = [v for it in self._items.values() for v in it.series.values if v == v]
@@ -905,9 +972,11 @@ class PlotPanel(QWidget):
             return y_min - pad, y_max + pad
 
         if self._stacked_mode:
-            for i, (key, plotted) in enumerate(self._items.items()):
+            order = [k for k, p in self._items.items() if p.visible]
+            for i, key in enumerate(order):
                 if i >= len(self._stacked_plots):
                     break
+                plotted = self._items[key]
                 p = self._stacked_plots[i]
                 try:
                     xr = p.vb.viewRange()[0]
@@ -918,14 +987,18 @@ class PlotPanel(QWidget):
                     p.setYRange(result[0], result[1], padding=0)
 
         elif self._multi_axis:
-            for idx, (key, plotted) in enumerate(self._items.items()):
-                vb = self.plot.plotItem.vb if (idx == 0 or plotted.view_box is None)                      else plotted.view_box
+            self._update_multi_axis_views()  # ensure geometry is current
+            for key, plotted in self._items.items():
+                if not plotted.visible:
+                    continue
+                vb = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
                 try:
                     xr = vb.viewRange()[0]
                 except Exception:
                     continue
                 result = _y_range_for_visible(plotted.series, xr[0], xr[1])
                 if result:
+                    vb.disableAutoRange()
                     vb.setYRange(result[0], result[1], padding=0)
 
         else:
@@ -1043,36 +1116,71 @@ class PlotPanel(QWidget):
         return label
 
     def _refresh_table(self) -> None:
-        self.table.setRowCount(len(self._items))
-        for row, (key, plotted) in enumerate(self._items.items()):
-            signal_item  = QTableWidgetItem(self._format_signal_label(key))
-            signal_item.setData(Qt.ItemDataRole.UserRole, key)   # key unchanged
-            cursor1_item = QTableWidgetItem('')
-            cursor2_item = QTableWidgetItem('')
-            unit_item    = QTableWidgetItem(plotted.series.unit)
-            brush = QBrush(QColor(plotted.color))
-            for item in (signal_item, cursor1_item, cursor2_item, unit_item):
-                item.setForeground(brush)
-            self.table.setItem(row, 0, signal_item)
-            self.table.setItem(row, 1, cursor1_item)
-            self.table.setItem(row, 2, cursor2_item)
-            self.table.setItem(row, 3, unit_item)
+        self.table.blockSignals(True)
+        # Build ordered list: group headers interleaved with signal rows
+        rows: list[tuple[str, str | None]] = []  # (type, key): type='group'|'signal'
+        seen_groups: set[str] = set()
+        for key, plotted in self._items.items():
+            g = plotted.group
+            if g and g not in seen_groups:
+                rows.append(('group', g))
+                seen_groups.add(g)
+            rows.append(('signal', key))
+
+        self.table.setRowCount(len(rows))
+        for row_idx, (rtype, rval) in enumerate(rows):
+            if rtype == 'group':
+                self._set_group_header_row(row_idx, rval)
+            else:
+                key     = rval
+                plotted = self._items[key]
+                indent  = '  ' if plotted.group else ''
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable |
+                    Qt.ItemFlag.ItemIsEnabled |
+                    Qt.ItemFlag.ItemIsSelectable
+                )
+                chk_item.setCheckState(
+                    Qt.CheckState.Checked if plotted.visible
+                    else Qt.CheckState.Unchecked
+                )
+                chk_item.setData(Qt.ItemDataRole.UserRole, key)
+                sig_item = QTableWidgetItem(indent + self._format_signal_label(key))
+                sig_item.setData(Qt.ItemDataRole.UserRole, key)
+                c1_item  = QTableWidgetItem('')
+                c2_item  = QTableWidgetItem('')
+                un_item  = QTableWidgetItem(plotted.series.unit)
+                brush = QBrush(QColor(
+                    plotted.color if plotted.visible else '#606060'
+                ))
+                for item in (sig_item, c1_item, c2_item, un_item):
+                    item.setForeground(brush)
+                chk_item.setForeground(brush)
+                self.table.setItem(row_idx, 0, chk_item)
+                self.table.setItem(row_idx, 1, sig_item)
+                self.table.setItem(row_idx, 2, c1_item)
+                self.table.setItem(row_idx, 3, c2_item)
+                self.table.setItem(row_idx, 4, un_item)
+        self.table.blockSignals(False)
+        self._apply_collapse_state()
         # widths are user-controlled — no resizeColumnsToContents
 
     def _emit_selection(self) -> None:
         row = self.table.currentRow()
-        # currentRow() keeps the last row even after clearSelection() —
-        # check the row is genuinely selected before treating it as active.
-        if row < 0 or not self.table.item(row, 0):
+        if row < 0:
             self._refresh_highlight()
             return
-        item = self.table.item(row, 0)
-        if not item.isSelected():
-            # Row exists but is no longer selected (deselect path)
+        # Signal key lives in col 1; group header key lives in col 0
+        item = self.table.item(row, 1) or self.table.item(row, 0)
+        if not item or not item.isSelected():
             self._refresh_highlight()
             return
         key = item.data(Qt.ItemDataRole.UserRole)
-        if key:
+        # Skip group header rows
+        if isinstance(key, str) and key.startswith('__'):
+            return
+        if key and key in self._items:
             self._current_key = str(key)
             self._set_axis_label(self._current_key)
             self.selectionChanged.emit(str(key))
@@ -1177,20 +1285,21 @@ class PlotPanel(QWidget):
         keys: list[str] = []
         seen: set[str]  = set()
         for index in self.table.selectionModel().selectedRows():
-            item = self.table.item(index.row(), 0)
+            # Signal key is in col 1 (col 0 is checkbox / group arrow)
+            item = self.table.item(index.row(), 1)
             if not item:
                 continue
             key = item.data(Qt.ItemDataRole.UserRole)
-            if key and str(key) not in seen:
+            if key and str(key) not in seen and not str(key).startswith('__'):
                 seen.add(str(key))
                 keys.append(str(key))
         if not keys:
             row = self.table.currentRow()
             if row >= 0:
-                item = self.table.item(row, 0)
+                item = self.table.item(row, 1)
                 if item:
                     key = item.data(Qt.ItemDataRole.UserRole)
-                    if key:
+                    if key and not str(key).startswith('__'):
                         keys.append(str(key))
         return keys
 
@@ -1227,13 +1336,13 @@ class PlotPanel(QWidget):
             pass
 
     def table_column_widths(self) -> list[int]:
-        """Return current widths of the 4 table columns (for config save)."""
-        return [self.table.columnWidth(i) for i in range(4)]
+        """Return current widths of the 5 table columns (for config save)."""
+        return [self.table.columnWidth(i) for i in range(5)]
 
     def set_table_column_widths(self, widths: list[int]) -> None:
         """Restore column widths saved in a configuration file."""
         for i, w in enumerate(widths):
-            if i < 4 and isinstance(w, int) and w > 0:
+            if i < 5 and isinstance(w, int) and w > 0:
                 self.table.setColumnWidth(i, w)
 
 
@@ -1299,16 +1408,247 @@ class PlotPanel(QWidget):
         menu.setStyleSheet(self._MENU_STYLE)
         return menu
 
+    # ── Group header rows ────────────────────────────────────────────────
+
+    def _set_group_header_row(self, row_idx: int, group_name: str) -> None:
+        """Render a collapsible group header row spanning all columns."""
+        collapsed = self._collapsed_groups.get(group_name, False)
+        arrow = '▶' if collapsed else '▼'
+
+        # Group visibility state for checkbox (right side)
+        keys_in_group = [k for k, p in self._items.items() if p.group == group_name]
+        vis_states = [self._items[k].visible for k in keys_in_group]
+        if all(vis_states):
+            grp_cs = Qt.CheckState.Checked
+        elif any(vis_states):
+            grp_cs = Qt.CheckState.PartiallyChecked
+        else:
+            grp_cs = Qt.CheckState.Unchecked
+
+        bg = QBrush(QColor('#1e2e40'))
+
+        # Col 0: collapse arrow + group visibility checkbox
+        arrow_item = QTableWidgetItem(arrow)
+        arrow_item.setData(Qt.ItemDataRole.UserRole, f'__group__{group_name}')
+        arrow_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        arrow_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled |
+            Qt.ItemFlag.ItemIsSelectable |
+            Qt.ItemFlag.ItemIsUserCheckable
+        )
+        arrow_item.setCheckState(grp_cs)
+        arrow_item.setBackground(bg)
+        f = arrow_item.font()
+        f.setBold(True)
+        arrow_item.setFont(f)
+        self.table.setItem(row_idx, 0, arrow_item)
+
+        # Col 1: GROUP NAME in Signal column — bold, clearly visible
+        name_item = QTableWidgetItem(f'  {group_name}')
+        name_item.setData(Qt.ItemDataRole.UserRole, f'__group__{group_name}')
+        name_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled |
+            Qt.ItemFlag.ItemIsSelectable |
+            Qt.ItemFlag.ItemIsEditable   # allow double-click rename
+        )
+        name_item.setBackground(bg)
+        f2 = name_item.font()
+        f2.setBold(True)
+        name_item.setFont(f2)
+        name_item.setForeground(QBrush(QColor('#8ab8e0')))  # light blue
+        self.table.setItem(row_idx, 1, name_item)
+
+        # Cols 2-4: empty, same background
+        for col in (2, 3, 4):
+            cell = QTableWidgetItem('')
+            cell.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            cell.setBackground(bg)
+            self.table.setItem(row_idx, col, cell)
+
+    def _apply_collapse_state(self) -> None:
+        """Show/hide signal rows according to _collapsed_groups state."""
+        current_group: str | None = None
+        for row in range(self.table.rowCount()):
+            item0 = self.table.item(row, 0)
+            if not item0:
+                continue
+            key = item0.data(Qt.ItemDataRole.UserRole)
+            if isinstance(key, str) and key.startswith('__group__'):
+                current_group = key[len('__group__'):]
+                self.table.setRowHidden(row, False)
+            else:
+                if current_group and self._collapsed_groups.get(current_group, False):
+                    self.table.setRowHidden(row, True)
+                else:
+                    self.table.setRowHidden(row, False)
+
+    # ── Visibility toggle ─────────────────────────────────────────────────
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        """Handle checkbox changes in the signal table."""
+        if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(key, str):
+            return
+
+        if key.startswith('__grpchk__'):
+            # Legacy col-4 group checkbox (kept for safety)
+            group_name = key[len('__grpchk__'):]
+            checked    = item.checkState() == Qt.CheckState.Checked
+            self._push_undo()
+            for k, p in self._items.items():
+                if p.group == group_name:
+                    p.visible = checked
+            self._apply_visibility()
+
+        elif key.startswith('__group__'):
+            # Col-0 group checkbox+arrow — handle visibility; flag suppresses collapse
+            if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                return
+            group_name = key[len('__group__'):]
+            checked    = item.checkState() == Qt.CheckState.Checked
+            self._group_vis_changed = True
+            self._push_undo()
+            for k, p in self._items.items():
+                if p.group == group_name:
+                    p.visible = checked
+            self._apply_visibility()
+
+        elif key in self._items:
+            # Individual signal checkbox
+            checked = item.checkState() == Qt.CheckState.Checked
+            if self._items[key].visible != checked:
+                self._push_undo()
+                self._items[key].visible = checked
+                self._apply_visibility()
+
+    def _apply_visibility(self) -> None:
+        """
+        Apply current .visible state to curves without a full rebuild.
+
+        For normal / multi-axis mode: simply show/hide existing curves.
+        For stacked mode: full rebuild is required (rows must be added/removed).
+        The cursor lines are NOT touched — they persist regardless of signal visibility.
+        """
+        if self._stacked_mode:
+            # Stacked needs full rebuild to add/remove rows
+            self._rebuild_curves(preserve_selection=True)
+        else:
+            # Lightweight: just toggle curve visibility on existing PlotDataItems
+            for key, plotted in self._items.items():
+                if plotted.curve is not None:
+                    plotted.curve.setVisible(plotted.visible)
+            # Refresh table to update checkbox states and row colours
+            self._refresh_table()
+            self._refresh_highlight()
+            # Repopulate cursor value columns — _refresh_table wipes them to ''
+            self._update_table_values(self.v_line.value(), col=2)
+            if self._cursor2_enabled:
+                self._update_table_values(self.v_line2.value(), col=3)
+
+    def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        """Double-click on group header (col 0 arrow or col 1 name) → rename group."""
+        key = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(key, str) or not key.startswith('__group__'):
+            return
+        old_name = key[len('__group__'):]
+        new_name, ok = QInputDialog.getText(
+            self.parent(), 'Rename Group', 'Group name:', text=old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+        for p in self._items.values():
+            if p.group == old_name:
+                p.group = new_name
+        if old_name in self._collapsed_groups:
+            self._collapsed_groups[new_name] = self._collapsed_groups.pop(old_name)
+        self._rebuild_curves(preserve_selection=True)
+
+    def _on_table_cell_clicked(self, row: int, col: int) -> None:
+        """Click on group header arrow col → toggle collapse.
+        If the col-0 checkbox was what got clicked, itemChanged already fired
+        and set _group_vis_changed — skip collapse in that case.
+        """
+        item0 = self.table.item(row, 0)
+        if not item0:
+            return
+        key = item0.data(Qt.ItemDataRole.UserRole)
+        if isinstance(key, str) and key.startswith('__group__'):
+            if self._group_vis_changed:
+                self._group_vis_changed = False  # consume the flag, skip collapse
+                return
+            group_name = key[len('__group__'):]
+            self._collapsed_groups[group_name] = not self._collapsed_groups.get(group_name, False)
+            self._apply_collapse_state()
+
+    # ── Group operations (called from context menu) ───────────────────────
+
+    def group_selected(self) -> None:
+        """Group currently selected signals under a user-supplied name."""
+        keys = [k for k in self.selected_keys() if k in self._items]
+        if not keys:
+            return
+        name, ok = QInputDialog.getText(
+            self.parent(), 'New Group', 'Group name:'
+        )
+        if not ok or not name.strip():
+            return
+        self._push_undo()
+        for k in keys:
+            self._items[k].group = name.strip()
+        self._rebuild_curves(preserve_selection=True)
+
+    def ungroup_selected(self, group_name: str) -> None:
+        """Remove all signals from a group (they go back to ungrouped)."""
+        self._push_undo()
+        for p in self._items.values():
+            if p.group == group_name:
+                p.group = ''
+        self._collapsed_groups.pop(group_name, None)
+        self._rebuild_curves(preserve_selection=True)
+
     def _show_table_menu(self, position) -> None:
         selected_keys = self.selected_keys()
         row  = self.table.currentRow()
-        item = self.table.item(row, 0) if row >= 0 else None
-        key  = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if key and str(key) not in selected_keys:
+        item1 = self.table.item(row, 1) if row >= 0 else None
+        item0 = self.table.item(row, 0) if row >= 0 else None
+        item  = item1 or item0
+        key   = item.data(Qt.ItemDataRole.UserRole) if item else None
+        # Check if right-click is on a group header row
+        if isinstance(key, str) and key.startswith('__group__'):
+            group_name = key[len('__group__'):]
+            self._show_group_header_menu(group_name, self.table.viewport().mapToGlobal(position))
+            return
+        if key and str(key) not in selected_keys and not str(key).startswith('__'):
             selected_keys = [str(key)]
-        # Always show the menu — signal-specific actions are greyed when
-        # nothing is selected, but background/display options work always.
         self._show_signal_menu(selected_keys, self.table.viewport().mapToGlobal(position))
+
+    def _show_group_header_menu(self, group_name: str, global_pos) -> None:
+        """Context menu shown when right-clicking a group header row."""
+        menu = self._make_menu()
+        rename_act = QAction(f'Rename "{group_name}"…', menu)
+        rename_act.triggered.connect(lambda: self._rename_group_dialog(group_name))
+        menu.addAction(rename_act)
+        ungroup_act = QAction('Ungroup', menu)
+        ungroup_act.triggered.connect(lambda: self.ungroup_selected(group_name))
+        menu.addAction(ungroup_act)
+        menu.exec(global_pos)
+
+    def _rename_group_dialog(self, old_name: str) -> None:
+        new_name, ok = QInputDialog.getText(
+            self.parent(), 'Rename Group', 'Group name:', text=old_name
+        )
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+        for p in self._items.values():
+            if p.group == old_name:
+                p.group = new_name
+        if old_name in self._collapsed_groups:
+            self._collapsed_groups[new_name] = self._collapsed_groups.pop(old_name)
+        self._rebuild_curves(preserve_selection=True)
 
     def _show_signal_menu(self, selected_keys: list, global_pos) -> None:
         """Shared signal context menu used by table and stacked plot right-click."""
@@ -1340,6 +1680,11 @@ class PlotPanel(QWidget):
         rm.triggered.connect(self.remove_selected_series)
         rm.setEnabled(has_sel)
         menu.addAction(rm)
+        menu.addSeparator()
+        grp_act = QAction('Group selected…', menu)
+        grp_act.triggered.connect(self.group_selected)
+        grp_act.setEnabled(has_sel)
+        menu.addAction(grp_act)
         # Signal display sub-menu
         menu.addSeparator()
         disp_menu = self._make_menu(menu)

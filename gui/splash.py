@@ -92,8 +92,16 @@ class CANScopeSplash(QSplashScreen):
             Qt.TransformationMode.SmoothTransformation,
         )
 
-        super().__init__(scaled, Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        # Normal titled window: shows in taskbar, minimises with Win+D / Show Desktop.
+        # Only the Minimize button is shown — no Close (would crash mid-load) or Maximize.
+        super().__init__(scaled)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowMinimizeButtonHint |
+            Qt.WindowType.CustomizeWindowHint
+        )
+        self.setWindowTitle('CAN Scope — Starting…')
 
         self._version     = version
         self._status_text = 'Starting...'
@@ -106,6 +114,7 @@ class CANScopeSplash(QSplashScreen):
     def set_status(self, message: str) -> None:
         """Update the loading status text shown in the frosted-glass panel."""
         self._status_text = message
+        self.setWindowTitle(f'CAN Scope — {message}')
         self._render()
         QApplication.processEvents()
 

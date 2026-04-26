@@ -7,6 +7,133 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.35] — 2025-04-25
+
+### Fixed — Cursor columns and timestamp normalisation (v00.00.33/34 regressions)
+
+- **Cursor 2 column hidden after enabling** — `set_cursor2_enabled(True)` was
+  calling `setColumnHidden(2, False)` (old column index).  Fixed to col 3.
+
+- **Cursor 1 values written to wrong column** — `_on_cursor1_moved` and
+  `_on_stacked_c1_moved` were calling `_update_table_values(x, col=3)`.
+  This wrote cursor 1 values into the hidden cursor 2 column, making them
+  invisible.  Root cause: the column-index replacement chain in v00.00.33
+  ran `col=1→col=2` then immediately `col=2→col=3`, cascading both steps
+  onto cursor 1 lines.  Fixed to `col=2` for cursor 1, `col=3` for cursor 2.
+
+- **Time axis showing large negative values (~−1.29×10⁹ s)** — double
+  timestamp normalisation introduced in v00.00.33.  In the new multi-DBC
+  `_run_can_raw` loop, `frame.timestamp -= base_ts` normalised the frame
+  first, then `decoder.decode_frame(frame)` created samples using the
+  already-normalised timestamp, then `s.timestamp -= base_ts` subtracted
+  base_ts a second time — giving `original_ts − 2×base_ts` ≈ −1.29×10⁹.
+  Fixed by removing the redundant per-sample subtraction; a comment explains
+  why it must not be re-added.
+
+---
+
+## [v00.00.34] — 2025-04-25
+
+### Fixed — Signal grouping and visibility (v00.00.33 bugs)
+
+- **Group name not visible** — the group name was placed in col 0 (the
+  26px checkbox column) and truncated to `...`.  Fixed: col 0 now shows
+  only the ▶/▼ collapse arrow; the group name is rendered in col 1
+  (Signal column) in bold light-blue (`#8ab8e0`), clearly readable.
+  Double-clicking either col 0 or col 1 of a group header opens the rename
+  dialog.
+
+- **Unchecking a signal removed cursors from all signals** — visibility
+  toggle called `_rebuild_curves()` which tears down every curve and cursor
+  line and recreates them from scratch.  C1/C2 lines were lost for all
+  signals.  Fixed with `_apply_visibility()`:
+  - **Normal / multi-axis mode:** calls `curve.setVisible(False/True)` on
+    the existing `PlotDataItem` — cursor lines are completely untouched.
+  - **Stacked mode:** still calls `_rebuild_curves()` because stacked rows
+    must be physically added/removed, but this is the expected behaviour
+    (stacked has no persistent cursors between rows anyway).
+
+---
+
+## [v00.00.33] — 2025-04-25
+
+### Added — Signal grouping and visibility toggle
+
+**Signal table now has 5 columns:**
+`[☑] | Signal | Cursor 1 | Cursor 2 | Unit`
+
+**Visibility checkbox (column 0)**
+- Checked (default) — signal curve plotted normally.
+- Unchecked — curve removed from plot; in stacked mode the entire row is
+  removed; cursor table hides the value for that signal.
+- Group checkbox (right side of group header, col 4) toggles all signals
+  in the group at once — tri-state: all checked / mixed / all unchecked.
+- Fit to Window only considers visible signals for Y-range calculation.
+- Visibility persisted in config JSON alongside color.
+
+**Signal groups**
+- Select one or more signals → right-click → **Group selected…** → type name.
+- Group header row appears with a collapse/expand arrow (▶/▼) in bold.
+- Click the arrow to collapse/expand — visual only, plot is unchanged.
+- Double-click the group name to rename inline.
+- Right-click group header → **Rename** or **Ungroup** (signals return to
+  flat list).
+- Groups saved/restored in config JSON.
+
+**Implementation notes**
+- `PlottedSignal` gains `visible: bool = True` and `group: str = ''` fields.
+- `_rebuild_overlay` skips invisible signals; `_rebuild_stacked` builds its
+  ordered list from visible signals only.
+- `_refresh_table` interleaves group header rows between signal rows;
+  `_apply_collapse_state` shows/hides rows after each table build.
+- `_on_table_item_changed` handles checkbox state changes with undo support.
+- Config backwards-compatible: old `signals: [key, ...]` format still loads.
+
+---
+
+## [v00.00.32] — 2025-04-25
+
+### Added — MDF4 bus logging support (raw CAN frames in MDF)
+
+MDF4 files recorded with CANoe, CANedge, or any ASAM MDF bus logger
+store raw CAN frames using ``CAN_DataFrame.*`` channels rather than
+pre-decoded engineering values.  These files now follow the full BLF/ASC
+workflow in CAN Scope — DBC required, full RawFrameStore, CAN Trace dialog.
+
+**Auto-detection — no user action required:**
+- On file open, ``MDFReader.is_bus_logging()`` probes channel group metadata
+  for ``CAN_DataFrame.*`` channels (< 50 ms, no data read).
+- Bus logging MDF → routed to ``MDFCANReader`` (DBC required, same pipeline
+  as BLF/ASC, CAN Trace available).
+- Pre-decoded MDF → routed to existing ``MDFReader`` (no DBC, vectorised
+  fast path unchanged).
+- Status bar shows *"MDF bus log detected — DBC required"* when appropriate.
+
+**New: ``core/readers/mdf_can_reader.py`` — MDFCANReader**
+- Uses ``python-can``'s ``MF4Reader`` which wraps asammdf internally and
+  yields ``can.Message`` objects — identical interface to BLFReader/ASCReader.
+- ``iter_with_frames()`` constructs ``RawFrame`` objects and calls
+  ``DBCDecoder.decode_frame()`` per frame — no changes to LoadWorker,
+  RawFrameStore, or DBCDecoder needed.
+- ``BusChannel`` field from MDF is already 1-indexed (ASAM convention) —
+  no +1 adjustment unlike BLF/ASC.
+- ``decoder`` property exposed for on-demand signal decode in CAN Trace.
+
+**Changed: ``core/readers/__init__.py``**
+- ``dbc_required_for(path)`` now probes MDF files instead of returning
+  hardcoded False.
+- ``reader_factory()`` routes MDF4 files through the probe; raises a clear
+  ``ValueError`` with instructions if bus logging MDF opened without DBC.
+
+**Channel config (DBC Manager) works identically** for bus logging MDF —
+the same ``ChannelConfig`` / per-channel decoder used for BLF/ASC applies.
+
+**Requirements:** ``python-can >= 4.6`` (already required) + ``asammdf >= 7.0``
+(already required).  The ``canmatrix`` package may be needed by python-can's
+MF4Reader internals — noted in ``requirements.txt``.
+
+---
+
 ## [v00.00.31] — 2025-04-25
 
 ### Fixed — DBC Manager match quality: J1939 PGN fallback

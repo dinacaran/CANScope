@@ -131,6 +131,37 @@ class MDFReader:
     # ── Internal ──────────────────────────────────────────────────────────
 
     @staticmethod
+    def is_bus_logging(mdf_path: str | Path) -> bool:
+        """
+        Probe an MDF file to determine if it contains raw CAN bus frames
+        (ASAM MDF bus logging format) rather than pre-decoded signals.
+
+        Bus logging MDF files store frames as ``CAN_DataFrame.*`` channels
+        per the ASAM MDF bus logging standard.  The probe reads only channel
+        group metadata — no sample data loaded.  Cost: < 50 ms.
+
+        Returns True  → file has CAN_DataFrame channels → needs DBC.
+        Returns False → file has pre-decoded signals   → no DBC needed.
+        """
+        try:
+            import asammdf
+            mdf = asammdf.MDF(str(mdf_path))
+            try:
+                for group in mdf.groups:
+                    for ch in group.channels:
+                        name = getattr(ch, "name", "") or ""
+                        if name.startswith("CAN_DataFrame."):
+                            return True
+            finally:
+                try:
+                    mdf.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _iter_arrays(mdf):
         """
         Core vectorised channel iterator.

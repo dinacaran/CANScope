@@ -60,6 +60,8 @@ class MainWindow(QMainWindow):
         self._worker: LoadWorker | None = None
         self._pending_plot_keys: list[str] = []
         self._pending_plot_colors: dict[str, str] = {}
+        self._pending_plot_visible: dict[str, bool] = {}
+        self._pending_plot_groups:  dict[str, str]  = {}
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
@@ -390,7 +392,14 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 'name': self.channel_config.name,
                 'channels': {str(k): v for k, v in self.channel_config.channels.items()},
             },
-            'signals': self.plot_panel.plotted_keys(),
+            'signals': [
+                {
+                    'key':     k,
+                    'visible': self.plot_panel._items[k].visible,
+                    'group':   self.plot_panel._items[k].group,
+                }
+                for k in self.plot_panel.plotted_keys()
+            ],
             'show_data_points': self.btn_points.isChecked(),
             'plot_background_color': self.plot_panel.background_color(),
             'signal_colors': self.plot_panel.series_colors(),
@@ -435,7 +444,22 @@ QToolButton:pressed { background-color: #1a2a3a; }
             )
         elif cfg_dbc:
             self.channel_config = ChannelConfig.from_single_dbc(cfg_dbc)
-        pending_keys   = list(data.get('signals') or [])
+        # ── Parse signals list: supports new dict format and old plain-string format ──
+        signals_data    = list(data.get('signals') or [])
+        pending_keys    = []
+        pending_visible = {}
+        pending_groups  = {}
+        for s in signals_data:
+            if isinstance(s, str):
+                pending_keys.append(s)
+            elif isinstance(s, dict):
+                k = s.get('key')
+                if k:
+                    pending_keys.append(k)
+                    if 'visible' in s:
+                        pending_visible[k] = bool(s['visible'])
+                    if s.get('group'):
+                        pending_groups[k] = str(s['group'])
         pending_colors = dict(data.get('signal_colors') or {})
 
         # Fix 6: if data is already decoded, ask the user what to do
@@ -459,30 +483,44 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if bg:
             self.plot_panel.set_background_color(str(bg))
         self.btn_multi_axis.setChecked(bool(data.get('multi_axis', False)))
-        self.btn_stacked.setChecked(bool(data.get('stacked', False)))     # Fix 4
+        self.btn_stacked.setChecked(bool(data.get('stacked', False)))
         self.btn_cursor1.setChecked(bool(data.get('cursor1', False)))
         self.btn_cursor2.setChecked(bool(data.get('cursor2', False)))
         self.plot_panel._name_show_channel = bool(data.get('name_show_channel', False))
         self.plot_panel._name_show_message = bool(data.get('name_show_message', False))
-        col_widths = data.get('table_column_widths')                       # Fix 2
+        col_widths = data.get('table_column_widths')
         if col_widths:
             self.plot_panel.set_table_column_widths([int(w) for w in col_widths])
 
         if use_current_data:
-            # Fix 6: reuse already-decoded store — just plot requested signals
+            # Reuse already-decoded store — plot signals and restore all visual state
             self._log(f'Configuration loaded (using current data): {path}')
             self._update_status('Config applied', 'Plotting signals from configuration')
             self.add_signals_to_plot(pending_keys)
             for key, color in pending_colors.items():
                 self.plot_panel.set_series_color(key, color)
+            # Restore visibility and group assignments
+            needs_rebuild = False
+            for key in pending_keys:
+                if key in self.plot_panel._items:
+                    if key in pending_visible:
+                        self.plot_panel._items[key].visible = pending_visible[key]
+                        needs_rebuild = True
+                    if pending_groups.get(key):
+                        self.plot_panel._items[key].group = pending_groups[key]
+                        needs_rebuild = True
+            if needs_rebuild:
+                self.plot_panel._rebuild_curves(preserve_selection=False)
             return
 
         # Reload from config BLF/DBC paths
         self.measurement_path = cfg_blf
         self.blf_path = cfg_blf   # alias
         self.dbc_path = cfg_dbc
-        self._pending_plot_keys   = pending_keys
-        self._pending_plot_colors = pending_colors
+        self._pending_plot_keys    = pending_keys
+        self._pending_plot_colors  = pending_colors
+        self._pending_plot_visible = pending_visible
+        self._pending_plot_groups  = pending_groups
         self._update_measurement_tab()
         if not self.blf_path or not self.dbc_path:
             QMessageBox.warning(self, 'Incomplete configuration', 'The configuration file does not contain both BLF and DBC paths.')
@@ -642,13 +680,29 @@ QToolButton:pressed { background-color: #1a2a3a; }
         )
         self._log('Decode finished successfully.')
         if self._pending_plot_keys:
-            wanted = list(self._pending_plot_keys)
-            colors = dict(self._pending_plot_colors)
+            wanted  = list(self._pending_plot_keys)
+            colors  = dict(self._pending_plot_colors)
+            visible = dict(getattr(self, '_pending_plot_visible', {}))
+            groups  = dict(getattr(self, '_pending_plot_groups',  {}))
             self._pending_plot_keys = []
             self.add_signals_to_plot(wanted)
             for key, color in colors.items():
                 self.plot_panel.set_series_color(key, color)
-            self._pending_plot_colors = {}
+            # Restore visibility and group from saved config
+            needs_rebuild = False
+            for key in wanted:
+                if key in self.plot_panel._items:
+                    if key in visible:
+                        self.plot_panel._items[key].visible = visible[key]
+                        needs_rebuild = True
+                    if key in groups and groups[key]:
+                        self.plot_panel._items[key].group = groups[key]
+                        needs_rebuild = True
+            if needs_rebuild:
+                self.plot_panel._rebuild_curves(preserve_selection=False)
+            self._pending_plot_colors  = {}
+            self._pending_plot_visible = {}
+            self._pending_plot_groups  = {}
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:
@@ -746,6 +800,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not mpath:
             return "Click 'Open File' to load BLF / ASC / MF4 / MDF / CSV."
         if dbc_required_for(mpath) and self.channel_config.is_empty():
+            suffix = Path(mpath).suffix.lower()
+            if suffix in ('.mf4', '.mdf'):
+                return "MDF bus log detected — DBC required. Click 'Open DBC' to configure."
             return "DBC required — click 'Open DBC' to configure channel mapping."
         return "Click 'Load + Decode', then select signal(s) to plot."
 

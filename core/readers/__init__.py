@@ -5,7 +5,7 @@ from pathlib import Path
 from core.readers.base import MeasurementReader, UnsupportedFormatError
 
 
-# ── Formats that require a DBC file for decoding ──────────────────────────
+# ── Formats that always require DBC (regardless of file content) ──────────
 CAN_RAW_SUFFIXES = {'.blf', '.asc'}
 
 # ── All supported measurement file suffixes ───────────────────────────────
@@ -13,8 +13,22 @@ ALL_SUFFIXES = {'.blf', '.asc', '.mf4', '.mdf', '.csv'}
 
 
 def dbc_required_for(path: str) -> bool:
-    """Return True when the given measurement file needs a DBC to decode."""
-    return Path(path).suffix.lower() in CAN_RAW_SUFFIXES
+    """
+    Return True when the measurement file needs a DBC to decode signals.
+
+    For .blf / .asc: always True.
+    For .mf4 / .mdf: True only when the file contains raw CAN bus frames
+        (ASAM MDF bus logging format, detected by CAN_DataFrame.* channels).
+        Pre-decoded MDF files return False.
+    For .csv: always False.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in CAN_RAW_SUFFIXES:
+        return True
+    if suffix in ('.mf4', '.mdf'):
+        from core.readers.mdf_reader import MDFReader
+        return MDFReader.is_bus_logging(path)
+    return False
 
 
 def reader_factory(
@@ -23,6 +37,12 @@ def reader_factory(
 ) -> MeasurementReader:
     """
     Return the appropriate MeasurementReader for *measurement_path*.
+
+    MDF4 / MDF routing
+    ------------------
+    A fast probe (< 50 ms) checks for ``CAN_DataFrame.*`` channels:
+    - Bus logging MDF  → ``MDFCANReader`` (raw frames + DBC, same as BLF/ASC)
+    - Pre-decoded MDF  → ``MDFReader``    (vectorised channel arrays, no DBC)
 
     Raises
     ------
@@ -47,7 +67,20 @@ def reader_factory(
 
     if suffix in ('.mf4', '.mdf'):
         from core.readers.mdf_reader import MDFReader
-        return MDFReader(measurement_path)
+        if MDFReader.is_bus_logging(measurement_path):
+            # Bus logging — raw CAN frames → needs DBC
+            if not dbc_path:
+                raise ValueError(
+                    "This MDF file contains raw CAN bus frames.\n"
+                    "A DBC file is required for signal decoding.\n"
+                    "Please configure channel → DBC mapping via 'Open DBC'."
+                )
+            from core.readers.mdf_can_reader import MDFCANReader
+            from core.dbc_decoder import DBCDecoder
+            return MDFCANReader(measurement_path, DBCDecoder(dbc_path))
+        else:
+            # Pre-decoded engineering values — no DBC needed
+            return MDFReader(measurement_path)
 
     if suffix == '.csv':
         from core.readers.csv_reader import CSVSignalReader

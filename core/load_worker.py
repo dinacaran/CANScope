@@ -125,7 +125,7 @@ class LoadWorker(QObject):
             if base_ts is None:
                 base_ts = frame.timestamp
                 store.base_ts = base_ts
-            frame.timestamp -= base_ts
+            frame.timestamp -= base_ts  # normalise to t=0
 
             store.note_frame(frame)
 
@@ -137,12 +137,9 @@ class LoadWorker(QObject):
                 else:
                     samples = []
             else:
-                # No DBC at all — raw frames only
                 samples = []
-
-            # Normalise sample timestamps
-            for s in samples:
-                s.timestamp -= base_ts
+            # NOTE: samples already carry frame.timestamp (already normalised above).
+            # Do NOT subtract base_ts again here — that would double-normalise.
 
             # Store every frame (decoded or not)
             rfs.append(
