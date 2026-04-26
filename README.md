@@ -23,16 +23,13 @@
 ---
 ## Screenshots
 Stacked plot:
-<img width="3000" height="1500" alt="Stacked_plot" src="https://github.com/user-attachments/assets/91ec3794-cbb9-46ba-a6d2-531d02278bd2" />
+<img width="3193" height="2022" alt="CANScope_V35" src="https://github.com/user-attachments/assets/0f413b0b-a23a-439f-b8c8-41848969c99c" />
 
 Multiple Axis plot:
 <img width="2376" height="1300" alt="Multi_plot" src="https://github.com/user-attachments/assets/efc7b429-befa-4344-bed3-4d5c2151ca98" />
 
 CAN Trace/ Raw Frame:
 <img width="1543" height="1019" alt="CANScope_RawCAN Frame" src="https://github.com/user-attachments/assets/69ad9749-ecec-445d-a31f-4b47901855cf" />
-
-Full tool view:
-<img width="2811" height="1663" alt="CANScope Viewer full view" src="https://github.com/user-attachments/assets/48ebceab-5fbc-47d8-9c9c-452452d2df57" />
 
 ---
 
