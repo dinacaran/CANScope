@@ -576,12 +576,25 @@ QToolButton:pressed { background-color: #1a2a3a; }
     def add_signals_to_plot(self, keys) -> None:
         if isinstance(keys, str):
             keys = [keys]
+        keys = [k for k in (keys or []) if k]
+        if not keys:
+            return
+
+        batch = len(keys) > 1
+        if batch:
+            self.plot_panel.begin_batch_add()
+
         plotted = 0
-        for key in keys or []:
+        for key in keys:
             if self.add_signal_to_plot(key, fit=False):
                 plotted += 1
-        if plotted:
+
+        if batch:
+            self.plot_panel.end_batch_add()
+        elif plotted:
             self.plot_panel.fit_to_window()
+
+        if plotted:
             self._update_status(f'Plotted {plotted} signal(s)', 'Use Fit to Window, reorder, or export selected CSV')
 
     def add_signal_to_plot(self, key: str, fit: bool = True) -> bool:

@@ -160,6 +160,7 @@ class PlotPanel(QWidget):
         self._collapsed_groups: dict[str, bool] = {}
         self._cursor2_enabled: bool = False
         self._group_vis_changed: bool = False  # True when itemChanged fired before cellClicked
+        self._batch_mode: bool = False          # True while batch-adding signals; suppresses per-add rebuilds
         self.setAcceptDrops(True)
 
         # ── Normal / multi-axis plot ──────────────────────────────────────
@@ -412,14 +413,29 @@ class PlotPanel(QWidget):
     def add_series(self, key: str, series: SignalSeries, color: str | None = None) -> None:
         if key in self._items:
             return
-        self._push_undo()
+        if not self._batch_mode:
+            self._push_undo()
         color = color or next(self._color_cycle)
         self._items[key] = PlottedSignal(key=key, series=series, curve=None, color=color)
         if self._current_key is None:
             self._current_key = key
-        self._rebuild_curves(preserve_selection=True)
-        self._update_empty_state_ui()
-        self.fit_to_window()
+        if not self._batch_mode:
+            self._rebuild_curves(preserve_selection=True)
+            self._update_empty_state_ui()
+            self.fit_to_window()
+
+    def begin_batch_add(self) -> None:
+        """Start a batch-add session. Suppresses per-signal rebuilds; call end_batch_add() when done."""
+        self._push_undo()
+        self._batch_mode = True
+
+    def end_batch_add(self) -> None:
+        """Finish a batch-add session. Triggers a single rebuild + fit for all queued signals."""
+        self._batch_mode = False
+        if self._items:
+            self._rebuild_curves(preserve_selection=True)
+            self._update_empty_state_ui()
+            self.fit_to_window()
 
     # ── Internal: clear all rendered items ────────────────────────────────
 
@@ -1266,20 +1282,33 @@ class PlotPanel(QWidget):
         if not keys:
             return
         self._push_undo()
-        order = list(self._items.keys())
+        key_set = set(keys)
+        order   = list(self._items.keys())
         if direction < 0:
             for key in keys:
                 idx = order.index(key)
-                if idx > 0 and order[idx - 1] not in keys:
+                if idx > 0 and order[idx - 1] not in key_set:
                     order[idx - 1], order[idx] = order[idx], order[idx - 1]
         else:
             for key in reversed(keys):
                 idx = order.index(key)
-                if idx < len(order) - 1 and order[idx + 1] not in keys:
+                if idx < len(order) - 1 and order[idx + 1] not in key_set:
                     order[idx + 1], order[idx] = order[idx], order[idx + 1]
         self._items = {k: self._items[k] for k in order}
-        self._rebuild_curves(preserve_selection=True)
-        self._restore_selection(keys)
+
+        if self._stacked_mode or self._multi_axis:
+            # Stacked: row positions are visual — full rebuild required.
+            # Multi-axis: axis numbering is index-based — full rebuild required.
+            self._rebuild_curves(preserve_selection=True)
+        else:
+            # Overlay mode: curves are already rendered; only table order changes.
+            # Skip the expensive curve teardown/rebuild and just refresh the table.
+            self._refresh_table()
+            self._restore_selection(keys)
+            self._refresh_highlight()
+            self._update_table_values(self.v_line.value(), col=2)
+            if self._cursor2_enabled:
+                self._update_table_values(self.v_line2.value(), col=3)
 
     def selected_keys(self) -> list[str]:
         keys: list[str] = []
@@ -1467,20 +1496,18 @@ class PlotPanel(QWidget):
 
     def _apply_collapse_state(self) -> None:
         """Show/hide signal rows according to _collapsed_groups state."""
-        current_group: str | None = None
         for row in range(self.table.rowCount()):
             item0 = self.table.item(row, 0)
             if not item0:
                 continue
             key = item0.data(Qt.ItemDataRole.UserRole)
             if isinstance(key, str) and key.startswith('__group__'):
-                current_group = key[len('__group__'):]
                 self.table.setRowHidden(row, False)
             else:
-                if current_group and self._collapsed_groups.get(current_group, False):
-                    self.table.setRowHidden(row, True)
-                else:
-                    self.table.setRowHidden(row, False)
+                plotted = self._items.get(key)
+                row_group = plotted.group if plotted else ''
+                hidden = bool(row_group and self._collapsed_groups.get(row_group, False))
+                self.table.setRowHidden(row, hidden)
 
     # ── Visibility toggle ─────────────────────────────────────────────────
 
