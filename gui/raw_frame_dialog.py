@@ -355,17 +355,24 @@ class RawFrameDialog(QDialog):
         # Remove placeholder
         item.removeChild(first_child)
 
-        decoder = getattr(self._raw_store, 'decoder', None)
-        if decoder is None:
-            item.addChild(QTreeWidgetItem(['', '', '', '(no DBC)', '', '', '']))
-            return
-
-        # Reconstruct a minimal RawFrame for the decoder
+        # Fetch the record first so we have rec.channel for per-channel lookup
         from core.models import RawFrame
         records = self._raw_store.get_window([store_idx])
         if not records:
             return
         rec = records[0]
+
+        # Prefer per-channel config (CAN1→DBC1, CAN2→DBC2, …); fall back to
+        # the single all-channels decoder set at load time.
+        channel_config = getattr(self._raw_store, 'channel_config', None)
+        if channel_config is not None:
+            decoder = channel_config.decoder_for(rec.channel)
+        else:
+            decoder = getattr(self._raw_store, 'decoder', None)
+
+        if decoder is None:
+            item.addChild(QTreeWidgetItem(['', '', '', '(no DBC)', '', '', '']))
+            return
 
         raw_frame = RawFrame(
             timestamp=rec.time_s,
