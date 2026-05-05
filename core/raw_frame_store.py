@@ -106,7 +106,10 @@ class RawFrameStore:
         # Create temp file immediately
         fd, path = tempfile.mkstemp(prefix='canscope_', suffix='.rawdata')
         self._data_path = path
-        self._data_file = os.fdopen(fd, 'w+b', buffering=0)
+        # Use a 1 MB write buffer — seal() calls flush() before mmap so this is safe.
+        # buffering=0 (unbuffered) caused one write() syscall per frame (64 B each),
+        # adding several seconds of overhead for large BLF files (hundreds of K frames).
+        self._data_file = os.fdopen(fd, 'w+b', buffering=1 << 20)
 
     # ── Write phase (during decode) ───────────────────────────────────────
 

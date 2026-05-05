@@ -12,8 +12,8 @@ from core.raw_frame_store import RawFrameStore
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
 
 # ── Streaming constants ───────────────────────────────────────────────────
-_CAN_TREE_INTERVAL     = 2_000
-_CAN_PLOT_INTERVAL     = 5_000
+_CAN_TREE_INTERVAL     = 10_000   # was 2 000 — build_tree_payload() sorts all signals; every 2k frames was ~250 rebuilds for 500k frames
+_CAN_PLOT_INTERVAL     = 25_000   # was 5 000 — partial_ready triggers main-thread redraw; every 5k was 100 redraws
 _CAN_PROGRESS_INTERVAL = 10_000
 _BULK_PLOT_INTERVAL    = 10
 _BULK_PROGRESS_INTERVAL = 50
@@ -120,6 +120,19 @@ class LoadWorker(QObject):
         if cfg:
             cfg.build_all_decoders()
 
+        # Pre-compute channel→decoder map so the hot loop pays one dict.get()
+        # instead of a Python function call + property access + two dict lookups
+        # per frame.  Unknown channels seen mid-file are resolved once and cached.
+        _decoder_map: dict[int | None, object | None] = {}
+        if cfg:
+            dec_cache = cfg._decoder_cache
+            for ch_key, path in cfg.channels.items():
+                actual_ch = None if ch_key == ALL_CHANNELS_KEY else ch_key
+                _decoder_map[actual_ch] = dec_cache.get(path)
+            _fallback_dec = _decoder_map.get(None)
+        else:
+            _fallback_dec = None
+
         for frame, _legacy_samples in reader.iter_with_frames():
             index += 1
             if base_ts is None:
@@ -131,11 +144,14 @@ class LoadWorker(QObject):
 
             # ── Multi-DBC decode: pick decoder by channel ─────────────────
             if cfg:
-                decoder = cfg.decoder_for(frame.channel)
-                if decoder:
-                    samples = decoder.decode_frame(frame)
+                ch = frame.channel
+                if ch in _decoder_map:
+                    decoder = _decoder_map[ch]
                 else:
-                    samples = []
+                    # First time seeing this channel — resolve once and cache
+                    decoder = cfg.decoder_for(ch) or _fallback_dec
+                    _decoder_map[ch] = decoder
+                samples = decoder.decode_frame(frame) if decoder else []
             else:
                 samples = []
             # NOTE: samples already carry frame.timestamp (already normalised above).
