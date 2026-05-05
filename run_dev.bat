@@ -15,7 +15,7 @@ if exist .venv\Scripts\python.exe (
     set "PYEXE=python"
 )
 
-echo Starting CAN Scope v00.00.08 in dev mode...
+echo Starting CAN Scope v00.00.xx in dev mode...
 "%PYEXE%" app.py
 if errorlevel 1 (
     echo.
