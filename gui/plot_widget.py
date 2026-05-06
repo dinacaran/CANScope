@@ -896,7 +896,7 @@ class PlotPanel(QWidget):
             idx = self._nearest_index(plotted.series.timestamps, x)
             if idx is None:
                 continue
-            value = plotted.series.raw_values[idx]
+            value = plotted.series.display_value_at(idx)
             row   = row_lookup.get(key)
             if row is not None:
                 cell = self.table.item(row, col)

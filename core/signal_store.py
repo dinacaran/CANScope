@@ -3,6 +3,7 @@ from __future__ import annotations
 import array as _array
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Iterable
 
 import numpy as np
 
@@ -16,11 +17,15 @@ class SignalSeries:
     message_id: int
     signal_name: str
     unit: str
-    # Bug 3 fix: array.array('d') uses ~3× less memory than a Python float list
-    # and appends in amortised O(1) without Python object overhead per element.
+    # array.array('d') uses ~3× less memory than a Python float list and
+    # appends in amortised O(1) without Python object overhead per element.
     timestamps: _array.array = field(default_factory=lambda: _array.array('d'))
     values: _array.array     = field(default_factory=lambda: _array.array('d'))
+    # raw_values is populated only for signals that carry display labels
+    # (DBC enum/choice signals, MDF text channels). For ordinary numeric
+    # signals it stays empty — consumers fall back to values[idx].
     raw_values: list[object] = field(default_factory=list)
+    has_labels: bool = False
 
     @property
     def key(self) -> str:
@@ -29,7 +34,23 @@ class SignalSeries:
 
     @property
     def latest_value(self) -> object:
-        return self.raw_values[-1] if self.raw_values else ""
+        if self.raw_values:
+            return self.raw_values[-1]
+        if self.values:
+            return self.values[-1]
+        return ""
+
+    def display_value_at(self, idx: int) -> object:
+        """
+        Display value for sample *idx*.
+        For label-bearing signals returns the cached label; for plain numeric
+        signals returns the float (kept in `values` to save RAM).
+        """
+        if self.has_labels and 0 <= idx < len(self.raw_values):
+            return self.raw_values[idx]
+        if 0 <= idx < len(self.values):
+            return self.values[idx]
+        return ""
 
     def numpy_timestamps(self) -> np.ndarray:
         """Return timestamps as a numpy float64 array (zero-copy if possible)."""
@@ -46,6 +67,16 @@ class SignalStore:
         self._signals_by_channel_message: dict[int | None, dict[str, list[str]]] = (
             defaultdict(lambda: defaultdict(list))
         )
+        # Hot-path cache: (channel, msg_name) → ordered list of SignalSeries refs.
+        # Built lazily on first decoded frame for each (channel, msg_name); reused
+        # for every subsequent frame so the inner loop avoids string-key concat
+        # and dict lookup per signal sample.
+        self._msg_series_cache: dict[tuple[int | None, str], list[SignalSeries]] = {}
+        # Per-(channel, msg_name, sig_name) choices map provided by the decoder(s).
+        # An empty/missing entry means "no labels" — series.has_labels stays False
+        # and raw_values is never appended to.
+        self._choices_lookup: dict[tuple[int | None, str, str], dict] = {}
+        self._tree_dirty: bool = True
         self.total_frames    = 0
         self.decoded_frames  = 0
         self.total_samples   = 0
@@ -58,6 +89,25 @@ class SignalStore:
         # On-disk indexed frame store (Option B: no cap, temp file on disk)
         self.raw_frame_store = None   # set to RawFrameStore by LoadWorker
         self.base_ts: float = 0.0  # set by LoadWorker for streaming
+
+    # ── Decoder integration (called once by LoadWorker) ──────────────────
+
+    def set_choices_lookup(
+        self,
+        lookup: dict[tuple[int | None, str, str], dict],
+    ) -> None:
+        """
+        Provide the per-signal DBC choices map keyed by
+        ``(channel, message_name, signal_name) → {int_key: label}``.
+        Used at series-creation time to decide whether to maintain
+        ``raw_values`` (label-bearing signals only).
+        """
+        self._choices_lookup = lookup
+
+    # ── Tree-dirty bookkeeping ────────────────────────────────────────────
+
+    def is_tree_dirty(self) -> bool:
+        return self._tree_dirty
 
     def note_frame(self, frame: RawFrame, decoded: bool = False) -> None:
         self.total_frames += 1
@@ -92,16 +142,19 @@ class SignalStore:
                     message_id=sample.message_id,
                     signal_name=sample.signal_name,
                     unit=sample.unit,
+                    has_labels=bool(self._choices_lookup.get(
+                        (sample.channel, sample.message_name, sample.signal_name)
+                    )),
                 )
                 self._series_by_key[key] = series
                 sigs = self._signals_by_channel_message[sample.channel][sample.message_name]
                 if sample.signal_name not in sigs:
                     sigs.append(sample.signal_name)
+                self._tree_dirty = True
             series = self._series_by_key[key]
             series.timestamps.append(sample.timestamp)
-            series.raw_values.append(sample.value)
-            # Use pre-computed numeric_value (handles enum/choice signals).
-            # Falls back to float(sample.value) for older callers without the field.
+            if series.has_labels:
+                series.raw_values.append(sample.value)
             numeric = getattr(sample, 'numeric_value', None)
             if numeric is not None:
                 series.values.append(numeric)
@@ -114,41 +167,74 @@ class SignalStore:
 
     def add_samples_direct(self, samples: list) -> None:
         """
-        Like add_samples() but accepts an already-materialised list directly.
-        Avoids the list() re-wrap overhead in the hot decode loop.
+        Hot path used by the BLF/ASC streaming decoder.
+
+        All samples in *samples* belong to the same decoded message (same
+        channel + message_name). The first call for a given (channel,
+        message_name) builds and caches the SignalSeries reference list;
+        subsequent calls walk the cached list directly — no string-key
+        construction, no per-sample dict lookups.
         """
         if not samples:
             return
         self.decoded_frames += 1
         self.unmatched_frames = max(0, self.unmatched_frames - 1)
-        for sample in samples:
-            self.channels.add(sample.channel)
-            self.message_hits[(sample.channel, sample.message_name)] += 1
-            key = self._make_key(sample.channel, sample.message_name, sample.signal_name)
-            if key not in self._series_by_key:
-                series = SignalSeries(
-                    channel=sample.channel,
-                    message_name=sample.message_name,
-                    message_id=sample.message_id,
-                    signal_name=sample.signal_name,
-                    unit=sample.unit,
-                )
-                self._series_by_key[key] = series
-                sigs = self._signals_by_channel_message[sample.channel][sample.message_name]
-                if sample.signal_name not in sigs:
-                    sigs.append(sample.signal_name)
-            series = self._series_by_key[key]
+
+        first = samples[0]
+        channel  = first.channel
+        msg_name = first.message_name
+        msg_key  = (channel, msg_name)
+
+        cached = self._msg_series_cache.get(msg_key)
+        # Cache miss OR signal-set changed (rare — e.g. multiplexed messages)
+        if cached is None or len(cached) != len(samples):
+            cached = self._build_msg_cache(channel, msg_name, samples)
+
+        n = len(samples)
+        self.total_samples += n
+        self.channels.add(channel)
+        self.message_hits[msg_key] += 1
+
+        # Tight inner loop — only the work that scales with sample count.
+        for series, sample in zip(cached, samples):
             series.timestamps.append(sample.timestamp)
-            series.raw_values.append(sample.value)
-            numeric = sample.numeric_value
-            if numeric is not None:
-                series.values.append(numeric)
-            else:
-                try:
-                    series.values.append(float(sample.value))
-                except (TypeError, ValueError):
-                    series.values.append(float('nan'))
-            self.total_samples += 1
+            series.values.append(sample.numeric_value)
+            if series.has_labels:
+                series.raw_values.append(sample.value)
+
+    def _build_msg_cache(
+        self,
+        channel: int | None,
+        msg_name: str,
+        samples: list,
+    ) -> list[SignalSeries]:
+        """Create / look up SignalSeries for each sample's signal and cache them."""
+        sigs_for_msg = self._signals_by_channel_message[channel][msg_name]
+        choices_lookup = self._choices_lookup
+        series_list: list[SignalSeries] = []
+        for sample in samples:
+            sig_name = sample.signal_name
+            str_key = self._make_key(channel, msg_name, sig_name)
+            series = self._series_by_key.get(str_key)
+            if series is None:
+                series = SignalSeries(
+                    channel=channel,
+                    message_name=msg_name,
+                    message_id=sample.message_id,
+                    signal_name=sig_name,
+                    unit=sample.unit,
+                    has_labels=bool(
+                        choices_lookup.get((channel, msg_name, sig_name))
+                        or choices_lookup.get((None, msg_name, sig_name))
+                    ),
+                )
+                self._series_by_key[str_key] = series
+                if sig_name not in sigs_for_msg:
+                    sigs_for_msg.append(sig_name)
+                self._tree_dirty = True
+            series_list.append(series)
+        self._msg_series_cache[(channel, msg_name)] = series_list
+        return series_list
 
     def add_series_bulk(
         self,
@@ -160,19 +246,26 @@ class SignalStore:
         timestamps: "np.ndarray",
         values: "np.ndarray",
         raw_values: list,
+        has_labels: bool = True,
     ) -> None:
         """
         Insert a complete channel time-series in one bulk operation.
 
         Uses ``array.array.frombytes(ndarray.tobytes())`` which is a single
         C-level memcopy — no per-sample Python loop, no temporary list.
-        Called by the LoadWorker MDF/CSV fast path.
+        Called by the LoadWorker MDF/CSV fast path and the BLF/ASC vectorised
+        decode path.
 
         Parameters
         ----------
         timestamps : float64 ndarray, already normalised (t=0 at recording start)
         values     : float64 ndarray of numeric values (integer keys for enum)
-        raw_values : list of display values (string labels or floats)
+        raw_values : list of display values (string labels or floats); may be
+                     empty when *has_labels* is False
+        has_labels : True for signals whose display value differs from the
+                     numeric value (DBC enums, MDF text channels). When False
+                     the series is treated as plain numeric and consumers fall
+                     back to ``values[idx]`` for display.
         """
         if len(timestamps) == 0:
             return
@@ -185,22 +278,23 @@ class SignalStore:
                 message_id=message_id,
                 signal_name=signal_name,
                 unit=unit,
+                has_labels=has_labels,
             )
             self._series_by_key[key] = series
             sigs = self._signals_by_channel_message[channel][message_name]
             if signal_name not in sigs:
                 sigs.append(signal_name)
+            self._tree_dirty = True
         else:
             series = self._series_by_key[key]
-
-        series = self._series_by_key[key]
 
         # C-level memcopy — no Python loop, no object allocation per sample
         ts_bytes  = np.asarray(timestamps, dtype=np.float64).tobytes()
         val_bytes = np.asarray(values,     dtype=np.float64).tobytes()
         series.timestamps.frombytes(ts_bytes)
         series.values.frombytes(val_bytes)
-        series.raw_values.extend(raw_values)
+        if has_labels and raw_values:
+            series.raw_values.extend(raw_values)
 
         n = len(timestamps)
         self.total_samples  += n
@@ -251,6 +345,7 @@ class SignalStore:
             payload[channel].update(
                 {msg: sorted(sigs) for msg, sigs in sorted(message_map.items())}
             )
+        self._tree_dirty = False
         return payload
 
     def channel_summary_text(self) -> str:
