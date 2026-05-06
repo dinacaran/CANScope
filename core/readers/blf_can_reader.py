@@ -62,6 +62,13 @@ class BLFCANReader:
             samples = self._decoder.decode_frame(frame)
             yield frame, samples
 
+    def iter_frames_only(self) -> Iterator[RawFrame]:
+        """
+        Yield raw frames without decoding — used by the 2-pass vectorised
+        load path which decodes in bulk after all frames are buffered.
+        """
+        yield from BLFReaderService(self._path)
+
     @property
     def decoder(self) -> DBCDecoder:
         """Expose the decoder so LoadWorker can call diagnostics_text()."""

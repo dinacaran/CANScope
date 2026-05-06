@@ -49,6 +49,12 @@ class ASCCANReader:
     # ── Extended iterator ─────────────────────────────────────────────────
 
     def iter_with_frames(self) -> Iterator[tuple[RawFrame, list[DecodedSignalSample]]]:
+        for frame in self.iter_frames_only():
+            samples = self._decoder.decode_frame(frame)
+            yield frame, samples
+
+    def iter_frames_only(self) -> Iterator[RawFrame]:
+        """Yield raw frames without decoding (used by vectorised 2-pass load)."""
         if not self._path.exists():
             raise ASCReadError(f"ASC file not found: {self._path}")
         try:
@@ -67,7 +73,7 @@ class ASCCANReader:
                     raw_ch = getattr(msg, 'channel', None)
                     # ASC also returns 0-indexed channels from python-can
                     ch_1idx = (int(raw_ch) + 1) if isinstance(raw_ch, (int, float)) else raw_ch
-                    frame = RawFrame(
+                    yield RawFrame(
                         timestamp     = float(msg.timestamp),
                         channel       = ch_1idx,
                         arbitration_id= int(msg.arbitration_id),
@@ -77,8 +83,6 @@ class ASCCANReader:
                         data          = data,
                         direction     = direction,
                     )
-                    samples = self._decoder.decode_frame(frame)
-                    yield frame, samples
         except ASCReadError:
             raise
         except Exception as exc:
