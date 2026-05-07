@@ -7,7 +7,7 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
-## [v00.00.39] — 2026-05-07
+## [v00.00.40] — 2026-05-07
 
 ### Added — DBC Manager channel pre-scan
 
@@ -33,7 +33,7 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
-## [v00.00.38] — 2026-05-07
+## [v00.00.39] — 2026-05-07
 
 ### Added — Vectorized BLF/ASC decode (30× faster)
 
