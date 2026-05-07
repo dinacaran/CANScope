@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QDialog,
     QHBoxLayout,
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from core.export import ExportService
 from core.load_worker import LoadWorker
-from core.readers import dbc_required_for, ALL_SUFFIXES
+from core.readers import dbc_required_for, prescan_measurement, ALL_SUFFIXES
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
 from gui.dbc_manager import DBCManagerDialog
 from core.signal_store import SignalStore
@@ -56,6 +57,8 @@ class MainWindow(QMainWindow):
         self.dbc_path: str | None = None
         self.blf_path: str | None = None  # deprecated alias
         self.store: SignalStore | None = None
+        # Pre-scan cache: (path, channels, ids_per_channel)
+        self._prescan_cache: tuple[str, list[int], dict[int, set[int]]] | None = None
         self._thread: QThread | None = None
         self._worker: LoadWorker | None = None
         self._pending_plot_keys: list[str] = []
@@ -291,6 +294,22 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._log(f'Selected measurement file: {path}')
         if not needs_dbc:
             self._log('DBC not required for this format.')
+
+        # Lightweight pre-scan: extract channel numbers + arb IDs
+        # so the DBC Manager can show real channels before Load+Decode
+        self._prescan_cache = None
+        if needs_dbc:
+            self._update_status('Scanning channels…', 'Reading measurement file header')
+            QApplication.processEvents()
+            try:
+                chs, ids = prescan_measurement(path, progress=self._log)
+                if chs:
+                    self._prescan_cache = (path, chs, ids)
+                    self._log(f'Pre-scan: found {len(chs)} channel(s): '
+                              f'{", ".join(f"CAN {c}" for c in chs)}')
+            except Exception as exc:
+                self._log(f'Pre-scan warning: {exc}')
+
         self._update_measurement_tab()
         self._update_action_states()
         self._update_status(
@@ -302,9 +321,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
         Collect CAN channel numbers and per-channel arbitration ID sets
         from all available sources.  Used by the DBC Manager on open and
         on Refresh Match.
+
+        Priority:
+        1. RawFrameStore (post-decode, full coverage)
+        2. SignalStore channels (post-decode fallback)
+        3. Pre-scan cache (pre-decode, from lightweight header scan)
         """
         ids_per_channel: dict[int, set[int]] = {}
         channels_in_file: list[int] = []
+
+        # Source 1: RawFrameStore (most complete, available after decode)
         rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
         if rfs is not None and len(rfs) > 0:
             import numpy as np
@@ -316,10 +342,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 ch_int = int(ch_val)
                 channels_in_file.append(ch_int)
                 ids_per_channel[ch_int] = set(int(x) for x in aids[chs == ch_val])
+
+        # Source 2: SignalStore (post-decode fallback)
         if not channels_in_file and self.store is not None:
             for ch in sorted(self.store.channels):
                 if ch is not None:
                     channels_in_file.append(int(ch))
+
+        # Source 3: Pre-scan cache (available before decode)
+        if not channels_in_file and self._prescan_cache is not None:
+            cached_path, cached_chs, cached_ids = self._prescan_cache
+            if cached_path == self.measurement_path:
+                channels_in_file = list(cached_chs)
+                ids_per_channel = {ch: set(ids) for ch, ids in cached_ids.items()}
+
         return channels_in_file, ids_per_channel
 
     def choose_dbc(self) -> None:

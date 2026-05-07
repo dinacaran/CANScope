@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from core.readers.base import MeasurementReader, UnsupportedFormatError
 
@@ -10,6 +11,83 @@ CAN_RAW_SUFFIXES = {'.blf', '.asc'}
 
 # ── All supported measurement file suffixes ───────────────────────────────
 ALL_SUFFIXES = {'.blf', '.asc', '.mf4', '.mdf', '.csv'}
+
+# Maximum frames to read during a lightweight pre-scan (keeps it < 1 s)
+_PRESCAN_LIMIT = 50_000
+
+
+def prescan_measurement(
+    path: str,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[int], dict[int, set[int]]]:
+    """
+    Lightweight pre-scan: read up to *_PRESCAN_LIMIT* raw CAN frames from
+    *path* and return ``(channels, ids_per_channel)`` without decoding signals.
+
+    Works for BLF, ASC, and MDF bus-logging files.  CSV and pre-decoded MDF
+    return empty results (channels come from decoded signals, not raw frames).
+
+    Typically finishes in < 1 second even for 100 MB+ files.
+    """
+    suffix = Path(path).suffix.lower()
+    channels: set[int] = set()
+    ids_per_channel: dict[int, set[int]] = {}
+
+    if suffix not in CAN_RAW_SUFFIXES and suffix not in ('.mf4', '.mdf'):
+        return [], {}
+
+    if suffix in ('.mf4', '.mdf'):
+        from core.readers.mdf_reader import MDFReader
+        if not MDFReader.is_bus_logging(path):
+            return [], {}
+
+    if progress:
+        progress("Scanning measurement for channels…")
+
+    try:
+        _prescan_can_messages(path, suffix, channels, ids_per_channel)
+    except Exception:
+        pass
+
+    sorted_chs = sorted(channels)
+    return sorted_chs, ids_per_channel
+
+
+def _prescan_can_messages(
+    path: str,
+    suffix: str,
+    channels: set[int],
+    ids_per_channel: dict[int, set[int]],
+) -> None:
+    """Iterate raw CAN messages from *path* using python-can readers."""
+    import can
+
+    if suffix == '.blf':
+        reader = can.BLFReader(str(path))
+    elif suffix == '.asc':
+        reader = can.ASCReader(str(path))
+    else:
+        reader = can.MF4Reader(str(path))
+
+    is_mdf = suffix in ('.mf4', '.mdf')
+    count = 0
+    with reader:
+        for msg in reader:
+            if not hasattr(msg, 'arbitration_id'):
+                continue
+            raw_ch = getattr(msg, 'channel', None)
+            if is_mdf:
+                ch = int(raw_ch) if isinstance(raw_ch, (int, float)) else None
+            else:
+                ch = (int(raw_ch) + 1) if isinstance(raw_ch, (int, float)) else None
+            if ch is not None:
+                channels.add(ch)
+                ids_per_channel.setdefault(ch, set()).add(
+                    int(msg.arbitration_id)
+                )
+            count += 1
+            if count >= _PRESCAN_LIMIT:
+                break
 
 
 def dbc_required_for(path: str) -> bool:
@@ -97,6 +175,7 @@ __all__ = [
     "UnsupportedFormatError",
     "reader_factory",
     "dbc_required_for",
+    "prescan_measurement",
     "CAN_RAW_SUFFIXES",
     "ALL_SUFFIXES",
 ]
