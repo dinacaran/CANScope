@@ -7,6 +7,93 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.39] — 2026-05-07
+
+### Added — DBC Manager channel pre-scan
+
+- **Measurement pre-scan on file open** — when a BLF/ASC/MDF file is selected,
+  a lightweight scan reads up to 50 000 frames (~< 1 s) to extract CAN channel
+  numbers and arbitration IDs *before* Load+Decode.  The DBC Manager now shows
+  the real channels from the measurement file instead of a hardcoded [1, 2].
+
+- **Channel info banner in DBC Manager** — shows "Channels detected: CAN 1,
+  CAN 2, …" or a hint to load a measurement file first.
+
+- **`prescan_measurement()` in `core/readers/__init__.py`** — new public
+  function reusable by any caller that needs channel/ID data before decoding.
+
+### Changed
+
+- **`_collect_channel_data()` priority chain** — now checks (1) RawFrameStore,
+  (2) SignalStore, (3) pre-scan cache — so the DBC Manager always has real
+  channel data regardless of decode state.
+
+- **DBC Manager fallback removed** — dropdown no longer shows phantom CAN 1/2
+  when no measurement is loaded; "All Channels" remains available as default.
+
+---
+
+## [v00.00.38] — 2026-05-07
+
+### Added — Vectorized BLF/ASC decode (30× faster)
+
+- **Two-pass vectorized decode pipeline** — Pass 1 drains all raw frames into
+  RawFrameStore (no DBC decode); Pass 2 groups frames by (channel, arb_id)
+  using numpy argsort/diff and applies numpy bit-extraction across entire
+  groups at once.  ~30× faster than per-frame cantools decode.
+
+- **`core/vectorized_decoder.py`** — `SignalExtractor` performs little-endian
+  bit extraction (shifts, masks, sign-extension, scale+offset) fully vectorized
+  across N frames.  `MessageVectorDecoder` verifies vectorized output vs
+  cantools on the first frame; any mismatch permanently falls back to per-row
+  cantools.  Big-endian and multiplexed signals use cantools fallback.
+
+- **`SignalStore.add_series_bulk()`** — inserts a complete channel time-series
+  via `array.array.frombytes(ndarray.tobytes())` — single C-level memcopy,
+  no per-sample Python loop.
+
+### Changed
+
+- **Cached message series refs** — `_msg_series_cache[(channel, msg_name)]`
+  caches ordered `list[SignalSeries]` so the hot loop avoids string-key
+  construction and dict lookups per signal sample.
+
+- **Selective `raw_values`** — `has_labels` flag on `SignalSeries` skips
+  `raw_values.append()` for ~90% of signals (plain numeric), saving hundreds
+  of MB on large files.  `display_value_at(idx)` falls back to `values[idx]`.
+
+- **Delta-only tree updates** — `build_tree_payload()` only called when
+  `_tree_dirty` flag is set (new signals seen since last emit).
+
+---
+
+## [v00.00.37] — 2026-05-07
+
+### Fixed — BLF decode performance for large files (>20 MB)
+
+- **Per-channel DBC config in vectorized path** — the two-pass vectorized
+  decoder now resolves the correct DBC per channel using `ChannelConfig`,
+  matching the per-row path behaviour.
+
+- **Choices lookup built before decode** — `store.set_choices_lookup()` is
+  called with the full (channel, msg_name, sig_name) → choices map before
+  the vectorized decode loop, so `has_labels` is correctly set on first
+  series creation.
+
+---
+
+## [v00.00.36] — 2026-05-07
+
+### Fixed — Raw Frame DBC decode with per-channel config
+
+- **`dbc_required_for(path)`** now probes MDF files instead of returning
+  a hardcoded value — correctly routes bus-logging MDF to the DBC path.
+
+- **`iter_frames_only()` on ASCCANReader** — refactored so the two-pass
+  vectorized path works for ASC files (was previously only on BLFCANReader).
+
+---
+
 ## [v00.00.35] — 2025-04-25
 
 ### Fixed — Cursor columns and timestamp normalisation (v00.00.33/34 regressions)

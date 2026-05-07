@@ -156,9 +156,7 @@ class DBCManagerDialog(QDialog):
         self.setMinimumWidth(720)
         self.resize(760, 380)
 
-        # Always show at least CAN 1 and 2 so the user can assign
-        # even before a measurement is loaded
-        self._channels_in_file = sorted(channels_in_file) if channels_in_file else [1, 2]
+        self._channels_in_file = sorted(channels_in_file) if channels_in_file else []
         self._ids_per_channel  = ids_per_channel
         self._data_provider    = data_provider  # callable for refresh
         self._rows: list[_DBCRow] = []
@@ -190,6 +188,11 @@ class DBCManagerDialog(QDialog):
             lbl.setStyleSheet("color: #8090a0; font-size: 11px;")
             hdr.addWidget(lbl)
         hdr.addStretch()
+
+        # Channel info banner
+        self._channel_info = QLabel()
+        self._channel_info.setStyleSheet("color: #a0a060; font-size: 11px; padding: 2px 4px;")
+        self._update_channel_info()
 
         # Populate existing rows
         for ch, path in channel_config.channels.items():
@@ -238,10 +241,30 @@ class DBCManagerDialog(QDialog):
         # ── Main layout ───────────────────────────────────────────────────
         main = QVBoxLayout(self)
         main.addLayout(name_row)
+        main.addWidget(self._channel_info)
         main.addLayout(hdr)
         main.addWidget(scroll, 1)
         main.addLayout(add_row)
         main.addLayout(btn_row)
+
+    # ── Channel info ────────────────────────────────────────────────────
+
+    def _update_channel_info(self) -> None:
+        if self._channels_in_file:
+            ch_list = ", ".join(f"CAN {c}" for c in self._channels_in_file)
+            self._channel_info.setText(
+                f"Channels detected in measurement: {ch_list}"
+            )
+            self._channel_info.setStyleSheet(
+                "color: #80b0a0; font-size: 11px; padding: 2px 4px;"
+            )
+        else:
+            self._channel_info.setText(
+                "No measurement loaded — open a measurement file first to detect channels"
+            )
+            self._channel_info.setStyleSheet(
+                "color: #b0a060; font-size: 11px; padding: 2px 4px;"
+            )
 
     # ── Public result ─────────────────────────────────────────────────────
 
@@ -304,6 +327,7 @@ class DBCManagerDialog(QDialog):
                             for ch in new_chs:
                                 if row.channel_combo.findData(ch) < 0:
                                     row.channel_combo.addItem(f'CAN {ch}', ch)
+                        self._update_channel_info()
             except Exception:
                 pass
 
