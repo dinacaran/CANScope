@@ -7,6 +7,95 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.42] — 2026-05-11
+
+### Added — Multi-axis Y-axis spacing and per-axis visibility toggle
+
+**Proper axis spacing in Multi-Axis mode**
+
+Previously all extra Y axes were positioned at a fixed `55 × idx` offset from
+the viewport left edge, causing every axis to stack on top of the others.
+
+- `_update_multi_axis_views` now assigns axes to consecutive **slots** rather
+  than fixed index offsets: each visible axis occupies its own non-overlapping
+  panel (55 px wide, 4 px gap between panels).
+- `_rebuild_overlay` expands the left layout margin via
+  `plot.getAxis('left').setWidth(55 + n_visible × 59)` so the viewport shifts
+  right and makes room — extra axes are never clipped or overlapping the data area.
+- Hidden axes are parked off-screen (`x = −9999`) so no blank gap is left in
+  the axis area.
+
+**"Axis" column in the signal table (Multi-Axis mode only)**
+
+- Signal table expanded from 5 to 6 columns; column 5 is **"Axis"** (36 px fixed,
+  checkbox only).
+- The column is hidden in Normal and Stacked modes; it becomes visible
+  automatically when Multi-Axis is enabled.
+- Unchecking an axis checkbox hides that signal's Y axis and frees its layout
+  slot — the plot area expands horizontally to fill the recovered space.
+- Re-checking restores the axis in the next available slot.
+- The `axis_visible` state is persisted through undo snapshots and restored
+  correctly after mode switches and curve rebuilds.
+- `PlottedSignal` gains `axis_visible: bool = True` field (slot-safe).
+
+### Fixed
+
+- **Plot area did not expand when axes were hidden** — `setWidth` was computed
+  once at build time for all extra axes (visible or not).  `_toggle_axis_visibility`
+  now recomputes the required margin from currently-visible axes only and calls
+  `setWidth` immediately so the layout shrinks and the viewport grows.
+
+---
+
+## [v00.00.41] — 2026-05-11
+
+### Added — Fault auto-plot, zoom to trigger point
+
+- **Fault detection auto-plot** — when a diagnostic rule fires, the signals
+  listed under `plot_signals:` in the YAML rule are automatically added to the
+  main plot and the view zooms to the trigger point (0→1 transition) with a
+  ±0.5 s margin.  Signal list is fully configurable per rule.
+- **`plot_signals:` field in rule YAML** — list signal names to auto-plot when
+  a fault fires.  Names are matched case-insensitively against the loaded
+  measurement.  If omitted, falls back to the fault signal itself.
+- **`MainWindow.plot_finding(finding)`** — adds signals and calls
+  `plot_panel.zoom_to_time(t0, t1)`.
+- **`PlotPanel.zoom_to_time(t_start, t_end, margin=0.5)`** — zooms X to
+  `[t_start − margin, t_end + margin]` and calls `fit_vertical()` to rescale Y.
+  Works in all three plot modes (Normal, Multi-Axis, Stacked).
+- **`DiagnosticContext.resolve_signal_key(name)`** — silent case-insensitive
+  lookup that returns the full store key without writing to the progress log.
+- **`Finding.plot_signals`** — new field (`list[str]`) carrying resolved store
+  keys for the signals to auto-plot.
+
+### Fixed — Cursor drag responsiveness
+
+- **`_nearest_index`** replaced Python `while` binary-search loop with
+  `np.searchsorted` (C-level, O(log n)).
+- **`_row_lookup`** — key → table-row mapping rebuilt once in `_refresh_table`
+  and cached; `_update_table_values` uses it directly (eliminates O(rows) scan
+  on every drag event).
+- **`SignalProxy` removed** — direct `scene.sigMouseMoved.connect(slot)`
+  replaces `pg.SignalProxy(rateLimit=60)`, eliminating up to 16 ms of
+  artificial throttle.  `_mouse_moved` signature changed from `(event: tuple)`
+  to `(pos)` to match the direct signal.
+- **`setUpdatesEnabled(False/True)`** wraps `_update_table_values` so the
+  entire cursor-value column update triggers one repaint instead of one per cell.
+
+### Fixed — Show/hide data points hang on large files (>150 MB)
+
+- **Style-only update path** — `_apply_curve_style(set_data=False)` uses
+  per-property setters (`setPen`, `setSymbol`, `setSymbolSize`, etc.) instead
+  of `setData(full_arrays)`.  The data arrays are never re-read; toggle is instant.
+- **`setClipToView(True)` + `setDownsampling(auto=True, method='peak')`** added
+  to every new `PlotDataItem` via `_configure_curve()`.  Only viewport-visible
+  samples are rendered; out-of-view samples are skipped by pyqtgraph.
+- **`np.asarray` instead of `np.frombuffer`** in the data-set path — zero-copy
+  via buffer protocol and returns a writable array as required by pyqtgraph
+  internals (`np.frombuffer` returns read-only).
+
+---
+
 ## [v00.00.40] — 2026-05-07
 
 ### Added — DBC Manager channel pre-scan

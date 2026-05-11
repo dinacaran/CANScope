@@ -36,8 +36,9 @@ class PlottedSignal:
     color: str
     axis: Any = None
     view_box: Any = None
-    visible: bool = True   # checkbox state — False hides curve and stacked row
-    group: str = ''        # '' = ungrouped; any string = group name
+    visible: bool = True        # checkbox state — False hides curve and stacked row
+    group: str = ''             # '' = ungrouped; any string = group name
+    axis_visible: bool = True   # multi-axis mode: show/hide the Y axis for this signal
 
 
 
@@ -142,7 +143,8 @@ class PlotPanel(QWidget):
         # (one InfiniteLine per row — they cannot be shared across scenes)
         self._stacked_c1_lines: list[pg.InfiniteLine] = []
         self._stacked_c2_lines: list[pg.InfiniteLine] = []
-        self._proxy = None
+        self._proxy = None          # legacy name kept; now stores the connected scene
+        self._row_lookup: dict[str, int] = {}   # key → table row; rebuilt by _refresh_table
         self._color_cycle = cycle([
             '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
             '#a65628', '#f781bf', '#17becf', '#bcbd22', '#1f77b4',
@@ -227,9 +229,9 @@ class PlotPanel(QWidget):
         # v_line2 not added to plot until cursor 2 is enabled
 
         # ── Signal table ──────────────────────────────────────────────────
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit'])
+            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit', 'Axis'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemSelectionChanged.connect(self._emit_selection)
@@ -242,19 +244,21 @@ class PlotPanel(QWidget):
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
         hdr.setStretchLastSection(False)
-        # Fix 1: all three columns user-resizable
-        hdr.setMinimumSectionSize(0)  # allow col 0 to be as narrow as we set it
+        hdr.setMinimumSectionSize(0)
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)      # ☑
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive) # Signal
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive) # Cursor 1
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive) # Cursor 2
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive) # Unit
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Axis
         self.table.setColumnWidth(0, 36)    # ☑ checkbox + group arrow
         self.table.setColumnWidth(1, 190)   # Signal
         self.table.setColumnWidth(2, 90)    # Cursor 1
         self.table.setColumnWidth(3, 90)    # Cursor 2
         self.table.setColumnWidth(4, 55)    # Unit
+        self.table.setColumnWidth(5, 36)    # Axis (multi-axis mode only)
         self.table.setColumnHidden(3, True) # hidden until cursor 2 enabled
+        self.table.setColumnHidden(5, True) # hidden until multi-axis mode enabled
 
         self.table_panel = QWidget()
         _tbl_layout = QVBoxLayout(self.table_panel)
@@ -304,12 +308,12 @@ class PlotPanel(QWidget):
 
     def set_show_points(self, show: bool) -> None:
         self._show_points = bool(show)
-        # Bug 2 fix: applies to ALL plotted signals (PlotDataItem supports symbols)
         for plotted in self._items.values():
-            self._apply_curve_style(plotted)
+            self._apply_curve_style(plotted, set_data=False)
 
     def set_multi_axis(self, enabled: bool) -> None:
         self._multi_axis = bool(enabled)
+        self.table.setColumnHidden(5, not self._multi_axis)
         self._rebuild_curves(preserve_selection=True)
         self.fit_to_window()
 
@@ -594,7 +598,6 @@ class PlotPanel(QWidget):
             vis_idx += 1
 
             if self._multi_axis and idx > 0:
-                # ── BUG 1 FIX ──
                 # Use PlotDataItem (not PlotCurveItem) so symbol kwargs work.
                 # sigResized is connected below so geometry is maintained on resize.
                 axis = pg.AxisItem('left')
@@ -603,17 +606,24 @@ class PlotPanel(QWidget):
                 self.plot.plotItem.scene().addItem(axis)
                 axis.linkToView(vb)
                 vb.setXLink(self.plot.plotItem.vb)
-                curve = pg.PlotDataItem()       # <-- was PlotCurveItem
+                curve = pg.PlotDataItem()
+                self._configure_curve(curve)
                 vb.addItem(curve)
                 plotted.curve     = curve
                 plotted.axis      = axis
                 plotted.view_box  = vb
                 self._extra_axes.append((axis, vb))
+                # Restore axis visibility state (toggled via Axis column checkbox)
+                axis.setVisible(plotted.axis_visible)
             else:
                 curve = self.plot.plot([], [], name=key)
+                self._configure_curve(curve)
                 plotted.curve    = curve
                 plotted.axis     = self.plot.getAxis('left')
                 plotted.view_box = None
+                # First signal uses main left axis — respect its axis_visible flag
+                if self._multi_axis:
+                    self.plot.getAxis('left').setVisible(plotted.axis_visible)
 
             self._apply_curve_style(plotted)
             try:
@@ -622,9 +632,13 @@ class PlotPanel(QWidget):
                 pass
 
         if self._extra_axes:
+            # Reserve left-margin space for VISIBLE extra axes only.
+            n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
+            total_left_w = self._MAIN_AXIS_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            self.plot.getAxis('left').setWidth(total_left_w)
             # Connect once; disconnect happens in _clear_rendered_items
             self.plot.plotItem.vb.sigResized.connect(self._update_multi_axis_views)
-            # Defer initial geometry until widget is painted
+            # Defer initial geometry until widget is painted and layout has settled
             QTimer.singleShot(10, self._update_multi_axis_views)
 
     def _rebuild_stacked(self) -> None:
@@ -686,6 +700,7 @@ class PlotPanel(QWidget):
                 p.setXLink(ref_plot)
 
             curve = pg.PlotDataItem()
+            self._configure_curve(curve)
             p.addItem(curve)
             plotted.curve    = curve
             plotted.axis     = p.getAxis('left')
@@ -730,45 +745,86 @@ class PlotPanel(QWidget):
 
             self._stacked_plots.append(p)
 
-    # ── Curve style ───────────────────────────────────────────────────────
+    # ── Curve configuration & style ──────────────────────────────────────
+
+    @staticmethod
+    def _configure_curve(curve: pg.PlotDataItem) -> None:
+        """One-time performance settings applied to every new PlotDataItem.
+
+        clipToView  — pyqtgraph only sends samples inside the current
+                      viewport to the renderer; the rest are never touched.
+                      For a 150 MB file this keeps every redraw O(visible)
+                      instead of O(total).
+        autoDownsample / peak — when many samples map to the same pixel,
+                      collapse them to min+max so fault spikes are never
+                      missed even at high zoom-out levels.
+        """
+        curve.setClipToView(True)
+        curve.setDownsampling(auto=True, method='peak')   # kwarg is 'method', not 'mode'
 
     def _apply_curve_style(self, plotted: PlottedSignal,
-                           selected: bool = False) -> None:
-        """
-        Apply pen style.  Selected curves are drawn thicker (5.0 vs 2.8).
+                           selected: bool = False,
+                           set_data: bool = True) -> None:
+        """Apply pen + symbol style.  Selected curves are drawn thicker.
+
+        set_data=True  (default, called on initial add): pushes the full
+            data buffer into pyqtgraph via setData().
+        set_data=False (style toggle / highlight change): uses cheap
+            per-property setters so the data arrays are never re-read.
+            This is what makes show/hide points instant on large files.
         """
         if plotted.curve is None:
             return
-        ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
-        vs = np.asarray(plotted.series.values,     dtype=np.float64)
         width = 5.0 if selected else 2.8
-        kwargs: dict = {
-            'pen':     pg.mkPen(color=plotted.color, width=width),
-            'connect': 'finite',
-        }
-        if self._show_points:
-            kwargs.update({
-                'symbol':     'o',
-                'symbolSize':  5,
-                'symbolBrush': plotted.color,
-                'symbolPen':   pg.mkPen(color=plotted.color, width=1.2),
-            })
+        pen   = pg.mkPen(color=plotted.color, width=width)
+
+        if set_data:
+            # np.asarray on array.array('d') is zero-copy via the buffer
+            # protocol and returns a writable view — required by pyqtgraph.
+            ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
+            vs = np.asarray(plotted.series.values,     dtype=np.float64)
+            kwargs: dict = {'pen': pen, 'connect': 'finite'}
+            if self._show_points:
+                kwargs.update({
+                    'symbol':     'o',
+                    'symbolSize':  5,
+                    'symbolBrush': plotted.color,
+                    'symbolPen':   pg.mkPen(color=plotted.color, width=1.2),
+                })
+            else:
+                kwargs['symbol'] = None
+            plotted.curve.setData(ts, vs, **kwargs)
         else:
-            kwargs['symbol'] = None
-        plotted.curve.setData(ts, vs, **kwargs)
+            # Style-only path: no data arrays touched.
+            plotted.curve.setPen(pen)
+            if self._show_points:
+                plotted.curve.setSymbol('o')
+                plotted.curve.setSymbolSize(5)
+                plotted.curve.setSymbolBrush(pg.mkBrush(plotted.color))
+                plotted.curve.setSymbolPen(pg.mkPen(color=plotted.color, width=1.2))
+            else:
+                plotted.curve.setSymbol(None)
 
     def _refresh_highlight(self) -> None:
         """Update curve thickness to reflect current table selection."""
         sel = set(self.selected_keys())
         for key, plotted in self._items.items():
             if plotted.curve is not None and plotted.visible:
-                self._apply_curve_style(plotted, selected=(key in sel))
+                self._apply_curve_style(plotted, selected=(key in sel),
+                                        set_data=False)
 
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
+    # Width constants for multi-axis layout
+    _MAIN_AXIS_W: int = 55   # width of the main (first) left axis
+    _EXTRA_AXIS_W: int = 55  # width of each additional floating axis
+    _EXTRA_AXIS_GAP: int = 4 # gap between adjacent axis panels
+
     def _update_multi_axis_views(self) -> None:
         """
-        Bug 1 fix: position floating ViewBoxes + axes to the LEFT of main plot.
+        Position floating ViewBoxes + axes to the LEFT of main plot.
+        Only VISIBLE extra axes occupy layout slots — hidden axes are parked
+        off-screen so their space is reclaimed by the viewport.
         Called on sigResized so geometry stays correct after window resize.
         """
         if not self._extra_axes:
@@ -777,19 +833,30 @@ class PlotPanel(QWidget):
         if rect.width() < 10:                       # widget not yet painted
             QTimer.singleShot(20, self._update_multi_axis_views)
             return
-        axis_width = 55
-        for idx, (axis, vb) in enumerate(self._extra_axes, start=1):
+        aw  = self._EXTRA_AXIS_W
+        gap = self._EXTRA_AXIS_GAP
+        mw  = self._MAIN_AXIS_W
+        # Assign consecutive slots only to visible extra axes.
+        # Hidden axes are placed off-screen (no layout space consumed).
+        slot = 0
+        for axis, vb in self._extra_axes:
             vb.setGeometry(rect)
             vb.linkedViewChanged(self.plot.plotItem.vb, vb.XAxis)
-            x = rect.left() - axis_width * idx
-            axis.setGeometry(QRectF(x, rect.top(), axis_width, rect.height()))
+            if axis.isVisible():
+                x = rect.left() - mw - gap - aw - slot * (aw + gap)
+                axis.setGeometry(QRectF(x, rect.top(), aw, rect.height()))
+                slot += 1
+            else:
+                # Park off-screen — invisible, no overlap with plot area
+                axis.setGeometry(QRectF(-9999, rect.top(), 1, rect.height()))
 
     # ── Mouse proxy management ────────────────────────────────────────────
 
     def _setup_mouse_proxy(self) -> None:
+        # Disconnect the previous scene first
         if self._proxy is not None:
             try:
-                self._proxy.disconnect()
+                self._proxy.sigMouseMoved.disconnect(self._mouse_moved)
             except Exception:
                 pass
             self._proxy = None
@@ -799,9 +866,10 @@ class PlotPanel(QWidget):
             if (self._stacked_mode and self._stacked_plots)
             else self.plot.scene()
         )
-        self._proxy = pg.SignalProxy(
-            scene.sigMouseMoved, rateLimit=60, slot=self._mouse_moved
-        )
+        # Direct connection — no SignalProxy throttle, so the h-line and cursor
+        # updates fire immediately on every mouse-move instead of up to 16 ms late.
+        scene.sigMouseMoved.connect(self._mouse_moved)
+        self._proxy = scene   # keep ref so we can disconnect on next rebuild
         # Fix 2: connect right-click handler for stacked mode
         if self._stacked_mode and self._stacked_plots:
             try:
@@ -868,12 +936,11 @@ class PlotPanel(QWidget):
 
     # ── Mouse cursor (hover tracking for h-line only) ─────────────────────
 
-    def _mouse_moved(self, event: tuple) -> None:
+    def _mouse_moved(self, pos) -> None:
         """Track mouse for horizontal reference line only.
         Vertical position is now controlled by draggable InfiniteLines."""
         if not self._items:
             return
-        pos = event[0]
         if self._stacked_mode:
             return   # stacked rows handle cursors via sigPositionChanged
         if not self.plot.sceneBoundingRect().contains(pos):
@@ -883,31 +950,30 @@ class PlotPanel(QWidget):
 
     def _update_table_values(self, x: float, col: int = 2) -> None:
         """Update Cursor 1 (col=2) or Cursor 2 (col=3) value column."""
-        row_lookup: dict[str, int] = {}
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)   # signal key is now col 1
-            if item:
-                key = str(item.data(Qt.ItemDataRole.UserRole))
-                if not key.startswith('__'):
-                    row_lookup[key] = row
-        for key, plotted in self._items.items():
-            if not plotted.visible:
-                continue   # hidden signal — no cursor value shown
-            idx = self._nearest_index(plotted.series.timestamps, x)
-            if idx is None:
-                continue
-            value = plotted.series.display_value_at(idx)
-            row   = row_lookup.get(key)
-            if row is not None:
+        self.table.setUpdatesEnabled(False)
+        try:
+            for key, plotted in self._items.items():
+                if not plotted.visible:
+                    continue
+                row = self._row_lookup.get(key)
+                if row is None:
+                    continue
                 cell = self.table.item(row, col)
-                if cell is not None:
-                    if isinstance(value, str):
-                        cell.setText(value)
-                    else:
-                        try:
-                            cell.setText(f"{float(value):.3f}")
-                        except (TypeError, ValueError):
-                            cell.setText(str(value))
+                if cell is None:
+                    continue
+                idx = self._nearest_index(plotted.series.timestamps, x)
+                if idx is None:
+                    continue
+                value = plotted.series.display_value_at(idx)
+                if isinstance(value, str):
+                    cell.setText(value)
+                else:
+                    try:
+                        cell.setText(f"{float(value):.3f}")
+                    except (TypeError, ValueError):
+                        cell.setText(str(value))
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     # ── Fit to window ─────────────────────────────────────────────────────
 
@@ -1189,13 +1255,34 @@ class PlotPanel(QWidget):
                 for item in (sig_item, c1_item, c2_item, un_item):
                     item.setForeground(brush)
                 chk_item.setForeground(brush)
+                # Col 5: Axis visibility checkbox (multi-axis mode only)
+                ax_item = QTableWidgetItem()
+                ax_item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable |
+                    Qt.ItemFlag.ItemIsEnabled |
+                    Qt.ItemFlag.ItemIsSelectable
+                )
+                ax_item.setCheckState(
+                    Qt.CheckState.Checked if plotted.axis_visible
+                    else Qt.CheckState.Unchecked
+                )
+                ax_item.setData(Qt.ItemDataRole.UserRole, f'__axis__{key}')
                 self.table.setItem(row_idx, 0, chk_item)
                 self.table.setItem(row_idx, 1, sig_item)
                 self.table.setItem(row_idx, 2, c1_item)
                 self.table.setItem(row_idx, 3, c2_item)
                 self.table.setItem(row_idx, 4, un_item)
+                self.table.setItem(row_idx, 5, ax_item)
         self.table.blockSignals(False)
         self._apply_collapse_state()
+        # Rebuild the key→row index used by _update_table_values on every cursor drag.
+        self._row_lookup = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            if item:
+                key = str(item.data(Qt.ItemDataRole.UserRole))
+                if not key.startswith('__'):
+                    self._row_lookup[key] = row
         # widths are user-controlled — no resizeColumnsToContents
 
     def _emit_selection(self) -> None:
@@ -1235,6 +1322,9 @@ class PlotPanel(QWidget):
                 color=v.color,
                 axis=None,
                 view_box=None,
+                visible=v.visible,
+                group=v.group,
+                axis_visible=v.axis_visible,
             )
             for k, v in self._items.items()
         }
@@ -1503,8 +1593,8 @@ class PlotPanel(QWidget):
         name_item.setForeground(QBrush(QColor('#8ab8e0')))  # light blue
         self.table.setItem(row_idx, 1, name_item)
 
-        # Cols 2-4: empty, same background
-        for col in (2, 3, 4):
+        # Cols 2-5: empty, same background
+        for col in (2, 3, 4, 5):
             cell = QTableWidgetItem('')
             cell.setFlags(Qt.ItemFlag.ItemIsEnabled)
             cell.setBackground(bg)
@@ -1533,6 +1623,15 @@ class PlotPanel(QWidget):
             return
         key = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(key, str):
+            return
+
+        # Col 5: Axis visibility toggle (multi-axis mode)
+        if key.startswith('__axis__'):
+            sig_key = key[len('__axis__'):]
+            if sig_key in self._items:
+                self._toggle_axis_visibility(
+                    sig_key, item.checkState() == Qt.CheckState.Checked
+                )
             return
 
         if key.startswith('__grpchk__'):
@@ -1589,6 +1688,27 @@ class PlotPanel(QWidget):
             self._update_table_values(self.v_line.value(), col=2)
             if self._cursor2_enabled:
                 self._update_table_values(self.v_line2.value(), col=3)
+
+    def _toggle_axis_visibility(self, key: str, visible: bool) -> None:
+        """Show or hide the Y axis for a single signal (multi-axis mode only).
+
+        Hiding an axis frees its layout slot so the plot area expands to fill
+        the gap.  Showing it re-inserts it at the next available slot.
+        """
+        plotted = self._items.get(key)
+        if plotted is None:
+            return
+        plotted.axis_visible = visible
+        if plotted.axis is not None:
+            plotted.axis.setVisible(visible)
+        if self._multi_axis and self._extra_axes:
+            # Resize the left margin to match the number of now-visible extra axes.
+            # sigResized will fire once the layout settles and reposition everything;
+            # the timer is a safety net for edge cases where sigResized doesn't fire.
+            n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
+            new_w = self._MAIN_AXIS_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            self.plot.getAxis('left').setWidth(new_w)
+            QTimer.singleShot(15, self._update_multi_axis_views)
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         """Double-click on group header (col 0 arrow or col 1 name) → rename group."""
@@ -1872,17 +1992,14 @@ class PlotPanel(QWidget):
 
     @staticmethod
     def _nearest_index(values, target: float) -> int | None:
-        if not len(values):
+        n = len(values)
+        if n == 0:
             return None
-        arr  = np.asarray(values, dtype=np.float64)
-        lo, hi = 0, len(arr) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if arr[mid] < target:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo == 0:
+        # Zero-copy view; searchsorted runs in C (O(log n), no Python loop).
+        arr = np.frombuffer(values, dtype=np.float64)
+        idx = int(np.searchsorted(arr, target, side='left'))
+        if idx >= n:
+            return n - 1
+        if idx == 0:
             return 0
-        before = lo - 1
-        return lo if abs(arr[lo] - target) < abs(arr[before] - target) else before
+        return idx if (arr[idx] - target) <= (target - arr[idx - 1]) else idx - 1
