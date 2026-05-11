@@ -75,6 +75,12 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self._update_action_states()  # grey-out on startup
         self._set_ready_status()
+
+        # Hidden diagnostics feature — Ctrl+Shift+A. No menu/toolbar entry.
+        # Disable with env var CANSCOPE_DIAGNOSTICS=0.
+        from gui.diagnostics.activation import install_shortcut
+        install_shortcut(self)
+
         self._log(f'{self.app_name} {self.version} started.')
         self._log(f'Dev log file: {self._log_file_path}')
         self._update_measurement_tab()
@@ -648,6 +654,17 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if fit:
             self.plot_panel.fit_to_window()
         return True
+
+    def plot_finding(self, finding) -> None:
+        """Plot a diagnostic finding's signals and zoom to its time window."""
+        if not self.store:
+            return
+        keys = finding.plot_signals or finding.signals
+        if keys:
+            self.add_signals_to_plot(keys)
+        t0, t1 = finding.time_window
+        if t0 or t1:
+            self.plot_panel.zoom_to_time(t0, t1)
 
     def export_selected_csv(self) -> None:
         series_items = self.plot_panel.plotted_series()

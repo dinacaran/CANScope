@@ -5,10 +5,6 @@ cantools>=39.4
 numpy>=1.26
 asammdf>=7.0
 pyinstaller>=6.0
-# YAML config loader for the diagnostics engine (rules in config/diagnostics/)
-pyyaml>=6.0
-# HTTP client for GitHub Models API (AI diagnosis feature, hidden Ctrl+Shift+A)
-requests>=2.31
 # canmatrix is required by python-can's MF4Reader for MDF bus logging support.
 # Install if you plan to open MDF files that contain raw CAN bus frames.
 # canmatrix

@@ -962,6 +962,22 @@ class PlotPanel(QWidget):
                 pad = (y_max - y_min) * 0.05 if y_min != y_max else (1.0 if y_min == 0 else abs(y_min) * 0.05)
                 self.plot.setYRange(y_min - pad, y_max + pad, padding=0)
 
+    def zoom_to_time(self, t_start: float, t_end: float, margin: float = 0.5) -> None:
+        """Zoom X to [t_start - margin, t_end + margin] and rescale Y to match."""
+        x0 = t_start - margin
+        x1 = t_end + margin
+        if x0 >= x1:
+            x1 = x0 + 1.0
+        if self._stacked_mode:
+            for p in self._stacked_plots:
+                p.setXRange(x0, x1, padding=0)
+        elif self._multi_axis:
+            self.plot.setXRange(x0, x1, padding=0)
+            self._update_multi_axis_views()
+        else:
+            self.plot.setXRange(x0, x1, padding=0)
+        self.fit_vertical()
+
     def fit_vertical(self) -> None:
         """
         Fit Y axis to the data currently visible in the X range.

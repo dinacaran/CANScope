@@ -157,11 +157,7 @@ builds and uploads the ZIP automatically on every tag push matching `v*.*.*`.
 
 ```
 canscope/
-├── app.py                        # Entry point, APP_NAME="CAN Scope", APP_VERSION
-├── config/
-│   └── diagnostics/
-│       ├── motor_control.yaml    # Fault rules for motor/inverter domain (user-editable)
-│       └── README.md             # Rule authoring guide
+├── app.py                        # Entry point, APP_NAME="CAN Scope"
 ├── core/
 │   ├── models.py                 # RawFrame, DecodedSignalSample dataclasses
 │   ├── channel_config.py         # ChannelConfig: {channel → DBC}, decoder cache, save/load .canscope_ch
@@ -169,53 +165,29 @@ canscope/
 │   ├── signal_store.py           # SignalStore, SignalSeries (array.array storage)
 │   ├── raw_frame_store.py        # On-disk indexed store: 18 B/frame RAM + 64 B/frame disk, mmap
 │   ├── dbc_decoder.py            # DBCDecoder with 3-level cache
-│   ├── vectorized_decoder.py     # Vectorised BLF/ASC decode + cached series refs
 │   ├── blf_reader.py             # BLFReaderService (wraps python-can)
 │   ├── export.py                 # CSV export
-│   ├── readers/
-│   │   ├── __init__.py           # reader_factory() + dbc_required_for() — format detection
-│   │   ├── base.py               # MeasurementReader protocol
-│   │   ├── blf_can_reader.py     # BLF + DBC pipeline
-│   │   ├── asc_can_reader.py     # ASC + DBC pipeline
-│   │   ├── mdf_reader.py         # MF4/MDF pre-decoded via asammdf + is_bus_logging() probe
-│   │   ├── mdf_can_reader.py     # MDF4 bus logging via python-can MF4Reader + DBC
-│   │   └── csv_reader.py         # Wide and narrow CSV
-│   └── diagnostics/              # AI-powered diagnostics engine (Ctrl+Shift+A)
-│       ├── __init__.py
-│       ├── config_loader.py      # YAML domain parser — infers rule type, auto-generates id/title
-│       ├── context.py            # DiagnosticContext — read-only SignalStore adapter for rule processors
-│       ├── engine.py             # DiagnosticEngine — orchestrates rule runs and evidence building
-│       ├── evidence.py           # EvidenceBuilder — reduces large data to <5 KB LLM snippets
-│       ├── models.py             # Finding, Severity, AnalysisResult dataclasses
-│       ├── rules/
-│       │   ├── __init__.py       # RULE_PROCESSORS dispatch table
-│       │   ├── expression.py     # Free-form condition evaluation (>, <, =, !=, and, or)
-│       │   ├── fault_signal.py   # fault_when operator evaluation
-│       │   ├── range_check.py    # min/max boundary check
-│       │   └── message_loss.py   # Gap detection between CAN samples
-│       └── llm/
-│           ├── __init__.py
-│           ├── client.py         # GitHubModelsClient — streaming OpenAI-compatible REST
-│           └── prompts.py        # Analysis and chat follow-up prompt builders
+│   └── readers/
+│       ├── __init__.py           # reader_factory() + dbc_required_for() — format detection
+│       ├── base.py               # MeasurementReader protocol
+│       ├── blf_can_reader.py     # BLF + DBC pipeline
+│       ├── asc_can_reader.py     # ASC + DBC pipeline
+│       ├── mdf_reader.py         # MF4/MDF pre-decoded via asammdf + is_bus_logging() probe
+│       ├── mdf_can_reader.py     # MDF4 bus logging via python-can MF4Reader + DBC
+│       └── csv_reader.py         # Wide and narrow CSV
 ├── gui/
-│   ├── main_window.py            # MainWindow, toolbar, config save/load, plot_finding()
-│   ├── plot_widget.py            # PlotPanel: normal / multi-axis / stacked, dual cursors, zoom_to_time()
+│   ├── main_window.py            # MainWindow, toolbar, config save/load, ChannelConfig integration
+│   ├── plot_widget.py            # PlotPanel: normal / multi-axis / stacked, dual cursors, groups
 │   ├── signal_tree.py            # SignalTreeWidget with live search
 │   ├── raw_frame_dialog.py       # Sliding-window CAN Trace (RawFrameStore, no cap)
 │   ├── dbc_manager.py            # DBC Manager dialog: per-channel DBC, match quality bars
-│   ├── splash.py                 # CANScopeSplash — minimisable, taskbar-visible splash screen
-│   └── diagnostics/              # Diagnostics UI (non-modal window)
-│       ├── activation.py         # Wires Ctrl+Shift+A shortcut in MainWindow
-│       ├── window.py             # DiagnosticsWindow — domain selector, run controls, auto-plot on fault
-│       ├── findings_panel.py     # Left panel — severity-coloured finding list + details pane
-│       ├── chat_panel.py         # Right panel — streaming LLM chat with status label
-│       └── worker.py             # AnalysisWorker / LLMWorker (background thread helpers)
+│   └── splash.py                 # CANScopeSplash — minimisable, taskbar-visible splash screen
 ├── resources/
 │   ├── splashscreen.png          # 1635 × 962 splash image
 │   ├── CANScope_ICON.png         # 1254 × 1254 app icon source
 │   └── app_icon.ico              # Multi-resolution ICO (256/128/64/48/32/16 px)
 ├── requirements.txt
-├── CANScope.spec                 # PyInstaller spec, bundles resources/ and config/
+├── CANScope.spec                 # PyInstaller spec, bundles resources/
 └── .github/workflows/build.yml  # Auto-build on v*.*.* tag push
 ```
 
