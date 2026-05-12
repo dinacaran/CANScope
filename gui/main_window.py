@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self._pending_plot_colors: dict[str, str] = {}
         self._pending_plot_visible: dict[str, bool] = {}
         self._pending_plot_groups:  dict[str, str]  = {}
+        self._pending_plot_axis_visible: dict[str, bool] = {}
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
@@ -436,9 +437,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             },
             'signals': [
                 {
-                    'key':     k,
-                    'visible': self.plot_panel._items[k].visible,
-                    'group':   self.plot_panel._items[k].group,
+                    'key':          k,
+                    'visible':      self.plot_panel._items[k].visible,
+                    'group':        self.plot_panel._items[k].group,
+                    'axis_visible': self.plot_panel._items[k].axis_visible,
                 }
                 for k in self.plot_panel.plotted_keys()
             ],
@@ -487,10 +489,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         elif cfg_dbc:
             self.channel_config = ChannelConfig.from_single_dbc(cfg_dbc)
         # ── Parse signals list: supports new dict format and old plain-string format ──
-        signals_data    = list(data.get('signals') or [])
-        pending_keys    = []
-        pending_visible = {}
-        pending_groups  = {}
+        signals_data         = list(data.get('signals') or [])
+        pending_keys         = []
+        pending_visible      = {}
+        pending_groups       = {}
+        pending_axis_visible = {}
         for s in signals_data:
             if isinstance(s, str):
                 pending_keys.append(s)
@@ -502,6 +505,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         pending_visible[k] = bool(s['visible'])
                     if s.get('group'):
                         pending_groups[k] = str(s['group'])
+                    if 'axis_visible' in s:
+                        pending_axis_visible[k] = bool(s['axis_visible'])
         pending_colors = dict(data.get('signal_colors') or {})
 
         # Fix 6: if data is already decoded, ask the user what to do
@@ -551,6 +556,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if pending_groups.get(key):
                         self.plot_panel._items[key].group = pending_groups[key]
                         needs_rebuild = True
+                    if key in pending_axis_visible:
+                        self.plot_panel._items[key].axis_visible = pending_axis_visible[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             return
@@ -559,10 +567,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.measurement_path = cfg_blf
         self.blf_path = cfg_blf   # alias
         self.dbc_path = cfg_dbc
-        self._pending_plot_keys    = pending_keys
-        self._pending_plot_colors  = pending_colors
-        self._pending_plot_visible = pending_visible
-        self._pending_plot_groups  = pending_groups
+        self._pending_plot_keys         = pending_keys
+        self._pending_plot_colors       = pending_colors
+        self._pending_plot_visible      = pending_visible
+        self._pending_plot_groups       = pending_groups
+        self._pending_plot_axis_visible = pending_axis_visible
         self._update_measurement_tab()
         if not self.blf_path or not self.dbc_path:
             QMessageBox.warning(self, 'Incomplete configuration', 'The configuration file does not contain both BLF and DBC paths.')
@@ -746,15 +755,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
         )
         self._log('Decode finished successfully.')
         if self._pending_plot_keys:
-            wanted  = list(self._pending_plot_keys)
-            colors  = dict(self._pending_plot_colors)
-            visible = dict(getattr(self, '_pending_plot_visible', {}))
-            groups  = dict(getattr(self, '_pending_plot_groups',  {}))
+            wanted       = list(self._pending_plot_keys)
+            colors       = dict(self._pending_plot_colors)
+            visible      = dict(getattr(self, '_pending_plot_visible',      {}))
+            groups       = dict(getattr(self, '_pending_plot_groups',       {}))
+            axis_visible = dict(getattr(self, '_pending_plot_axis_visible', {}))
             self._pending_plot_keys = []
             self.add_signals_to_plot(wanted)
             for key, color in colors.items():
                 self.plot_panel.set_series_color(key, color)
-            # Restore visibility and group from saved config
+            # Restore visibility, group, and axis_visible from saved config
             needs_rebuild = False
             for key in wanted:
                 if key in self.plot_panel._items:
@@ -764,11 +774,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if key in groups and groups[key]:
                         self.plot_panel._items[key].group = groups[key]
                         needs_rebuild = True
+                    if key in axis_visible:
+                        self.plot_panel._items[key].axis_visible = axis_visible[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
-            self._pending_plot_colors  = {}
-            self._pending_plot_visible = {}
-            self._pending_plot_groups  = {}
+            self._pending_plot_colors       = {}
+            self._pending_plot_visible      = {}
+            self._pending_plot_groups       = {}
+            self._pending_plot_axis_visible = {}
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:

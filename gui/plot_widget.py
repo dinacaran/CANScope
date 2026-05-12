@@ -308,8 +308,17 @@ class PlotPanel(QWidget):
 
     def set_show_points(self, show: bool) -> None:
         self._show_points = bool(show)
-        for plotted in self._items.values():
-            self._apply_curve_style(plotted, set_data=False)
+        # In stacked mode each PlotItem triggers its own repaint when its curve
+        # style changes.  Suppress individual paint events so all N rows coalesce
+        # into one repaint pass when setUpdatesEnabled(True) is restored.
+        if self._stacked_mode:
+            self.glw.setUpdatesEnabled(False)
+        try:
+            for plotted in self._items.values():
+                self._apply_curve_style(plotted, set_data=False)
+        finally:
+            if self._stacked_mode:
+                self.glw.setUpdatesEnabled(True)
 
     def set_multi_axis(self, enabled: bool) -> None:
         self._multi_axis = bool(enabled)
@@ -795,7 +804,15 @@ class PlotPanel(QWidget):
                 kwargs['symbol'] = None
             plotted.curve.setData(ts, vs, **kwargs)
         else:
-            # Style-only path: no data arrays touched.
+            # Style-only path: use individual setters — each calls updateItems()
+            # internally, but actual Qt repaints are batched by the caller via
+            # setUpdatesEnabled(False/True) in set_show_points (stacked mode) and
+            # _refresh_highlight, so we still get only one render pass.
+            #
+            # NOTE: opts.update()+updateItems(styleUpdate=True) looks faster but
+            # styleUpdate=True calls scatter.updateSpots() which only refreshes
+            # EXISTING spot styles — it never pushes data into an empty scatter.
+            # Going from symbol=None → 'o' produces zero dots with that path.
             plotted.curve.setPen(pen)
             if self._show_points:
                 plotted.curve.setSymbol('o')
@@ -881,30 +898,53 @@ class PlotPanel(QWidget):
 
     def _on_stacked_c1_moved(self) -> None:
         """Sync all stacked C1 lines when any one is dragged."""
+        # ── Re-entry guard ──────────────────────────────────────────────────
+        # setPos() on each non-sender line re-fires sigPositionChanged, which
+        # would call this handler again for every line — O(n²) updates per
+        # drag event.  The flag is set BEFORE the loop and checked HERE so the
+        # recursive call returns immediately.
+        if getattr(self, '_syncing_c1', False):
+            return
         if not self._stacked_c1_lines:
             return
-        # Find which line triggered (the one that moved)
-        # Use the first line as the master position source since they're all
-        # connected to this handler and we just want consistency
         x = self.sender().value() if self.sender() else self._stacked_c1_lines[0].value()
-        self.v_line.setPos(x)   # keep normal-mode cursor in sync too
+        # Sync v_line silently — blockSignals prevents _on_cursor1_moved from
+        # firing and doing a redundant _update_table_values pass.
+        self.v_line.blockSignals(True)
+        self.v_line.setPos(x)
+        self.v_line.blockSignals(False)
+        # Batch all per-row line moves into one scene repaint.
         self._syncing_c1 = True
-        for line in self._stacked_c1_lines:
-            if line is not self.sender():
-                line.setPos(x)
-        self._syncing_c1 = False
+        self.glw.setUpdatesEnabled(False)
+        try:
+            for line in self._stacked_c1_lines:
+                if line is not self.sender():
+                    line.setPos(x)
+        finally:
+            self._syncing_c1 = False
+            self.glw.setUpdatesEnabled(True)
         self._update_table_values(x, col=2)
         self._update_cursor_labels()
 
     def _on_stacked_c2_moved(self) -> None:
         """Sync all stacked C2 lines when any one is dragged."""
+        if getattr(self, '_syncing_c2', False):
+            return
         if not self._stacked_c2_lines:
             return
         x = self.sender().value() if self.sender() else self._stacked_c2_lines[0].value()
-        self.v_line2.setPos(x)  # keep normal-mode cursor in sync too
-        for line in self._stacked_c2_lines:
-            if line is not self.sender():
-                line.setPos(x)
+        self.v_line2.blockSignals(True)
+        self.v_line2.setPos(x)
+        self.v_line2.blockSignals(False)
+        self._syncing_c2 = True
+        self.glw.setUpdatesEnabled(False)
+        try:
+            for line in self._stacked_c2_lines:
+                if line is not self.sender():
+                    line.setPos(x)
+        finally:
+            self._syncing_c2 = False
+            self.glw.setUpdatesEnabled(True)
         self._update_table_values(x, col=3)
         self._update_cursor_labels()
 

@@ -7,6 +7,37 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.43] — 2026-05-12
+
+### Changed — Diagnostics rule syntax redesigned (expression engine)
+
+**Rule format is now a plain condition expression string**
+
+The previous YAML rule system (three separate rule types: `fault_signal`,
+`range_check`, `message_loss`, with `signal_map` and dict-based operator
+syntax) has been replaced by a single unified expression engine.
+
+- `condition:` is now the only required field per rule.  Everything else
+  (`id`, `title`, `severity`, `description`, `suggested_action`,
+  `plot_signals`, `enabled`) is optional.
+- Supported operators: `>` `<` `>=` `<=` `=` `!=`
+- Boolean connectors: `and` / `or` (left-to-right, no parentheses required
+  for simple rules).
+- Signal names inside the condition are matched **case-insensitively** against
+  the full `CH<n>::<MsgName>::<SigName>` store key.  A partial name is enough.
+  Rules for absent signals are silently skipped.
+- `signal_map` block is no longer needed or used (accepted but ignored for
+  backward compatibility).
+- `type:` field removed — all rules are expression rules.
+- `context_window_s:` domain-level key controls how many seconds of data
+  before/after each fault are captured for AI diagnosis context (default 2.0 s).
+
+**`config/diagnostics/README.md` fully rewritten** to document the current
+expression syntax, all optional fields, severity aliases, and `plot_signals`
+behaviour.
+
+---
+
 ## [v00.00.42] — 2026-05-11
 
 ### Added — Multi-axis Y-axis spacing and per-axis visibility toggle
