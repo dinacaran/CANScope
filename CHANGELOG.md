@@ -7,6 +7,169 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.44] — 2026-06-24
+
+### Fixed — Multi-Axis mode: Y-axis drag, label, and visibility bugs
+
+**Y-axis drag only panned the first signal (all axes)**
+
+In multi-axis mode the main left `AxisItem` is widened via `setWidth()` to
+reserve margin space for the floating extra axes.  This caused it to cover
+the entire left margin and intercept all mouse drag events, so dragging on
+any Y axis always panned the first signal's ViewBox.
+
+- `_LeftAxis` (the main left axis class) now overrides `mouseDragEvent`.
+  At drag start it checks the button-down scene position against each visible
+  floating axis's `sceneBoundingRect()`; if a match is found it routes all
+  subsequent events of that gesture to the matched ViewBox via
+  `vb.mouseDragEvent(event, axis=1)`.  Dragging on the main axis falls
+  through to the default behaviour.
+- `_LeftAxis._panel` back-reference set in `PlotPanel.__init__` gives the
+  override access to `self._extra_axes` at runtime.
+
+**Main axis label changed to selected signal instead of its own signal**
+
+Clicking any row in the signal table called `_set_axis_label` which always
+labelled the main left axis from `_current_key` (the selected row).  In
+multi-axis mode this overwrote the first signal's label with whatever row
+was clicked.
+
+- `_set_axis_label` now branches on `_multi_axis`.  In the multi-axis
+  branch the main axis is labelled from the first visible signal with
+  `view_box is None` (the signal that actually uses it), regardless of
+  which row is selected.  Extra floating axes still take their labels from
+  their own signal.  The non-multi-axis (overlay) path is unchanged.
+
+**Unchecking the first signal's "Axis" checkbox collapsed the entire left margin**
+
+`_toggle_axis_visibility` called `plotted.axis.setVisible(False)` for every
+signal.  For the first signal this hid the main `PlotItem` layout member,
+collapsing the left margin to zero and destroying the space needed by all
+floating extra axes.
+
+- `_toggle_axis_visibility` now branches on `plotted.view_box is None`
+  (main axis vs floating axis).  When hiding the main axis it blanks visual
+  content (`setLabel('')`, `setTextPen(pg.mkPen(None))`,
+  `setStyle(showValues=False)`) without calling `setVisible(False)`, keeping
+  the layout intact.  Restoring re-applies the signal's label, color, and
+  tick visibility.
+- `_set_axis_label` also respects `axis_visible=False` for the main axis so
+  a selection-change event cannot accidentally re-show a deliberately hidden
+  main axis.
+
+---
+
+### Performance — MF4/MDF file loading (2–5× speedup)
+
+**Batch channel reads via `mdf.select()` (biggest win)**
+
+`MDFReader._iter_arrays` previously called `mdf.get()` once per channel.
+asammdf stores channels in "channel groups" that share a single compressed
+data block; each `mdf.get()` decompressed the entire block and discarded
+all channels except one — O(channels_per_group) wasted decompressions.
+
+- Per-group channel specs are now collected from metadata (no I/O), then
+  `mdf.select(all_channels, raw=False)` reads the entire group in **one**
+  file pass.  A second `mdf.select(enum_channels, raw=True)` pass fetches
+  raw integers for enum channels only (skipped for all-numeric groups).
+- Falls back to individual `mdf.get()` calls per channel if `select()` raises.
+- For groups with many channels the improvement is 5–20×.
+
+**Numeric `disp_list` allocation eliminated**
+
+Pure numeric channels previously called `num_arr.tolist()` — an O(n) Python
+list allocation for every channel.  `SignalStore.add_series_bulk` already
+supports `has_labels=False` which skips the `raw_values` storage entirely.
+
+- Numeric channels now yield `disp_list = []`.
+- `_run_bulk_array` passes `has_labels = len(disp_list) > 0` to
+  `add_series_bulk`, skipping the allocation for ~90% of channels.
+
+**Tree rebuild gated on interval + dirty flag**
+
+`_run_bulk_array` previously called `store.build_tree_payload()` (full sort
+of all signals) for every channel.  With 200+ channels that is 200+ sorts.
+
+- `tree_update` is now emitted only every `_BULK_PLOT_INTERVAL` (10)
+  channels **and** only when `store.is_tree_dirty()`, matching the pattern
+  used by the CAN decode path.
+
+**`is_bus_logging()` result cached**
+
+`MDFReader.is_bus_logging()` opens the file header to detect
+`CAN_DataFrame.*` channels.  The function is called by `prescan_measurement`,
+`dbc_required_for`, and `reader_factory` for the same file — three header
+opens before a single byte of signal data is read.
+
+- `MDFReader._bus_logging_cache` (class-level dict) stores the result keyed
+  by resolved absolute path.  Subsequent calls for the same path return
+  immediately from the cache.
+
+**Enum double-fetch batched**
+
+Enum channels previously made a second `mdf.get(raw=True)` call per channel.
+With `select()`-based loading these are now batched: all enum channels in a
+group are fetched together in one `mdf.select(enum_channels, raw=True)` call.
+
+---
+
+### Performance — BLF file loading (2–4× speedup on Pass 1)
+
+**Zero-object frame ingestion via `iter_raw_tuples()`**
+
+Pass 1 previously constructed a `RawFrame` dataclass per frame
+(8-field object allocation + `bytes(msg.data)` copy + `getattr` calls + type
+casts) — repeated 1–2 million times for large BLF files.
+
+- `BLFReaderService.iter_raw_tuples()` yields plain tuples
+  `(timestamp, channel_byte, arb_id, dlc, direction_int, is_extended, is_fd, data)`
+  directly from python-can `Message` objects with no intermediate objects:
+  `channel_byte` pre-computed as `(int(ch)+1) & 0xFF` or `255`; `direction_int`
+  as `0/1/2` from `is_rx`; `data` passed as the raw bytearray from python-can.
+- `BLFCANReader.iter_raw_tuples()` exposes this to `LoadWorker`.
+- `LoadWorker._run_can_raw_vectorized` detects `iter_raw_tuples` via
+  `hasattr` and uses it; falls back to the legacy `iter_frames_only` path for
+  other reader types.
+
+**Zero-allocation disk write in `RawFrameStore.append_raw()`**
+
+`RawFrameStore.append()` created three temporary `bytes` objects per frame
+(conversion → slice → zero-pad concat) × 1–2 M frames.
+
+- New `append_raw()` method uses a single pre-allocated `bytearray(64)` write
+  buffer (`self._write_buf`).  Each frame: `buf[:] = _ZEROS_64` (C-level
+  64-byte memcopy of a module constant), then `buf[:n] = data[:n]` (C-level
+  payload copy) — zero Python object allocations per frame.
+- `append_raw()` also skips the name-table dict lookup (always `nid=0` in the
+  2-pass path) and the string direction comparison (accepts `direction_int`
+  directly), saving additional per-frame Python work.
+
+**`note_frame()` removed from Pass 1 hot loop**
+
+`store.note_frame()` ran 6 operations per frame (counter increment,
+`set.add`, dict increment, conditional, f-string, list append) for every
+frame in Pass 1.
+
+- The hot loop now only calls `rfs.append_raw()` and the progress emit.
+- After `rfs.seal()`, `_bulk_compute_store_stats(store, rfs)` replicates
+  the equivalent bookkeeping in a single numpy pass:
+  `np.unique` on the channel array for channel set + frame counts; a 20-
+  iteration Python loop for `first_frame_ids`.  Pass 2 still overwrites
+  `decoded_frames` and `unmatched_frames` as before.
+
+**Choices label lookup vectorised (Pass 2)**
+
+DBC enum signals previously built `disp_list` with a Python `for v in
+numeric_arr` loop — up to 500 K iterations for common status signals.
+
+- For the common DBC case (non-negative integer keys, max key < 65 536) a
+  numpy LUT is built once from the choices dict (`lut[k] = str(v)`,
+  `lut_valid[k] = True`), then the per-sample work is done entirely via numpy
+  fancy indexing: `lut[safe_idx[has_val]]`.  No Python loop over samples.
+  A Python loop fallback is kept for non-integer keys or very large key values.
+
+---
+
 ## [v00.00.43] — 2026-05-12
 
 ### Changed — Diagnostics rule syntax redesigned (expression engine)

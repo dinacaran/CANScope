@@ -28,6 +28,46 @@ from core.signal_store import SignalSeries
 from gui.signal_tree import SignalTreeWidget
 
 
+class _LeftAxis(pg.AxisItem):
+    """Left AxisItem that keeps its title adjacent to tick labels even when setWidth()
+    expands the item far beyond its natural content width.
+
+    Also routes Y-axis drag events to the correct floating ViewBox when in
+    multi-axis mode.  The expanded setWidth() causes this item to cover the
+    entire left margin, so without the override every drag would pan only the
+    main ViewBox regardless of which floating axis the user clicked on.
+    """
+
+    def __init__(self) -> None:
+        super().__init__('left')
+        self._title_x: float | None = None  # if set, overrides pyqtgraph's default x=-5
+        self._panel: Any = None             # set by PlotPanel after construction
+        self._drag_vb: Any = None           # floating ViewBox claimed at drag start
+
+    def mouseDragEvent(self, event) -> None:
+        panel = self._panel
+        if panel is not None and panel._extra_axes:
+            if event.isStart():
+                self._drag_vb = None
+                scene_pos = event.buttonDownScenePos()
+                for axis, vb in panel._extra_axes:
+                    if axis.isVisible() and axis.sceneBoundingRect().contains(scene_pos):
+                        self._drag_vb = vb
+                        break
+            if self._drag_vb is not None:
+                self._drag_vb.mouseDragEvent(event, axis=1)
+                if event.isFinish():
+                    self._drag_vb = None
+                return
+        super().mouseDragEvent(event)
+
+    def resizeEvent(self, ev=None) -> None:
+        super().resizeEvent(ev)
+        title_x = getattr(self, '_title_x', None)
+        if title_x is not None and self.label is not None and self.label.isVisible():
+            self.label.setX(title_x)
+
+
 @dataclass(slots=True)
 class PlottedSignal:
     key: str
@@ -166,7 +206,9 @@ class PlotPanel(QWidget):
         self.setAcceptDrops(True)
 
         # ── Normal / multi-axis plot ──────────────────────────────────────
-        self.plot = pg.PlotWidget()
+        _left_axis = _LeftAxis()
+        self.plot = pg.PlotWidget(axisItems={'left': _left_axis})
+        _left_axis._panel = self  # enables multi-axis drag routing in mouseDragEvent
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self._legend = self.plot.addLegend()
         self.plot.setLabel('bottom', 'Time (seconds)')
@@ -643,12 +685,23 @@ class PlotPanel(QWidget):
         if self._extra_axes:
             # Reserve left-margin space for VISIBLE extra axes only.
             n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
-            total_left_w = self._MAIN_AXIS_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
-            self.plot.getAxis('left').setWidth(total_left_w)
+            total_left_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            main_axis = self.plot.getAxis('left')
+            main_axis.setWidth(total_left_w)
+            # Anchor the main axis title adjacent to its tick labels rather than at
+            # the far-left of the expanded axis item (pyqtgraph default is x = -5).
+            # _title_x is read by _LeftAxis.resizeEvent on every resize.
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = total_left_w - self._MAIN_AXIS_W - 5
             # Connect once; disconnect happens in _clear_rendered_items
             self.plot.plotItem.vb.sigResized.connect(self._update_multi_axis_views)
             # Defer initial geometry until widget is painted and layout has settled
             QTimer.singleShot(10, self._update_multi_axis_views)
+        else:
+            # Reset title anchor when no extra axes are present
+            main_axis = self.plot.getAxis('left')
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = None
 
     def _rebuild_stacked(self) -> None:
         """
@@ -833,9 +886,10 @@ class PlotPanel(QWidget):
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
     # Width constants for multi-axis layout
-    _MAIN_AXIS_W: int = 55   # width of the main (first) left axis
-    _EXTRA_AXIS_W: int = 55  # width of each additional floating axis
-    _EXTRA_AXIS_GAP: int = 4 # gap between adjacent axis panels
+    _MAIN_AXIS_W: int = 55        # width of the main (first) left axis ticks+labels
+    _MAIN_AXIS_TITLE_W: int = 20  # extra reserve for the rotated axis title (renders at far-left of setWidth area)
+    _EXTRA_AXIS_W: int = 55       # width of each additional floating axis
+    _EXTRA_AXIS_GAP: int = 4      # gap between adjacent axis panels
 
     def _update_multi_axis_views(self) -> None:
         """
@@ -853,12 +907,13 @@ class PlotPanel(QWidget):
         aw  = self._EXTRA_AXIS_W
         gap = self._EXTRA_AXIS_GAP
         mw  = self._MAIN_AXIS_W
-        # Assign consecutive slots only to visible extra axes.
-        # Hidden axes are placed off-screen (no layout space consumed).
-        slot = 0
+        # Update ViewBox geometry for all axes (visible and hidden).
         for axis, vb in self._extra_axes:
             vb.setGeometry(rect)
             vb.linkedViewChanged(self.plot.plotItem.vb, vb.XAxis)
+
+        slot = 0
+        for axis, vb in reversed(self._extra_axes):
             if axis.isVisible():
                 x = rect.left() - mw - gap - aw - slot * (aw + gap)
                 axis.setGeometry(QRectF(x, rect.top(), aw, rect.height()))
@@ -1215,11 +1270,24 @@ class PlotPanel(QWidget):
         if not key or key not in self._items:
             self.plot.setLabel('left', 'Value')
             return
-        series = self._items[key].series
-        label  = series.signal_name + (f' ({series.unit})' if series.unit else '')
-        self.plot.setLabel('left', label, color=self._items[key].color)
-        self.plot.getAxis('left').setTextPen(pg.mkPen(self._items[key].color))
         if self._multi_axis:
+            # Main left axis always tracks the first visible signal assigned to it
+            # (view_box is None), regardless of which row is currently selected.
+            main_plotted = next(
+                (p for p in self._items.values() if p.visible and p.view_box is None),
+                None,
+            )
+            if main_plotted is not None:
+                if main_plotted.axis_visible:
+                    ms = main_plotted.series
+                    ml = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
+                    self.plot.setLabel('left', ml, color=main_plotted.color)
+                    self.plot.getAxis('left').setTextPen(pg.mkPen(main_plotted.color))
+                    self.plot.getAxis('left').setStyle(showValues=True)
+                else:
+                    self.plot.setLabel('left', '')
+                    self.plot.getAxis('left').setTextPen(pg.mkPen(None))
+                    self.plot.getAxis('left').setStyle(showValues=False)
             for axis_key in list(self._items.keys())[1:]:
                 plotted = self._items[axis_key]
                 if plotted.axis is not None and plotted.axis is not self.plot.getAxis('left'):
@@ -1229,6 +1297,11 @@ class PlotPanel(QWidget):
                     plotted.axis.setLabel(lbl, color=plotted.color)
                     plotted.axis.setTextPen(pg.mkPen(plotted.color))
                     plotted.axis.setWidth(55)
+        else:
+            series = self._items[key].series
+            label  = series.signal_name + (f' ({series.unit})' if series.unit else '')
+            self.plot.setLabel('left', label, color=self._items[key].color)
+            self.plot.getAxis('left').setTextPen(pg.mkPen(self._items[key].color))
 
     # ── Table ─────────────────────────────────────────────────────────────
 
@@ -1740,14 +1813,32 @@ class PlotPanel(QWidget):
             return
         plotted.axis_visible = visible
         if plotted.axis is not None:
-            plotted.axis.setVisible(visible)
+            if plotted.view_box is None:
+                # Main left axis: setVisible(False) collapses the entire left
+                # margin, destroying the layout space that floating extra axes
+                # depend on.  Fake "hidden" by blanking the visual content instead.
+                if visible:
+                    ms = plotted.series
+                    lbl = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
+                    plotted.axis.setLabel(lbl, color=plotted.color)
+                    plotted.axis.setTextPen(pg.mkPen(plotted.color))
+                    plotted.axis.setStyle(showValues=True)
+                else:
+                    plotted.axis.setLabel('')
+                    plotted.axis.setTextPen(pg.mkPen(None))
+                    plotted.axis.setStyle(showValues=False)
+            else:
+                plotted.axis.setVisible(visible)
         if self._multi_axis and self._extra_axes:
             # Resize the left margin to match the number of now-visible extra axes.
             # sigResized will fire once the layout settles and reposition everything;
             # the timer is a safety net for edge cases where sigResized doesn't fire.
             n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
-            new_w = self._MAIN_AXIS_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
-            self.plot.getAxis('left').setWidth(new_w)
+            new_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            main_axis = self.plot.getAxis('left')
+            main_axis.setWidth(new_w)
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = new_w - self._MAIN_AXIS_W - 5
             QTimer.singleShot(15, self._update_multi_axis_views)
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:

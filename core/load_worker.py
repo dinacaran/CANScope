@@ -19,6 +19,54 @@ _BULK_PLOT_INTERVAL    = 10
 _BULK_PROGRESS_INTERVAL = 50
 
 
+def _bulk_compute_store_stats(store, rfs) -> None:
+    """
+    Populate store frame-statistics from the sealed RawFrameStore arrays.
+
+    Replaces the per-frame ``note_frame()`` calls removed from the Pass 1 hot
+    loop (Bottleneck 3).  All work is vectorised numpy; no Python loop over
+    individual frames.
+    """
+    import numpy as np
+    n = len(rfs)
+    if n == 0:
+        return
+
+    channels_np = np.frombuffer(rfs.channels,   dtype=np.uint8)
+    arb_ids_np  = np.frombuffer(rfs.arb_ids,    dtype=np.uint32)
+    dlcs_np     = np.frombuffer(rfs.dlcs,        dtype=np.uint8)
+    dirs_np     = np.frombuffer(rfs.directions,  dtype=np.uint8)
+    flags_np    = np.frombuffer(rfs.flags,        dtype=np.uint8)
+
+    # Channel set + per-channel frame counts (single numpy unique pass)
+    unique_chs, counts = np.unique(channels_np, return_counts=True)
+    for ch_byte, cnt in zip(unique_chs.tolist(), counts.tolist()):
+        ch = None if ch_byte == 255 else ch_byte
+        store.channels.add(ch)
+        store.channel_frame_counts[ch] = cnt
+
+    store.total_frames    = n
+    store.unmatched_frames = n  # corrected to n - decoded_total by Pass 2
+
+    # First-20-frame diagnostic strings (same format as note_frame)
+    _dir_strs = ('Rx', 'Tx', 'Unknown')
+    for i in range(min(20, n)):
+        ch_byte   = int(channels_np[i])
+        ch        = None if ch_byte == 255 else ch_byte
+        aid       = int(arb_ids_np[i])
+        dlc       = int(dlcs_np[i])
+        fl        = int(flags_np[i])
+        direction = _dir_strs[min(int(dirs_np[i]), 2)]
+        id_hex    = (
+            f"0x{aid:08X}" if (bool(fl & 1) or aid > 0x7FF)
+            else f"0x{aid:03X}"
+        )
+        label = f"CH{ch}" if ch is not None else "CH?"
+        store.first_frame_ids.append(
+            f"{label} | {id_hex} | DLC={dlc} | {direction}"
+        )
+
+
 class LoadWorker(QObject):
     """
     Background worker that reads any measurement file and populates a SignalStore.
@@ -156,33 +204,56 @@ class LoadWorker(QObject):
         # ── Pass 1: drain frames into raw_frame_store ────────────────────
         self.progress.emit("Reading frames (pass 1/2)...")
         base_ts: float | None = None
-        index = 0
-        rfs_append = rfs.append           # bind once for hot loop
-        note_frame = store.note_frame
+        index   = 0
+        _fast   = hasattr(reader, 'iter_raw_tuples')
 
-        for frame in reader.iter_frames_only():
-            index += 1
-            if base_ts is None:
-                base_ts = frame.timestamp
-                store.base_ts = base_ts
-            frame.timestamp -= base_ts
-            note_frame(frame)
-            rfs_append(
-                timestamp   = frame.timestamp,
-                channel     = frame.channel,
-                arb_id      = frame.arbitration_id,
-                dlc         = frame.dlc,
-                direction   = frame.direction,
-                is_extended = frame.is_extended_id,
-                is_fd       = frame.is_fd,
-                data        = frame.data,
-                frame_name  = '',
-                decoded     = False,
-            )
-            if index == 1 or index % _CAN_PROGRESS_INTERVAL == 0:
-                self.progress.emit(f"Reading frames: {index:,}...")
+        if _fast:
+            # Zero-object fast path (Bottlenecks 1, 3, 4):
+            #   • yields tuples instead of RawFrame dataclasses
+            #   • append_raw() skips name-table lookup and string direction
+            #   • note_frame() removed; stats computed in bulk after seal()
+            rfs_append_raw = rfs.append_raw
+            for ts, ch_byte, arb_id, dlc, dir_int, is_ext, is_fd, data in \
+                    reader.iter_raw_tuples():
+                index += 1
+                if base_ts is None:
+                    base_ts = ts
+                    store.base_ts = base_ts
+                rfs_append_raw(ts - base_ts, ch_byte, arb_id, dlc,
+                               dir_int, is_ext, is_fd, data)
+                if index == 1 or index % _CAN_PROGRESS_INTERVAL == 0:
+                    self.progress.emit(f"Reading frames: {index:,}...")
+        else:
+            # Legacy path: RawFrame objects with per-frame note_frame()
+            rfs_append = rfs.append
+            note_frame = store.note_frame
+            for frame in reader.iter_frames_only():
+                index += 1
+                if base_ts is None:
+                    base_ts = frame.timestamp
+                    store.base_ts = base_ts
+                frame.timestamp -= base_ts
+                note_frame(frame)
+                rfs_append(
+                    timestamp   = frame.timestamp,
+                    channel     = frame.channel,
+                    arb_id      = frame.arbitration_id,
+                    dlc         = frame.dlc,
+                    direction   = frame.direction,
+                    is_extended = frame.is_extended_id,
+                    is_fd       = frame.is_fd,
+                    data        = frame.data,
+                    frame_name  = '',
+                    decoded     = False,
+                )
+                if index == 1 or index % _CAN_PROGRESS_INTERVAL == 0:
+                    self.progress.emit(f"Reading frames: {index:,}...")
 
         rfs.seal()
+
+        if _fast:
+            # Bulk-compute what per-frame note_frame() would have done.
+            _bulk_compute_store_stats(store, rfs)
         n = len(rfs)
         if n == 0:
             store.normalize_timestamps(already_normalized=True)
@@ -271,15 +342,52 @@ class LoadWorker(QObject):
             for sig_name, (ext, numeric_arr) in sig_results.items():
                 choices = ext.choices
                 if choices:
-                    disp_list: list[object] = []
-                    for v in numeric_arr:
-                        if np.isnan(v):
-                            disp_list.append('')
-                        else:
-                            label = choices.get(int(v))
-                            disp_list.append(
-                                str(label) if label is not None else float(v)
-                            )
+                    # Vectorised choices lookup (Bottleneck 5).
+                    # Build a numpy object LUT keyed by integer choice value,
+                    # then use fancy indexing instead of a Python per-sample loop.
+                    # Falls back to a Python loop only when keys are non-integer
+                    # or exceed 65 535 (never seen in practice for DBC enums).
+                    nan_mask = np.isnan(numeric_arr)
+                    int_arr  = numeric_arr.astype(np.int64)
+                    try:
+                        int_keys = {
+                            k: str(v) for k, v in choices.items()
+                            if isinstance(k, int) and k >= 0
+                        }
+                        max_key = max(int_keys) if int_keys else -1
+                    except (TypeError, ValueError):
+                        int_keys = {}
+                        max_key  = -1
+
+                    if int_keys and max_key < 65536:
+                        # Build LUT and a parallel bool mask for valid entries.
+                        lut       = np.empty(max_key + 1, dtype=object)
+                        lut_valid = np.zeros(max_key + 1, dtype=bool)
+                        for k, v in int_keys.items():
+                            lut[k]       = v
+                            lut_valid[k] = True
+
+                        safe_idx  = np.clip(int_arr, 0, max_key)
+                        in_range  = ~nan_mask & (int_arr >= 0) & (int_arr <= max_key)
+                        has_val   = in_range & lut_valid[safe_idx]
+
+                        result = np.empty(len(numeric_arr), dtype=object)
+                        result[nan_mask]           = ''
+                        result[~nan_mask & ~in_range] = numeric_arr[~nan_mask & ~in_range]
+                        result[in_range & ~lut_valid[safe_idx]] = \
+                            numeric_arr[in_range & ~lut_valid[safe_idx]]
+                        if has_val.any():
+                            result[has_val] = lut[safe_idx[has_val]]
+                        disp_list = result.tolist()
+                    else:
+                        # Fallback: Python loop (non-integer / very large keys)
+                        disp_list = [
+                            '' if np.isnan(v)
+                            else (str(choices[int(v)])
+                                  if int(v) in choices
+                                  else float(v))
+                            for v in numeric_arr
+                        ]
                     has_labels = True
                     raw_values = disp_list
                 else:
@@ -545,14 +653,19 @@ class LoadWorker(QObject):
             if base_ts is None:
                 base_ts = float(ts_arr[0])
                 store.base_ts = base_ts
-            ts_norm = ts_arr - base_ts
+            ts_norm    = ts_arr - base_ts
+            has_labels = len(disp_list) > 0
             store.add_series_bulk(
                 channel=None, message_name=grp_name, message_id=0,
                 signal_name=ch_name, unit=unit,
                 timestamps=ts_norm, values=num_arr, raw_values=disp_list,
+                has_labels=has_labels,
             )
-            self.tree_update.emit(store.build_tree_payload())
+            # Gate tree rebuild on an interval + dirty flag — avoids a full
+            # sort of all signals for every channel (Bottleneck 3).
             if ch_count % _BULK_PLOT_INTERVAL == 0:
+                if store.is_tree_dirty():
+                    self.tree_update.emit(store.build_tree_payload())
                 self.partial_ready.emit()
             if ch_count == 1 or ch_count % _BULK_PROGRESS_INTERVAL == 0:
                 self.progress.emit(
