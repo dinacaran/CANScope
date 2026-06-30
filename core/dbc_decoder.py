@@ -9,6 +9,7 @@ import cantools
 from cantools.database.errors import DecodeError
 
 from core.models import RawFrame, DecodedSignalSample
+from core.readers.db_format import db_format_label
 
 
 class DBCLoadError(RuntimeError):
@@ -40,6 +41,7 @@ class DBCDecoder:
             "candidate_pgn": 0,
             "decode_success": 0,
             "decode_fail": 0,
+            "decoded_no_signals": 0,
         }
         self._build_indexes()
 
@@ -48,28 +50,28 @@ class DBCDecoder:
     @staticmethod
     def _load_database(path: Path):
         if not path.exists():
-            raise DBCLoadError(f"DBC file not found: {path}")
+            raise DBCLoadError(f"Database file not found: {path}")
         load_messages: list[str] = []
         try:
             db = cantools.database.load_file(str(path), strict=True)
-            load_messages.append("DBC loaded in strict mode.")
+            load_messages.append("Database loaded in strict mode.")
             return db, load_messages
         except Exception as strict_exc:
             load_messages.append(
-                "WARNING: Strict DBC validation failed. Retrying with compatibility mode."
+                "WARNING: Strict database validation failed. Retrying with compatibility mode."
             )
             load_messages.append(f"Strict mode details: {strict_exc}")
             try:
                 db = cantools.database.load_file(str(path), strict=False)
-                load_messages.append("DBC loaded in compatibility mode.")
+                load_messages.append("Database loaded in compatibility mode.")
                 return db, load_messages
             except Exception as exc:
-                raise DBCLoadError(f"Failed to load DBC file '{path}': {exc}") from exc
+                raise DBCLoadError(f"Failed to load database file '{path}': {exc}") from exc
 
     # ── Index building ────────────────────────────────────────────────────
 
     def _build_indexes(self) -> None:
-        self.load_messages.append(f"DBC messages available: {len(self.database.messages):,}")
+        self.load_messages.append(f"Messages available: {len(self.database.messages):,}")
         for message in self.database.messages:
             frame_id = int(getattr(message, "frame_id", -1))
             frame_id_text = (
@@ -185,7 +187,12 @@ class DBCDecoder:
                 continue
 
             if not isinstance(decoded, dict) or not decoded:
-                self.stats["decode_fail"] += 1
+                if not message.signals:
+                    # Message exists in DB but carries no signal definitions
+                    # (e.g. raw UDS diagnostic frames). Not a decoder error.
+                    self.stats["decoded_no_signals"] += 1
+                else:
+                    self.stats["decode_fail"] += 1
                 continue
 
             msg_name = message.name
@@ -232,8 +239,9 @@ class DBCDecoder:
         return []
 
     def diagnostics_text(self) -> str:
+        fmt = db_format_label(str(self.dbc_path))
         lines = [
-            f"DBC file: {self.dbc_path}",
+            f"{fmt} file: {self.dbc_path}",
             f"DBC messages: {len(self.database.messages):,}",
             "",
             "First DBC message IDs:",
@@ -247,6 +255,7 @@ class DBCDecoder:
             f"  PGN candidates:     {self.stats['candidate_pgn']:,}",
             f"  Decode success:     {self.stats['decode_success']:,}",
             f"  Decode fail:        {self.stats['decode_fail']:,}",
+            f"  Matched, no signals:{self.stats['decoded_no_signals']:,}",
             f"  ID cache entries:   {len(self._candidate_cache):,}",
         ])
         return "\n".join(lines)

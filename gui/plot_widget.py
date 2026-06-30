@@ -203,6 +203,7 @@ class PlotPanel(QWidget):
         self._cursor2_enabled: bool = False
         self._group_vis_changed: bool = False  # True when itemChanged fired before cellClicked
         self._batch_mode: bool = False          # True while batch-adding signals; suppresses per-add rebuilds
+        self._rebuild_seq: int = 0              # bumped each rebuild and by fit_to_window(); lets deferred restores detect staleness
         self.setAcceptDrops(True)
 
         # ── Normal / multi-axis plot ──────────────────────────────────────
@@ -471,18 +472,23 @@ class PlotPanel(QWidget):
         if not self._batch_mode:
             self._push_undo()
         color = color or next(self._color_cycle)
+        was_empty = not self._items
         self._items[key] = PlottedSignal(key=key, series=series, curve=None, color=color)
         if self._current_key is None:
             self._current_key = key
         if not self._batch_mode:
             self._rebuild_curves(preserve_selection=True)
             self._update_empty_state_ui()
-            self.fit_to_window()
+            # Only auto-fit when adding the very first signal; otherwise
+            # _rebuild_curves has already restored the saved view range.
+            if was_empty:
+                self.fit_to_window()
 
     def begin_batch_add(self) -> None:
         """Start a batch-add session. Suppresses per-signal rebuilds; call end_batch_add() when done."""
         self._push_undo()
         self._batch_mode = True
+        self._batch_started_empty = not bool(self._items)
 
     def end_batch_add(self) -> None:
         """Finish a batch-add session. Triggers a single rebuild + fit for all queued signals."""
@@ -490,7 +496,10 @@ class PlotPanel(QWidget):
         if self._items:
             self._rebuild_curves(preserve_selection=True)
             self._update_empty_state_ui()
-            self.fit_to_window()
+            # Auto-fit only when the plot was empty before the batch (e.g. loading
+            # a config into an empty plot); otherwise preserve the existing view.
+            if self._batch_started_empty:
+                self.fit_to_window()
 
     # ── Internal: clear all rendered items ────────────────────────────────
 
@@ -585,18 +594,47 @@ class PlotPanel(QWidget):
     def _rebuild_curves(self, preserve_selection: bool = False) -> None:
         selected = self.selected_keys() if preserve_selection else []
 
-        # Save X view range and cursor positions before destroying rendered items
+        # Save X and Y view ranges before destroying rendered items so that
+        # add/remove operations don't snap the viewport back to full extent.
         _saved_xr: list | None = None
+        _saved_yr: list | None = None          # standard overlay: one shared Y range
+        _saved_yr_by_key: dict[str, list] = {}  # stacked / multi-axis: per-signal key
+
         if self._stacked_mode and self._stacked_plots:
             try:
                 _saved_xr = list(self._stacked_plots[0].vb.viewRange()[0])
             except Exception:
                 pass
+            order = [k for k, p in self._items.items() if p.visible]
+            for i, key in enumerate(order):
+                if i < len(self._stacked_plots):
+                    try:
+                        _saved_yr_by_key[key] = list(self._stacked_plots[i].vb.viewRange()[1])
+                    except Exception:
+                        pass
         elif not self._stacked_mode:
             try:
                 _saved_xr = list(self.plot.plotItem.vb.viewRange()[0])
             except Exception:
                 pass
+            if self._multi_axis:
+                first_visible = True
+                for key, plotted in self._items.items():
+                    if not plotted.visible:
+                        continue
+                    try:
+                        if first_visible or plotted.view_box is None:
+                            _saved_yr_by_key[key] = list(self.plot.plotItem.vb.viewRange()[1])
+                        else:
+                            _saved_yr_by_key[key] = list(plotted.view_box.viewRange()[1])
+                    except Exception:
+                        pass
+                    first_visible = False
+            else:
+                try:
+                    _saved_yr = list(self.plot.plotItem.vb.viewRange()[1])
+                except Exception:
+                    pass
 
         self._clear_rendered_items()
 
@@ -605,24 +643,125 @@ class PlotPanel(QWidget):
             self._update_empty_state_ui()
             return
 
+        # Each rebuild gets a unique sequence number.  The closures below
+        # capture it so a deferred restore can bail out if fit_to_window()
+        # or a newer rebuild has run in the meantime.
+        self._rebuild_seq += 1
+        _seq = self._rebuild_seq
+
         if self._stacked_mode:
             self.view_stack.setCurrentIndex(1)
             self._rebuild_stacked()
-            # Restore X range so the view doesn't jump when rows are added/removed
-            if _saved_xr and self._stacked_plots:
-                try:
-                    self._stacked_plots[0].setXRange(_saved_xr[0], _saved_xr[1], padding=0)
-                except Exception:
-                    pass
+
+            def _restore_stacked() -> None:
+                # Bail if a newer rebuild or fit_to_window() supersedes us.
+                if self._rebuild_seq != _seq:
+                    return
+                if _saved_xr and self._stacked_plots:
+                    try:
+                        self._stacked_plots[0].setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    except Exception:
+                        pass
+                if _saved_yr_by_key and self._stacked_plots:
+                    order_after = [k for k, p in self._items.items() if p.visible]
+                    for i, key in enumerate(order_after):
+                        if i < len(self._stacked_plots) and key in _saved_yr_by_key:
+                            try:
+                                yr = _saved_yr_by_key[key]
+                                self._stacked_plots[i].setYRange(yr[0], yr[1], padding=0)
+                            except Exception:
+                                pass
+                # Disable auto-range so pyqtgraph's deferred updateAutoRange()
+                # (queued by curve.setData inside _rebuild_stacked) cannot
+                # override the restored ranges. fit_to_window() re-enables it.
+                for p in self._stacked_plots:
+                    try:
+                        p.vb.enableAutoRange(x=False, y=False)
+                        p.vb.setAutoVisible(x=False, y=False)
+                    except Exception:
+                        pass
+
+            # Synchronous pass locks in the range before Qt paints the frame.
+            # Deferred pass (singleShot 0) runs after pyqtgraph's own
+            # singleShot-0 auto-range update that setData() queues.
+            _restore_stacked()
+            QTimer.singleShot(0, _restore_stacked)
         else:
             self.view_stack.setCurrentIndex(0)
             self._rebuild_overlay()
-            # Restore X range for overlay mode
-            if _saved_xr:
+
+            def _restore_overlay() -> None:
+                # Bail if a newer rebuild or fit_to_window() supersedes us.
+                if self._rebuild_seq != _seq:
+                    return
+                if _saved_xr:
+                    try:
+                        self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    except Exception:
+                        pass
+                if self._multi_axis and _saved_yr_by_key:
+                    first_visible = True
+                    for key, plotted in self._items.items():
+                        if not plotted.visible or key not in _saved_yr_by_key:
+                            continue
+                        try:
+                            yr = _saved_yr_by_key[key]
+                            if first_visible or plotted.view_box is None:
+                                self.plot.setYRange(yr[0], yr[1], padding=0)
+                            else:
+                                plotted.view_box.setYRange(yr[0], yr[1], padding=0)
+                        except Exception:
+                            pass
+                        first_visible = False
+                elif _saved_yr:
+                    try:
+                        self.plot.setYRange(_saved_yr[0], _saved_yr[1], padding=0)
+                    except Exception:
+                        pass
+                # Auto-fit Y for newly added signals that have no saved range.
+                # Only applies to floating ViewBoxes (idx > 0 in multi-axis);
+                # the first signal's VB is the main one and is handled above.
+                if self._multi_axis:
+                    for key, plotted in self._items.items():
+                        if not plotted.visible or plotted.view_box is None:
+                            continue
+                        if key in _saved_yr_by_key:
+                            continue
+                        try:
+                            y = np.asarray(plotted.series.values, dtype=np.float64)
+                            finite = y[np.isfinite(y)]
+                            if len(finite):
+                                ymin, ymax = float(finite.min()), float(finite.max())
+                                if ymin == ymax:
+                                    ymin, ymax = ymin - 0.5, ymax + 0.5
+                                pad = (ymax - ymin) * 0.05
+                                plotted.view_box.setYRange(ymin - pad, ymax + pad, padding=0)
+                        except Exception:
+                            pass
+                # Disable auto-range on every affected ViewBox so pyqtgraph's
+                # deferred updateAutoRange() (queued by curve.setData inside
+                # _rebuild_overlay) cannot override the restored ranges.
+                # fit_to_window() re-enables it explicitly when needed.
                 try:
-                    self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    vb = self.plot.plotItem.vb
+                    vb.enableAutoRange(x=False, y=False)
+                    vb.setAutoVisible(x=False, y=False)
                 except Exception:
                     pass
+                if self._multi_axis:
+                    for plotted in self._items.values():
+                        if plotted.view_box is not None:
+                            try:
+                                plotted.view_box.enableAutoRange(x=False, y=False)
+                                plotted.view_box.setAutoVisible(x=False, y=False)
+                            except Exception:
+                                pass
+
+            # Synchronous pass locks in the range before Qt paints the frame.
+            # Deferred pass (singleShot 0) runs after pyqtgraph's own
+            # singleShot-0 auto-range update that setData() queues.
+            _restore_overlay()
+            QTimer.singleShot(0, _restore_overlay)
 
         self._set_axis_label(self._current_key)
         self._refresh_table()
@@ -653,6 +792,11 @@ class PlotPanel(QWidget):
                 # sigResized is connected below so geometry is maintained on resize.
                 axis = pg.AxisItem('left')
                 vb   = pg.ViewBox()
+                # Lock auto-range OFF before X-linking — otherwise the first
+                # setData on this curve triggers auto-range that propagates
+                # through the link and resets the main plot's X.
+                vb.enableAutoRange(x=False, y=False)
+                vb.setAutoVisible(x=False, y=False)
                 self.plot.plotItem.scene().addItem(vb)
                 self.plot.plotItem.scene().addItem(axis)
                 axis.linkToView(vb)
@@ -1073,6 +1217,9 @@ class PlotPanel(QWidget):
     # ── Fit to window ─────────────────────────────────────────────────────
 
     def fit_to_window(self) -> None:
+        # Cancel any deferred range-restore queued by _rebuild_curves so that
+        # an explicit fit is not silently overwritten on the next event-loop tick.
+        self._rebuild_seq += 1
         if not self._items:
             if not self._stacked_mode:
                 self.plot.enableAutoRange()
@@ -1468,7 +1615,6 @@ class PlotPanel(QWidget):
         self._rebuild_curves(preserve_selection=False)
         self._set_axis_label(self._current_key)
         self._update_empty_state_ui()
-        self.fit_to_window()
 
     def remove_selected_series(self) -> None:
         self._push_undo()
@@ -1478,7 +1624,6 @@ class PlotPanel(QWidget):
         self._rebuild_curves(preserve_selection=False)
         self._set_axis_label(self._current_key)
         self._update_empty_state_ui()
-        self.fit_to_window()
 
     def clear_all(self) -> None:
         self._push_undo()
@@ -1786,21 +1931,27 @@ class PlotPanel(QWidget):
         For stacked mode: full rebuild is required (rows must be added/removed).
         The cursor lines are NOT touched — they persist regardless of signal visibility.
         """
-        if self._stacked_mode:
-            # Stacked needs full rebuild to add/remove rows
+        # Newly-enabled signals have no curve yet — _rebuild_overlay skipped them
+        # last pass. The lightweight setVisible toggle can't materialise a curve,
+        # so fall through to a full rebuild.
+        needs_rebuild = self._stacked_mode or any(
+            p.visible and p.curve is None for p in self._items.values()
+        )
+        if needs_rebuild:
             self._rebuild_curves(preserve_selection=True)
-        else:
-            # Lightweight: just toggle curve visibility on existing PlotDataItems
-            for key, plotted in self._items.items():
-                if plotted.curve is not None:
-                    plotted.curve.setVisible(plotted.visible)
-            # Refresh table to update checkbox states and row colours
-            self._refresh_table()
-            self._refresh_highlight()
-            # Repopulate cursor value columns — _refresh_table wipes them to ''
-            self._update_table_values(self.v_line.value(), col=2)
-            if self._cursor2_enabled:
-                self._update_table_values(self.v_line2.value(), col=3)
+            return
+        # Lightweight path — every visible signal already has a curve,
+        # just toggle setVisible on existing PlotDataItems.
+        for key, plotted in self._items.items():
+            if plotted.curve is not None:
+                plotted.curve.setVisible(plotted.visible)
+        # Refresh table to update checkbox states and row colours
+        self._refresh_table()
+        self._refresh_highlight()
+        # Repopulate cursor value columns — _refresh_table wipes them to ''
+        self._update_table_values(self.v_line.value(), col=2)
+        if self._cursor2_enabled:
+            self._update_table_values(self.v_line2.value(), col=3)
 
     def _toggle_axis_visibility(self, key: str, visible: bool) -> None:
         """Show or hide the Y axis for a single signal (multi-axis mode only).

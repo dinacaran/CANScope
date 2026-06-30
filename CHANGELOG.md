@@ -7,6 +7,70 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.45] — 2026-06-30
+
+### Added — Test suite
+
+Introduced an automated test suite (`tests/`) with pytest infrastructure:
+
+- Binary test fixtures for BLF and ASC formats generated on first run via
+  `tests/fixtures/_generate.py` (fixtures are not committed).
+- Pre-commit hook installer (`tests/install_hooks.py`) runs the suite before
+  each commit.
+- `pytest.ini` and `requirements-dev.txt` added for test configuration and
+  developer dependencies.
+
+### Fixed — Adding or removing a signal resets the plot view (X and Y ranges)
+
+Adding or removing a signal from an already-populated plot snapped the X
+range back to the full file extent and reset all Y axis zooms, causing the
+user to lose their current time-window focus.
+
+**Root cause (main\_window.py):** `add_signal_to_plot` and
+`add_signals_to_plot` called `fit_to_window()` unconditionally after every
+add, overriding the view ranges that `_rebuild_curves` had already saved and
+restored.
+
+- Both call sites now capture `was_empty` (whether the plot had no signals)
+  before the add. `fit_to_window()` is only called when `was_empty` is true —
+  i.e., the first signal being added to a blank plot.
+- Adding subsequent signals to an already-populated plot no longer touches the
+  viewport.
+
+**Root cause (plot\_widget.py, multi-axis mode):** creating a new `ViewBox`
+for an extra Y axis left auto-range enabled by default. The first `setData`
+call on the curve triggered an auto-range pass that propagated through the
+`setXLink` chain and reset the main plot's X range. The subsequent
+save/restore could correct Y but could not undo the X clobber.
+
+- `enableAutoRange(x=False, y=False)` and `setAutoVisible(x=False, y=False)`
+  are now called on each new `ViewBox` immediately after construction and
+  **before** `setXLink` — cutting the propagation path before it is formed.
+- Newly added signals (not present in the saved Y-range dict) have their Y
+  range auto-fitted from their own data after the rebuild, so the new axis
+  shows the signal correctly without affecting the main X range.
+
+### Fixed — Signal visibility toggle (ON) does not render the signal
+
+Enabling a signal's visibility checkbox after it had been hidden was a no-op:
+the signal remained invisible. Disable worked correctly.
+
+**Root cause:** `_apply_visibility` used a lightweight path that called
+`curve.setVisible(True)` on existing `PlotDataItem` objects. Invisible signals
+have `curve = None` (set by `_rebuild_overlay` which skips them to keep the
+multi-axis slot count correct), so the toggle had nothing to act on.
+
+- `_apply_visibility` now checks whether any newly-enabled signal has
+  `curve is None`. If so it falls through to a full `_rebuild_curves` call,
+  which creates the missing curve (and, in multi-axis mode, the missing
+  `ViewBox` and `AxisItem`) and restores all existing view ranges via the
+  save/restore mechanism.
+- The lightweight `setVisible` path is retained for the hide direction and
+  for cases where all visible signals already have curves, avoiding
+  unnecessary rebuild overhead.
+
+---
+
 ## [v00.00.44] — 2026-06-24
 
 ### Fixed — Multi-Axis mode: Y-axis drag, label, and visibility bugs

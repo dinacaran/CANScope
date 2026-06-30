@@ -1,17 +1,17 @@
 """
-DBC Manager dialog — assign DBC files to CAN channels.
+DBC Manager dialog — assign DBC or ARXML database files to CAN channels.
 
 Layout:
 
     ┌──────────────────────────────────────────────────────────────────┐
     │  DBC Manager                                              [Name: Truck ECU Setup] │
     ├─────────────────────┬──────────────────┬────────────────────────┤
-    │  DBC File           │  Assigned to     │  Match  (IDs in file)  │
+    │  Database file      │  Assigned to     │  Match  (IDs in file)  │
     ├─────────────────────┼──────────────────┼────────────────────────┤
     │  Powertrain.dbc [×] │  [CAN 1       ▼] │  ████████░░  91%  34/37│
-    │  Chassis.dbc    [×] │  [CAN 2       ▼] │  ███████░░░  78%  21/27│
+    │  Chassis.arxml  [×] │  [CAN 2       ▼] │  ███████░░░  78%  21/27│
     │                     │                  │                        │
-    │  [+ Add DBC…]       │                  │                        │
+    │  [+ Add Database…]  │                  │                        │
     ├─────────────────────┴──────────────────┴────────────────────────┤
     │  [Save Channel Config…]   [Load Channel Config…]   [OK] [Cancel]│
     └──────────────────────────────────────────────────────────────────┘
@@ -181,7 +181,7 @@ class DBCManagerDialog(QDialog):
 
         # Column headers
         hdr = QHBoxLayout()
-        for text, width in [("DBC File", 190), ("Assigned to", 140),
+        for text, width in [("Database file", 190), ("Assigned to", 140),
                              ("Match quality", 240), ("", 30)]:
             lbl = QLabel(text)
             lbl.setFixedWidth(width)
@@ -202,9 +202,9 @@ class DBCManagerDialog(QDialog):
             self._refresh_all_matches()
 
         # ── Add DBC button ────────────────────────────────────────────────
-        add_btn = QPushButton("+ Add DBC…")
+        add_btn = QPushButton("+ Add Database…")
         add_btn.clicked.connect(self._on_add_dbc)
-        add_btn.setFixedWidth(110)
+        add_btn.setFixedWidth(130)
 
         refresh_btn = QPushButton("↻ Refresh Match")
         refresh_btn.clicked.connect(self._refresh_all_matches)
@@ -367,7 +367,7 @@ class DBCManagerDialog(QDialog):
             db = cantools.database.load_file(dbc_path, strict=False)
             dbc_ids = {int(m.frame_id) & 0x1FFFFFFF for m in db.messages}
         except Exception:
-            return 0.0, "can't read DBC", ALL_CHANNELS_KEY
+            return 0.0, "can't read database", ALL_CHANNELS_KEY
 
         if not dbc_ids or not self._ids_per_channel:
             return 0.0, "0 / 0 IDs", ALL_CHANNELS_KEY
@@ -413,8 +413,8 @@ class DBCManagerDialog(QDialog):
 
     def _on_add_dbc(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add DBC file(s)", "",
-            "DBC files (*.dbc);;All files (*)"
+            self, "Add database file(s)", "",
+            "CAN databases (*.dbc *.arxml);;DBC files (*.dbc);;ARXML files (*.arxml);;All files (*)"
         )
         for path in paths:
             self._add_row(path)

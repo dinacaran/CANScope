@@ -69,6 +69,16 @@ class BLFCANReader:
         """
         yield from BLFReaderService(self._path)
 
+    def iter_raw_tuples(self):
+        """
+        Zero-object fast path for Pass 1.
+        Delegates to :meth:`BLFReaderService.iter_raw_tuples` which yields
+        lightweight tuples instead of :class:`RawFrame` dataclasses.
+        LoadWorker detects this method via ``hasattr`` and prefers it over
+        ``iter_frames_only`` (Bottleneck 1).
+        """
+        yield from BLFReaderService(self._path).iter_raw_tuples()
+
     @property
     def decoder(self) -> DBCDecoder:
         """Expose the decoder so LoadWorker can call diagnostics_text()."""

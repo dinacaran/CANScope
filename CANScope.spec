@@ -32,6 +32,8 @@ hiddenimports = [
     "can.io.asc",
     "asammdf",
     "cantools.database",
+    "cantools.database.can.formats.arxml",
+    "lxml",
 ]
 
 block_cipher = None

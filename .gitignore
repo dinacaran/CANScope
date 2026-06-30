@@ -59,6 +59,12 @@ canscope_config.json
 htmlcov/
 *.coveragerc
 
+# ── Test fixtures ─────────────────────────────────────────────────────────
+# sample.blf and sample.asc are generated locally by tests/fixtures/_generate.py
+# and intentionally NOT committed (already caught by *.blf / *.asc above).
+# sample.dbc is a hand-written text fixture that IS committed — un-exclude it.
+!tests/fixtures/sample.dbc
+
 # ── Secrets ───────────────────────────────────────────────────────────────
 *.pem
 *.key

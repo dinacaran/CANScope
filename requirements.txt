@@ -1,7 +1,7 @@
 PySide6>=6.7
 pyqtgraph>=0.13
 python-can>=4.6
-cantools>=39.4
+cantools>=39.4  # includes DBC + ARXML (AUTOSAR 3/4) database support; no [arxml] extras needed
 numpy>=1.26
 asammdf>=7.0
 pyinstaller>=6.0

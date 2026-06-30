@@ -301,9 +301,10 @@ class LoadWorker(QObject):
         ))
 
         vec_dbcs: dict[int, VectorizedDBC] = {}
-        decoded_total  = 0
-        decoded_groups = 0
-        total_groups   = len(boundaries) - 1
+        decoded_total    = 0
+        decoded_groups   = 0
+        no_signals_total = 0
+        total_groups     = len(boundaries) - 1
 
         for g in range(total_groups):
             start, end = int(boundaries[g]), int(boundaries[g + 1])
@@ -417,18 +418,31 @@ class LoadWorker(QObject):
             flags_np[group_idx]    |= np.uint8(4)         # decoded bit
             name_ids_np[group_idx]  = np.uint16(nid)
 
-            # Update decoder stats so diagnostics_text() makes sense
-            decoder.stats['decode_success'] = (
-                decoder.stats.get('decode_success', 0) + len(group_idx)
-            )
+            # Update decoder stats so diagnostics_text() makes sense.
+            # Signal-less groups (e.g. raw UDS diagnostic frames) are counted
+            # separately — they are not decode failures.
+            if sig_results:
+                decoder.stats['decode_success'] = (
+                    decoder.stats.get('decode_success', 0) + len(group_idx)
+                )
+            elif not message.signals:
+                decoder.stats['decoded_no_signals'] = (
+                    decoder.stats.get('decoded_no_signals', 0) + len(group_idx)
+                )
+                no_signals_total += len(group_idx)
 
             decoded_total  += len(group_idx)
             decoded_groups += 1
             if decoded_groups % 50 == 0 or decoded_groups == total_groups:
+                n_sigs = len(store._series_by_key)
+                hint = (
+                    " (measurement contains only diagnostic / signal-less frames)"
+                    if n_sigs == 0 and no_signals_total > 0 else ""
+                )
                 self.progress.emit(
                     f"Decoded {decoded_groups}/{total_groups} message groups | "
-                    f"signals: {len(store._series_by_key):,} | "
-                    f"frames: {decoded_total:,}"
+                    f"signals: {n_sigs:,} | "
+                    f"frames: {decoded_total:,}{hint}"
                 )
                 # Refresh tree + plot every batch of groups so the GUI is
                 # responsive while pass 2 is running.

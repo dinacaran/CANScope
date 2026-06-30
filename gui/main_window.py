@@ -232,7 +232,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
         self.status_state_label = QLabel('State: Ready')
-        self.status_next_step_label = QLabel('Next: Open BLF, then Open DBC, then Load + Decode')
+        self.status_next_step_label = QLabel('Next: Open BLF, then Open Database, then Load + Decode')
         self.statusBar().addWidget(self.status_state_label)
         self.statusBar().addPermanentWidget(self.status_next_step_label, 1)
         self._sync_panel_toggle_buttons()
@@ -244,7 +244,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._toolbar_actions: dict[str, QAction] = {}
         for text, slot in [
             ('Open File',    self.choose_blf),
-            ('Open DBC',     self.choose_dbc),
+            ('Open Database', self.choose_dbc),
             ('Load + Decode',self.load_data),
             ('Save Config',  self.save_configuration),
             ('Load Config',  self.load_configuration),
@@ -300,7 +300,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         needs_dbc = dbc_required_for(path)
         self._log(f'Selected measurement file: {path}')
         if not needs_dbc:
-            self._log('DBC not required for this format.')
+            self._log('Database not required for this format.')
 
         # Lightweight pre-scan: extract channel numbers + arb IDs
         # so the DBC Manager can show real channels before Load+Decode
@@ -385,7 +385,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._log(self.channel_config.summary())
         self._update_measurement_tab()
         self._update_action_states()
-        self._update_status('DBC configured', self._next_step_message())
+        self._update_status('Database configured', self._next_step_message())
 
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
@@ -585,13 +585,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
             QMessageBox.warning(self, 'Missing file', 'Please select a measurement file first.')
             self._update_status('Waiting for input', self._next_step_message())
             return
-        # DBC required only for CAN-raw formats
+        # Database required only for CAN-raw formats
         if dbc_required_for(mpath) and self.channel_config.is_empty():
             reply = QMessageBox.question(
-                self, 'No DBC configured',
-                'This format requires a DBC for signal decoding.\n'
-                'No DBC is configured yet.\n\n'
-                'Open DBC Manager now?',
+                self, 'No database configured',
+                'This format requires a database (DBC or ARXML) for signal decoding.\n'
+                'No database is configured yet.\n\n'
+                'Open Database Manager now?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -631,6 +631,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not keys:
             return
 
+        # Only fit when the plot was empty before this add — preserves user's
+        # zoom when adding signals to an already-populated plot.
+        was_empty = not self.plot_panel.plotted_keys()
         batch = len(keys) > 1
         if batch:
             self.plot_panel.begin_batch_add()
@@ -642,7 +645,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
         if batch:
             self.plot_panel.end_batch_add()
-        elif plotted:
+        elif plotted and was_empty:
             self.plot_panel.fit_to_window()
 
         if plotted:
@@ -659,8 +662,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not series:
             self._log(f'Signal not found: {key}')
             return False
+        # Only fit when the plot was empty before this add — preserves user's
+        # zoom when adding signals to an already-populated plot.
+        was_empty = not self.plot_panel.plotted_keys()
         self.plot_panel.add_series(key, series)
-        if fit:
+        if fit and was_empty:
             self.plot_panel.fit_to_window()
         return True
 
@@ -882,15 +888,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if dbc_required_for(mpath) and self.channel_config.is_empty():
             suffix = Path(mpath).suffix.lower()
             if suffix in ('.mf4', '.mdf'):
-                return "MDF bus log detected — DBC required. Click 'Open DBC' to configure."
-            return "DBC required — click 'Open DBC' to configure channel mapping."
+                return "MDF bus log detected — database required. Click 'Open Database' to configure."
+            return "Database required — click 'Open Database' to configure channel mapping."
         return "Click 'Load + Decode', then select signal(s) to plot."
 
     def _update_measurement_tab(self, channels: str = '', frames: str = '', decoded: str = '', samples: str = '') -> None:
         mpath = self.measurement_path or self.blf_path
         lines = [
             f'File: {mpath or ""}',
-            f'DBC:  {self.dbc_path or "(not required)"}',
+            f'Database:  {self.dbc_path or "(not required)"}',
             f'Channels: {channels}',
             f'Frames: {frames}',
             f'Decoded Frames: {decoded}',
