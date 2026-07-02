@@ -1,7 +1,7 @@
 # CAN Scope
 
 > A portable, zero-install Windows tool for loading CAN/automotive measurement files,
-> decoding signals with DBC databases, and plotting them interactively.
+> decoding signals with DBC or ARXML (AUTOSAR) databases, and plotting them interactively.
 
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
@@ -12,8 +12,8 @@
 
 ## Supported Formats
 
-| Format | Extension | DBC Required |
-|--------|-----------|--------------|
+| Format | Extension | Database Required |
+|--------|-----------|-------------------|
 | Vector Binary Logging Format | `.blf` | Yes |
 | Vector CANalyzer ASCII Log | `.asc` | Yes |
 | ASAM MDF4 — bus logging (raw CAN frames) | `.mf4` | Yes — auto-detected |
@@ -22,8 +22,18 @@
 
 > **MDF auto-detection:** CAN Scope automatically probes each MDF file on open.
 > If it contains raw CAN bus frames (`CAN_DataFrame.*` channel groups) it routes
-> through the bus-logging pipeline and requires a DBC. Pre-decoded MDF files load
-> directly without a DBC.
+> through the bus-logging pipeline and requires a database file (`.dbc` or `.arxml`).
+> Pre-decoded MDF files load directly without a database.
+
+### Database Formats
+
+Both `.dbc` and `.arxml` (AUTOSAR System Description) files are accepted wherever
+a CAN database is required.
+
+- Open an `.arxml` in the **Database Manager** exactly as you would a `.dbc`.
+- Mixed configurations are supported: some CAN channels can use a `.dbc` and others an `.arxml`.
+- Supported ARXML variants: AUTOSAR 3.x and AUTOSAR 4.x.
+- To convert an existing `.dbc` to `.arxml` for testing: `cantools convert input.dbc output.arxml`
 
 ---
 
@@ -44,10 +54,10 @@ CAN Trace / Raw Frame viewer:
 
 ### File & Decoding
 - **Multi-format loading** — BLF, ASC, MF4 (bus-logged and pre-decoded), MDF3, and CSV in one tool
-- **Multi-channel DBC mapping** — assign a different DBC to each CAN channel via the DBC Manager; channel 0 acts as an "All Channels" fallback
-- **DBC match quality indicators** — the DBC Manager shows per-channel decode coverage bars with J1939 PGN fallback scoring
+- **Multi-channel database mapping** — assign a different `.dbc` or `.arxml` to each CAN channel via the Database Manager; channel 0 acts as an "All Channels" fallback
+- **Database match quality indicators** — the Database Manager shows per-channel decode coverage bars with J1939 PGN fallback scoring
 - **Streaming decode** — signal tree and plots update in real time while large files are still decoding
-- **Persistent channel config** — DBC-to-channel assignments saved as `.canscope_ch` JSON and reloaded automatically between sessions
+- **Persistent channel config** — database-to-channel assignments saved as `.canscope_ch` JSON and reloaded automatically between sessions
 
 ### Plot Modes
 - **Normal** — all signals share one Y axis
@@ -113,15 +123,15 @@ the latest `CANScope_vXX.XX.XX_Windows.zip`. Unzip anywhere and run `CANScope.ex
 | Step | Action |
 |------|--------|
 | 1 | **Open File** — select `.blf`, `.asc`, `.mf4`, `.mdf`, or `.csv` |
-| 2 | **Open DBC** — required for BLF, ASC, and MF4 bus-logged files |
-| 3 | **DBC Manager** *(optional)* — assign a different DBC per CAN channel |
+| 2 | **Open Database** — required for BLF, ASC, and MF4 bus-logged files (`.dbc` or `.arxml`) |
+| 3 | **Database Manager** *(optional)* — assign a different database per CAN channel |
 | 4 | **Load + Decode** — background decode; signal tree populates live |
 | 5 | Double-click or drag a signal to plot it, or select and press Space |
 | 6 | Drag **Cursor 1** to read time and signal value in the table |
 | 7 | Toggle **Cursor 2** to measure ΔT between two points |
 | 8 | Switch between **Normal**, **Multi-Axis**, and **Stacked** plot modes |
 | 9 | **Fit to Window** or **Fit Vertical** to rescale the view |
-| 10 | **Save Config** (Ctrl+S) to persist the full session state |
+| 10 | **Save Config** (Ctrl+S) — persists file paths, database mapping, plotted signals, and all view state |
 | 11 | **Export CSV** to save selected signal data to a time-aligned file |
 | 12 | **CAN Trace** to browse raw CAN frames (BLF / ASC / MF4 bus-log) |
 
@@ -157,37 +167,66 @@ builds and uploads the ZIP automatically on every tag push matching `v*.*.*`.
 
 ```
 canscope/
-├── app.py                        # Entry point, APP_NAME="CAN Scope"
+├── app.py                        # Entry point, APP_NAME="CAN Scope", APP_VERSION
+├── config/
+│   └── diagnostics/
+│       ├── motor_control.yaml    # Fault rules for motor/inverter domain (user-editable)
+│       └── README.md             # Rule authoring guide
 ├── core/
 │   ├── models.py                 # RawFrame, DecodedSignalSample dataclasses
-│   ├── channel_config.py         # ChannelConfig: {channel → DBC}, decoder cache, save/load .canscope_ch
+│   ├── channel_config.py         # ChannelConfig: {channel → DBC or ARXML}, decoder cache, save/load .canscope_ch
 │   ├── load_worker.py            # QThread: CAN-raw / bulk-array / sample-loop decode paths
 │   ├── signal_store.py           # SignalStore, SignalSeries (array.array storage)
 │   ├── raw_frame_store.py        # On-disk indexed store: 18 B/frame RAM + 64 B/frame disk, mmap
-│   ├── dbc_decoder.py            # DBCDecoder with 3-level cache
+│   ├── dbc_decoder.py            # DBCDecoder with 3-level cache — accepts .dbc and .arxml
+│   ├── vectorized_decoder.py     # Vectorised BLF/ASC decode + cached series refs
 │   ├── blf_reader.py             # BLFReaderService (wraps python-can)
 │   ├── export.py                 # CSV export
-│   └── readers/
-│       ├── __init__.py           # reader_factory() + dbc_required_for() — format detection
-│       ├── base.py               # MeasurementReader protocol
-│       ├── blf_can_reader.py     # BLF + DBC pipeline
-│       ├── asc_can_reader.py     # ASC + DBC pipeline
-│       ├── mdf_reader.py         # MF4/MDF pre-decoded via asammdf + is_bus_logging() probe
-│       ├── mdf_can_reader.py     # MDF4 bus logging via python-can MF4Reader + DBC
-│       └── csv_reader.py         # Wide and narrow CSV
+│   ├── readers/
+│   │   ├── __init__.py           # reader_factory() + dbc_required_for() — format detection
+│   │   ├── db_format.py          # SUPPORTED_DB_SUFFIXES, is_database_file(), db_format_label()
+│   │   ├── base.py               # MeasurementReader protocol
+│   │   ├── blf_can_reader.py     # BLF + DBC/ARXML pipeline
+│   │   ├── asc_can_reader.py     # ASC + DBC/ARXML pipeline
+│   │   ├── mdf_reader.py         # MF4/MDF pre-decoded via asammdf + is_bus_logging() probe
+│   │   ├── mdf_can_reader.py     # MDF4 bus logging via python-can MF4Reader + DBC/ARXML
+│   │   └── csv_reader.py         # Wide and narrow CSV
+│   └── diagnostics/              # AI-powered diagnostics engine (Ctrl+Shift+A)
+│       ├── __init__.py
+│       ├── config_loader.py      # YAML domain parser — infers rule type, auto-generates id/title
+│       ├── context.py            # DiagnosticContext — read-only SignalStore adapter for rule processors
+│       ├── engine.py             # DiagnosticEngine — orchestrates rule runs and evidence building
+│       ├── evidence.py           # EvidenceBuilder — reduces large data to <5 KB LLM snippets
+│       ├── models.py             # Finding, Severity, AnalysisResult dataclasses
+│       ├── rules/
+│       │   ├── __init__.py       # RULE_PROCESSORS dispatch table
+│       │   ├── expression.py     # Free-form condition evaluation (>, <, =, !=, and, or)
+│       │   ├── fault_signal.py   # fault_when operator evaluation
+│       │   ├── range_check.py    # min/max boundary check
+│       │   └── message_loss.py   # Gap detection between CAN samples
+│       └── llm/
+│           ├── __init__.py
+│           ├── client.py         # GitHubModelsClient — streaming OpenAI-compatible REST
+│           └── prompts.py        # Analysis and chat follow-up prompt builders
 ├── gui/
-│   ├── main_window.py            # MainWindow, toolbar, config save/load, ChannelConfig integration
-│   ├── plot_widget.py            # PlotPanel: normal / multi-axis / stacked, dual cursors, groups
+│   ├── main_window.py            # MainWindow, toolbar, config save/load, plot_finding()
+│   ├── plot_widget.py            # PlotPanel: normal / multi-axis / stacked, dual cursors, zoom_to_time()
 │   ├── signal_tree.py            # SignalTreeWidget with live search
 │   ├── raw_frame_dialog.py       # Sliding-window CAN Trace (RawFrameStore, no cap)
-│   ├── dbc_manager.py            # DBC Manager dialog: per-channel DBC, match quality bars
-│   └── splash.py                 # CANScopeSplash — minimisable, taskbar-visible splash screen
+│   ├── dbc_manager.py            # Database Manager dialog: per-channel DBC/ARXML, match quality bars
+│   ├── splash.py                 # CANScopeSplash — minimisable, taskbar-visible splash screen
+│   └── diagnostics/              # Diagnostics UI (non-modal window)
+│       ├── activation.py         # Wires Ctrl+Shift+A shortcut in MainWindow
+│       ├── window.py             # DiagnosticsWindow — domain selector, run controls, auto-plot on fault
+│       ├── findings_panel.py     # Left panel — severity-coloured finding list + details pane
+│       ├── chat_panel.py         # Right panel — streaming LLM chat with status label
+│       └── worker.py             # AnalysisWorker / LLMWorker (background thread helpers)
 ├── resources/
 │   ├── splashscreen.png          # 1635 × 962 splash image
 │   ├── CANScope_ICON.png         # 1254 × 1254 app icon source
 │   └── app_icon.ico              # Multi-resolution ICO (256/128/64/48/32/16 px)
 ├── requirements.txt
-├── CANScope.spec                 # PyInstaller spec, bundles resources/
+├── CANScope.spec                 # PyInstaller spec, bundles resources/ and config/
 └── .github/workflows/build.yml  # Auto-build on v*.*.* tag push
 ```
 
@@ -200,7 +239,7 @@ canscope/
 | PySide6 | ≥ 6.7 | GUI framework | LGPL v3 |
 | pyqtgraph | ≥ 0.13 | Interactive plots | MIT |
 | python-can | ≥ 4.6 | BLF / ASC / MF4 bus-log reading | LGPL v3 |
-| cantools | ≥ 39.4 | DBC decoding | MIT |
+| cantools | ≥ 39.4 | DBC + ARXML (AUTOSAR 3/4) decoding | MIT |
 | numpy | ≥ 1.26 | Array operations | BSD |
 | asammdf | ≥ 7.0 | MF4 / MDF pre-decoded signals | MIT |
 | canmatrix | any | MF4 bus-log support (optional) | LGPL v3 |

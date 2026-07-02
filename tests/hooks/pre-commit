@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit hook: run the test suite; abort the commit if tests fail.
+# Install with:  python tests/install_hooks.py
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+echo "Running CANScope tests..."
+python -m pytest tests/ -q --tb=short
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+    echo ""
+    echo "Tests failed — commit aborted. Fix failing tests and retry."
+    exit 1
+fi
+
+echo "Tests passed."
+exit 0

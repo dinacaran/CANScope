@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self._pending_plot_colors: dict[str, str] = {}
         self._pending_plot_visible: dict[str, bool] = {}
         self._pending_plot_groups:  dict[str, str]  = {}
+        self._pending_plot_axis_visible: dict[str, bool] = {}
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
@@ -75,6 +76,12 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self._update_action_states()  # grey-out on startup
         self._set_ready_status()
+
+        # Hidden diagnostics feature — Ctrl+Shift+A. No menu/toolbar entry.
+        # Disable with env var CANSCOPE_DIAGNOSTICS=0.
+        from gui.diagnostics.activation import install_shortcut
+        install_shortcut(self)
+
         self._log(f'{self.app_name} {self.version} started.')
         self._log(f'Dev log file: {self._log_file_path}')
         self._update_measurement_tab()
@@ -225,7 +232,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
         self.status_state_label = QLabel('State: Ready')
-        self.status_next_step_label = QLabel('Next: Open BLF, then Open DBC, then Load + Decode')
+        self.status_next_step_label = QLabel('Next: Open BLF, then Open Database, then Load + Decode')
         self.statusBar().addWidget(self.status_state_label)
         self.statusBar().addPermanentWidget(self.status_next_step_label, 1)
         self._sync_panel_toggle_buttons()
@@ -237,7 +244,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._toolbar_actions: dict[str, QAction] = {}
         for text, slot in [
             ('Open File',    self.choose_blf),
-            ('Open DBC',     self.choose_dbc),
+            ('Open Database', self.choose_dbc),
             ('Load + Decode',self.load_data),
             ('Save Config',  self.save_configuration),
             ('Load Config',  self.load_configuration),
@@ -264,6 +271,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         QShortcut(QKeySequence('Ctrl+S'), self, activated=self.save_configuration)
         QShortcut(QKeySequence('F'), self, activated=self.plot_panel.fit_to_window)
         QShortcut(QKeySequence('V'), self, activated=self.plot_panel.fit_vertical)
+        QShortcut(QKeySequence('C'), self, activated=self._shortcut_change_signal_color)
+        QShortcut(QKeySequence('R'), self, activated=self._shortcut_toggle_cursors)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=lambda: self.add_signals_to_plot(self.signal_tree.selected_signal_keys()))
         QShortcut(QKeySequence('Ctrl+Up'), self, activated=self.plot_panel.move_selected_up)
         # Raw Frames hidden from GUI to prevent hang on large files — accessible via shortcut
@@ -293,7 +302,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         needs_dbc = dbc_required_for(path)
         self._log(f'Selected measurement file: {path}')
         if not needs_dbc:
-            self._log('DBC not required for this format.')
+            self._log('Database not required for this format.')
 
         # Lightweight pre-scan: extract channel numbers + arb IDs
         # so the DBC Manager can show real channels before Load+Decode
@@ -378,7 +387,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._log(self.channel_config.summary())
         self._update_measurement_tab()
         self._update_action_states()
-        self._update_status('DBC configured', self._next_step_message())
+        self._update_status('Database configured', self._next_step_message())
 
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
@@ -403,6 +412,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.btn_cursor2.setText('Cursor 2: ON' if checked else 'Cursor 2')
         self._update_status('Cursor 2 updated',
                             'Drag C2 line to measure time delta between cursors')
+
+    def _shortcut_change_signal_color(self) -> None:
+        key = self.plot_panel._current_key
+        if not key or key not in self.plot_panel._items:
+            keys = self.plot_panel.selected_keys()
+            key = keys[0] if keys else None
+        if key:
+            self.plot_panel._choose_color_for_key(str(key))
+
+    def _shortcut_toggle_cursors(self) -> None:
+        both_on = self.btn_cursor1.isChecked() and self.btn_cursor2.isChecked()
+        target = not both_on
+        self.btn_cursor1.setChecked(target)
+        self.btn_cursor2.setChecked(target)
 
     def show_raw_frames(self) -> None:
         rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
@@ -430,9 +453,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             },
             'signals': [
                 {
-                    'key':     k,
-                    'visible': self.plot_panel._items[k].visible,
-                    'group':   self.plot_panel._items[k].group,
+                    'key':          k,
+                    'visible':      self.plot_panel._items[k].visible,
+                    'group':        self.plot_panel._items[k].group,
+                    'axis_visible': self.plot_panel._items[k].axis_visible,
                 }
                 for k in self.plot_panel.plotted_keys()
             ],
@@ -481,10 +505,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         elif cfg_dbc:
             self.channel_config = ChannelConfig.from_single_dbc(cfg_dbc)
         # ── Parse signals list: supports new dict format and old plain-string format ──
-        signals_data    = list(data.get('signals') or [])
-        pending_keys    = []
-        pending_visible = {}
-        pending_groups  = {}
+        signals_data         = list(data.get('signals') or [])
+        pending_keys         = []
+        pending_visible      = {}
+        pending_groups       = {}
+        pending_axis_visible = {}
         for s in signals_data:
             if isinstance(s, str):
                 pending_keys.append(s)
@@ -496,6 +521,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         pending_visible[k] = bool(s['visible'])
                     if s.get('group'):
                         pending_groups[k] = str(s['group'])
+                    if 'axis_visible' in s:
+                        pending_axis_visible[k] = bool(s['axis_visible'])
         pending_colors = dict(data.get('signal_colors') or {})
 
         # Fix 6: if data is already decoded, ask the user what to do
@@ -545,6 +572,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if pending_groups.get(key):
                         self.plot_panel._items[key].group = pending_groups[key]
                         needs_rebuild = True
+                    if key in pending_axis_visible:
+                        self.plot_panel._items[key].axis_visible = pending_axis_visible[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             return
@@ -553,10 +583,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.measurement_path = cfg_blf
         self.blf_path = cfg_blf   # alias
         self.dbc_path = cfg_dbc
-        self._pending_plot_keys    = pending_keys
-        self._pending_plot_colors  = pending_colors
-        self._pending_plot_visible = pending_visible
-        self._pending_plot_groups  = pending_groups
+        self._pending_plot_keys         = pending_keys
+        self._pending_plot_colors       = pending_colors
+        self._pending_plot_visible      = pending_visible
+        self._pending_plot_groups       = pending_groups
+        self._pending_plot_axis_visible = pending_axis_visible
         self._update_measurement_tab()
         if not self.blf_path or not self.dbc_path:
             QMessageBox.warning(self, 'Incomplete configuration', 'The configuration file does not contain both BLF and DBC paths.')
@@ -570,13 +601,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
             QMessageBox.warning(self, 'Missing file', 'Please select a measurement file first.')
             self._update_status('Waiting for input', self._next_step_message())
             return
-        # DBC required only for CAN-raw formats
+        # Database required only for CAN-raw formats
         if dbc_required_for(mpath) and self.channel_config.is_empty():
             reply = QMessageBox.question(
-                self, 'No DBC configured',
-                'This format requires a DBC for signal decoding.\n'
-                'No DBC is configured yet.\n\n'
-                'Open DBC Manager now?',
+                self, 'No database configured',
+                'This format requires a database (DBC or ARXML) for signal decoding.\n'
+                'No database is configured yet.\n\n'
+                'Open Database Manager now?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -616,6 +647,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not keys:
             return
 
+        # Only fit when the plot was empty before this add — preserves user's
+        # zoom when adding signals to an already-populated plot.
+        was_empty = not self.plot_panel.plotted_keys()
         batch = len(keys) > 1
         if batch:
             self.plot_panel.begin_batch_add()
@@ -627,7 +661,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
         if batch:
             self.plot_panel.end_batch_add()
-        elif plotted:
+        elif plotted and was_empty:
             self.plot_panel.fit_to_window()
 
         if plotted:
@@ -644,10 +678,24 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not series:
             self._log(f'Signal not found: {key}')
             return False
+        # Only fit when the plot was empty before this add — preserves user's
+        # zoom when adding signals to an already-populated plot.
+        was_empty = not self.plot_panel.plotted_keys()
         self.plot_panel.add_series(key, series)
-        if fit:
+        if fit and was_empty:
             self.plot_panel.fit_to_window()
         return True
+
+    def plot_finding(self, finding) -> None:
+        """Plot a diagnostic finding's signals and zoom to its time window."""
+        if not self.store:
+            return
+        keys = finding.plot_signals or finding.signals
+        if keys:
+            self.add_signals_to_plot(keys)
+        t0, t1 = finding.time_window
+        if t0 or t1:
+            self.plot_panel.zoom_to_time(t0, t1)
 
     def export_selected_csv(self) -> None:
         series_items = self.plot_panel.plotted_series()
@@ -729,15 +777,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
         )
         self._log('Decode finished successfully.')
         if self._pending_plot_keys:
-            wanted  = list(self._pending_plot_keys)
-            colors  = dict(self._pending_plot_colors)
-            visible = dict(getattr(self, '_pending_plot_visible', {}))
-            groups  = dict(getattr(self, '_pending_plot_groups',  {}))
+            wanted       = list(self._pending_plot_keys)
+            colors       = dict(self._pending_plot_colors)
+            visible      = dict(getattr(self, '_pending_plot_visible',      {}))
+            groups       = dict(getattr(self, '_pending_plot_groups',       {}))
+            axis_visible = dict(getattr(self, '_pending_plot_axis_visible', {}))
             self._pending_plot_keys = []
             self.add_signals_to_plot(wanted)
             for key, color in colors.items():
                 self.plot_panel.set_series_color(key, color)
-            # Restore visibility and group from saved config
+            # Restore visibility, group, and axis_visible from saved config
             needs_rebuild = False
             for key in wanted:
                 if key in self.plot_panel._items:
@@ -747,11 +796,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if key in groups and groups[key]:
                         self.plot_panel._items[key].group = groups[key]
                         needs_rebuild = True
+                    if key in axis_visible:
+                        self.plot_panel._items[key].axis_visible = axis_visible[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
-            self._pending_plot_colors  = {}
-            self._pending_plot_visible = {}
-            self._pending_plot_groups  = {}
+            self._pending_plot_colors       = {}
+            self._pending_plot_visible      = {}
+            self._pending_plot_groups       = {}
+            self._pending_plot_axis_visible = {}
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:
@@ -851,15 +904,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if dbc_required_for(mpath) and self.channel_config.is_empty():
             suffix = Path(mpath).suffix.lower()
             if suffix in ('.mf4', '.mdf'):
-                return "MDF bus log detected — DBC required. Click 'Open DBC' to configure."
-            return "DBC required — click 'Open DBC' to configure channel mapping."
+                return "MDF bus log detected — database required. Click 'Open Database' to configure."
+            return "Database required — click 'Open Database' to configure channel mapping."
         return "Click 'Load + Decode', then select signal(s) to plot."
 
     def _update_measurement_tab(self, channels: str = '', frames: str = '', decoded: str = '', samples: str = '') -> None:
         mpath = self.measurement_path or self.blf_path
         lines = [
             f'File: {mpath or ""}',
-            f'DBC:  {self.dbc_path or "(not required)"}',
+            f'Database:  {self.dbc_path or "(not required)"}',
             f'Channels: {channels}',
             f'Frames: {frames}',
             f'Decoded Frames: {decoded}',

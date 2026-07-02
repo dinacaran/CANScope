@@ -1,0 +1,18 @@
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_:
+
+BO_ 256 EngineControl: 8 Vector__XXX
+ SG_ EngSpeed : 0|16@1+ (0.5,0) [0|6000] "rpm" Vector__XXX
+ SG_ Throttle : 16|8@1+ (0.5,0) [0|100] "%" Vector__XXX
+
+BO_ 512 GearStatus: 4 Vector__XXX
+ SG_ Gear : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 768 DiagRequest: 8 Vector__XXX
+
+VAL_ 512 Gear 1 "Park" 2 "Reverse" 3 "Neutral" 4 "Drive" ;

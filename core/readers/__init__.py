@@ -125,20 +125,20 @@ def reader_factory(
     Raises
     ------
     UnsupportedFormatError  – file extension is not recognised
-    ValueError              – DBC required for format but not supplied
+    ValueError              – DBC or ARXML required for format but not supplied
     """
     suffix = Path(measurement_path).suffix.lower()
 
     if suffix == '.blf':
         if not dbc_path:
-            raise ValueError("A DBC file is required for BLF files.")
+            raise ValueError("A DBC or ARXML file is required for BLF files.")
         from core.readers.blf_can_reader import BLFCANReader
         from core.dbc_decoder import DBCDecoder
         return BLFCANReader(measurement_path, DBCDecoder(dbc_path))
 
     if suffix == '.asc':
         if not dbc_path:
-            raise ValueError("A DBC file is required for ASC files.")
+            raise ValueError("A DBC or ARXML file is required for ASC files.")
         from core.readers.asc_can_reader import ASCCANReader
         from core.dbc_decoder import DBCDecoder
         return ASCCANReader(measurement_path, DBCDecoder(dbc_path))
@@ -146,12 +146,12 @@ def reader_factory(
     if suffix in ('.mf4', '.mdf'):
         from core.readers.mdf_reader import MDFReader
         if MDFReader.is_bus_logging(measurement_path):
-            # Bus logging — raw CAN frames → needs DBC
+            # Bus logging — raw CAN frames → needs DBC or ARXML
             if not dbc_path:
                 raise ValueError(
                     "This MDF file contains raw CAN bus frames.\n"
-                    "A DBC file is required for signal decoding.\n"
-                    "Please configure channel → DBC mapping via 'Open DBC'."
+                    "A DBC or ARXML file is required for signal decoding.\n"
+                    "Please configure channel → database mapping via 'Open Database'."
                 )
             from core.readers.mdf_can_reader import MDFCANReader
             from core.dbc_decoder import DBCDecoder

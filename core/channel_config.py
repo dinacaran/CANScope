@@ -1,5 +1,5 @@
 """
-ChannelConfig — maps CAN channel numbers to DBC file paths.
+ChannelConfig — maps CAN channel numbers to database file paths (.dbc or .arxml).
 
 This is the persistent "vehicle / project configuration" layer, kept
 separate from session config (signals, plot layout, measurement path).
@@ -8,17 +8,20 @@ Saved as a standalone JSON file (.canscope_ch):
 
     {
         "type": "canscope_channel_config",
-        "version": 1,
+        "version": 2,
         "name": "Truck ECU Setup",
         "channels": {
             "1": "/path/to/Powertrain.dbc",
-            "2": "/path/to/Chassis.dbc",
+            "2": "/path/to/Chassis.arxml",
             "0": "/path/to/FallbackAll.dbc"   <- channel 0 = "All Channels"
         }
     }
 
+Version history: 1 = DBC-only paths; 2 = DBC or ARXML paths (both accepted
+on load, version 2 written on save).
+
 Channel key 0 (ALL_CHANNELS_KEY) means "apply to all channels that have
-no specific DBC assigned".
+no specific database assigned".
 
 Usage in LoadWorker:
     channel_config.decoder_for(channel)  -> DBCDecoder | None
@@ -34,14 +37,14 @@ ALL_CHANNELS_KEY = 0
 
 class ChannelConfig:
     """
-    Maps CAN channel numbers to DBC file paths.
+    Maps CAN channel numbers to database file paths (.dbc or .arxml).
 
     Attributes
     ----------
     name : str
         Human-readable label (e.g. "Truck ECU v2").
     channels : dict[int, str]
-        ``{channel_num: dbc_absolute_path}``.
+        ``{channel_num: database_absolute_path}`` — paths may be .dbc or .arxml.
         Key ``ALL_CHANNELS_KEY`` (0) = fallback for unassigned channels.
     """
 
@@ -79,7 +82,7 @@ class ChannelConfig:
         """Save to a .canscope_ch JSON file."""
         data = {
             "type": "canscope_channel_config",
-            "version": 1,
+            "version": 2,
             "name": self.name,
             "channels": {str(k): v for k, v in self.channels.items()},
         }

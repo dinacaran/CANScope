@@ -1,0 +1,8 @@
+channel,message_name,message_id,signal_name,unit,timestamp,value,raw_value
+1,EngineControl,0x100,EngSpeed,rpm,0.001,600.0,1200.0
+1,EngineControl,0x100,EngSpeed,rpm,0.002,602.5,1205.0
+1,EngineControl,0x100,EngSpeed,rpm,0.003,605.0,1210.0
+1,EngineControl,0x100,Throttle,%,0.001,25.0,50.0
+1,EngineControl,0x100,Throttle,%,0.002,26.0,52.0
+1,GearStatus,0x200,Gear,,0.001,Drive,4
+1,GearStatus,0x200,Gear,,0.002,Drive,4

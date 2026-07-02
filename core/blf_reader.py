@@ -45,6 +45,48 @@ class BLFReaderService:
         except Exception as exc:  # pragma: no cover - runtime protection
             raise BLFReadError(f"Failed to read BLF file '{self.path}': {exc}") from exc
 
+    def iter_raw_tuples(self):
+        """
+        Yield ``(timestamp, channel_byte, arb_id, dlc, direction_int,
+        is_extended, is_fd, data)`` tuples directly from python-can.
+
+        Avoids constructing a :class:`RawFrame` dataclass per frame — no
+        Python object allocation, no ``bytes()`` copy, no string direction.
+
+        * ``channel_byte`` — uint8: channel + 1 (1-indexed), or 255 for None
+        * ``direction_int`` — int: 0=Rx, 1=Tx, 2=Unknown
+        * ``data``         — raw bytes-like from python-can (bytearray / None)
+
+        Used by the 2-pass vectorised loader (Bottleneck 1 / Pass 1 hot loop).
+        """
+        if not self.path.exists():
+            raise BLFReadError(f"BLF file not found: {self.path}")
+
+        try:
+            with can.BLFReader(str(self.path)) as reader:
+                for msg in reader:
+                    raw_ch = getattr(msg, "channel", None)
+                    ch_byte = (
+                        (int(raw_ch) + 1) & 0xFF
+                        if isinstance(raw_ch, (int, float))
+                        else 255
+                    )
+                    is_rx = getattr(msg, "is_rx", None)
+                    dir_int = 0 if is_rx is True else (1 if is_rx is False else 2)
+                    d = msg.data
+                    yield (
+                        float(msg.timestamp),
+                        ch_byte,
+                        int(msg.arbitration_id),
+                        int(getattr(msg, "dlc", len(d) if d else 0)),
+                        dir_int,
+                        bool(getattr(msg, "is_extended_id", False)),
+                        bool(getattr(msg, "is_fd", False)),
+                        d if d is not None else b"",
+                    )
+        except Exception as exc:
+            raise BLFReadError(f"Failed to read BLF file '{self.path}': {exc}") from exc
+
     @staticmethod
     def _direction(msg: can.Message) -> str:
         is_rx = getattr(msg, "is_rx", None)

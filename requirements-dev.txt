@@ -1,0 +1,4 @@
+# Development / test dependencies — install alongside requirements.txt
+# pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8.0
+pyyaml>=6.0

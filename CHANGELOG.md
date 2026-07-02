@@ -7,7 +7,354 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
-## [v00.00.39] — 2026-05-07
+## [v00.00.45] — 2026-06-30
+
+### Added — Test suite
+
+Introduced an automated test suite (`tests/`) with pytest infrastructure:
+
+- Binary test fixtures for BLF and ASC formats generated on first run via
+  `tests/fixtures/_generate.py` (fixtures are not committed).
+- Pre-commit hook installer (`tests/install_hooks.py`) runs the suite before
+  each commit.
+- `pytest.ini` and `requirements-dev.txt` added for test configuration and
+  developer dependencies.
+
+### Fixed — Adding or removing a signal resets the plot view (X and Y ranges)
+
+Adding or removing a signal from an already-populated plot snapped the X
+range back to the full file extent and reset all Y axis zooms, causing the
+user to lose their current time-window focus.
+
+**Root cause (main\_window.py):** `add_signal_to_plot` and
+`add_signals_to_plot` called `fit_to_window()` unconditionally after every
+add, overriding the view ranges that `_rebuild_curves` had already saved and
+restored.
+
+- Both call sites now capture `was_empty` (whether the plot had no signals)
+  before the add. `fit_to_window()` is only called when `was_empty` is true —
+  i.e., the first signal being added to a blank plot.
+- Adding subsequent signals to an already-populated plot no longer touches the
+  viewport.
+
+**Root cause (plot\_widget.py, multi-axis mode):** creating a new `ViewBox`
+for an extra Y axis left auto-range enabled by default. The first `setData`
+call on the curve triggered an auto-range pass that propagated through the
+`setXLink` chain and reset the main plot's X range. The subsequent
+save/restore could correct Y but could not undo the X clobber.
+
+- `enableAutoRange(x=False, y=False)` and `setAutoVisible(x=False, y=False)`
+  are now called on each new `ViewBox` immediately after construction and
+  **before** `setXLink` — cutting the propagation path before it is formed.
+- Newly added signals (not present in the saved Y-range dict) have their Y
+  range auto-fitted from their own data after the rebuild, so the new axis
+  shows the signal correctly without affecting the main X range.
+
+### Fixed — Signal visibility toggle (ON) does not render the signal
+
+Enabling a signal's visibility checkbox after it had been hidden was a no-op:
+the signal remained invisible. Disable worked correctly.
+
+**Root cause:** `_apply_visibility` used a lightweight path that called
+`curve.setVisible(True)` on existing `PlotDataItem` objects. Invisible signals
+have `curve = None` (set by `_rebuild_overlay` which skips them to keep the
+multi-axis slot count correct), so the toggle had nothing to act on.
+
+- `_apply_visibility` now checks whether any newly-enabled signal has
+  `curve is None`. If so it falls through to a full `_rebuild_curves` call,
+  which creates the missing curve (and, in multi-axis mode, the missing
+  `ViewBox` and `AxisItem`) and restores all existing view ranges via the
+  save/restore mechanism.
+- The lightweight `setVisible` path is retained for the hide direction and
+  for cases where all visible signals already have curves, avoiding
+  unnecessary rebuild overhead.
+
+---
+
+## [v00.00.44] — 2026-06-24
+
+### Fixed — Multi-Axis mode: Y-axis drag, label, and visibility bugs
+
+**Y-axis drag only panned the first signal (all axes)**
+
+In multi-axis mode the main left `AxisItem` is widened via `setWidth()` to
+reserve margin space for the floating extra axes.  This caused it to cover
+the entire left margin and intercept all mouse drag events, so dragging on
+any Y axis always panned the first signal's ViewBox.
+
+- `_LeftAxis` (the main left axis class) now overrides `mouseDragEvent`.
+  At drag start it checks the button-down scene position against each visible
+  floating axis's `sceneBoundingRect()`; if a match is found it routes all
+  subsequent events of that gesture to the matched ViewBox via
+  `vb.mouseDragEvent(event, axis=1)`.  Dragging on the main axis falls
+  through to the default behaviour.
+- `_LeftAxis._panel` back-reference set in `PlotPanel.__init__` gives the
+  override access to `self._extra_axes` at runtime.
+
+**Main axis label changed to selected signal instead of its own signal**
+
+Clicking any row in the signal table called `_set_axis_label` which always
+labelled the main left axis from `_current_key` (the selected row).  In
+multi-axis mode this overwrote the first signal's label with whatever row
+was clicked.
+
+- `_set_axis_label` now branches on `_multi_axis`.  In the multi-axis
+  branch the main axis is labelled from the first visible signal with
+  `view_box is None` (the signal that actually uses it), regardless of
+  which row is selected.  Extra floating axes still take their labels from
+  their own signal.  The non-multi-axis (overlay) path is unchanged.
+
+**Unchecking the first signal's "Axis" checkbox collapsed the entire left margin**
+
+`_toggle_axis_visibility` called `plotted.axis.setVisible(False)` for every
+signal.  For the first signal this hid the main `PlotItem` layout member,
+collapsing the left margin to zero and destroying the space needed by all
+floating extra axes.
+
+- `_toggle_axis_visibility` now branches on `plotted.view_box is None`
+  (main axis vs floating axis).  When hiding the main axis it blanks visual
+  content (`setLabel('')`, `setTextPen(pg.mkPen(None))`,
+  `setStyle(showValues=False)`) without calling `setVisible(False)`, keeping
+  the layout intact.  Restoring re-applies the signal's label, color, and
+  tick visibility.
+- `_set_axis_label` also respects `axis_visible=False` for the main axis so
+  a selection-change event cannot accidentally re-show a deliberately hidden
+  main axis.
+
+---
+
+### Performance — MF4/MDF file loading (2–5× speedup)
+
+**Batch channel reads via `mdf.select()` (biggest win)**
+
+`MDFReader._iter_arrays` previously called `mdf.get()` once per channel.
+asammdf stores channels in "channel groups" that share a single compressed
+data block; each `mdf.get()` decompressed the entire block and discarded
+all channels except one — O(channels_per_group) wasted decompressions.
+
+- Per-group channel specs are now collected from metadata (no I/O), then
+  `mdf.select(all_channels, raw=False)` reads the entire group in **one**
+  file pass.  A second `mdf.select(enum_channels, raw=True)` pass fetches
+  raw integers for enum channels only (skipped for all-numeric groups).
+- Falls back to individual `mdf.get()` calls per channel if `select()` raises.
+- For groups with many channels the improvement is 5–20×.
+
+**Numeric `disp_list` allocation eliminated**
+
+Pure numeric channels previously called `num_arr.tolist()` — an O(n) Python
+list allocation for every channel.  `SignalStore.add_series_bulk` already
+supports `has_labels=False` which skips the `raw_values` storage entirely.
+
+- Numeric channels now yield `disp_list = []`.
+- `_run_bulk_array` passes `has_labels = len(disp_list) > 0` to
+  `add_series_bulk`, skipping the allocation for ~90% of channels.
+
+**Tree rebuild gated on interval + dirty flag**
+
+`_run_bulk_array` previously called `store.build_tree_payload()` (full sort
+of all signals) for every channel.  With 200+ channels that is 200+ sorts.
+
+- `tree_update` is now emitted only every `_BULK_PLOT_INTERVAL` (10)
+  channels **and** only when `store.is_tree_dirty()`, matching the pattern
+  used by the CAN decode path.
+
+**`is_bus_logging()` result cached**
+
+`MDFReader.is_bus_logging()` opens the file header to detect
+`CAN_DataFrame.*` channels.  The function is called by `prescan_measurement`,
+`dbc_required_for`, and `reader_factory` for the same file — three header
+opens before a single byte of signal data is read.
+
+- `MDFReader._bus_logging_cache` (class-level dict) stores the result keyed
+  by resolved absolute path.  Subsequent calls for the same path return
+  immediately from the cache.
+
+**Enum double-fetch batched**
+
+Enum channels previously made a second `mdf.get(raw=True)` call per channel.
+With `select()`-based loading these are now batched: all enum channels in a
+group are fetched together in one `mdf.select(enum_channels, raw=True)` call.
+
+---
+
+### Performance — BLF file loading (2–4× speedup on Pass 1)
+
+**Zero-object frame ingestion via `iter_raw_tuples()`**
+
+Pass 1 previously constructed a `RawFrame` dataclass per frame
+(8-field object allocation + `bytes(msg.data)` copy + `getattr` calls + type
+casts) — repeated 1–2 million times for large BLF files.
+
+- `BLFReaderService.iter_raw_tuples()` yields plain tuples
+  `(timestamp, channel_byte, arb_id, dlc, direction_int, is_extended, is_fd, data)`
+  directly from python-can `Message` objects with no intermediate objects:
+  `channel_byte` pre-computed as `(int(ch)+1) & 0xFF` or `255`; `direction_int`
+  as `0/1/2` from `is_rx`; `data` passed as the raw bytearray from python-can.
+- `BLFCANReader.iter_raw_tuples()` exposes this to `LoadWorker`.
+- `LoadWorker._run_can_raw_vectorized` detects `iter_raw_tuples` via
+  `hasattr` and uses it; falls back to the legacy `iter_frames_only` path for
+  other reader types.
+
+**Zero-allocation disk write in `RawFrameStore.append_raw()`**
+
+`RawFrameStore.append()` created three temporary `bytes` objects per frame
+(conversion → slice → zero-pad concat) × 1–2 M frames.
+
+- New `append_raw()` method uses a single pre-allocated `bytearray(64)` write
+  buffer (`self._write_buf`).  Each frame: `buf[:] = _ZEROS_64` (C-level
+  64-byte memcopy of a module constant), then `buf[:n] = data[:n]` (C-level
+  payload copy) — zero Python object allocations per frame.
+- `append_raw()` also skips the name-table dict lookup (always `nid=0` in the
+  2-pass path) and the string direction comparison (accepts `direction_int`
+  directly), saving additional per-frame Python work.
+
+**`note_frame()` removed from Pass 1 hot loop**
+
+`store.note_frame()` ran 6 operations per frame (counter increment,
+`set.add`, dict increment, conditional, f-string, list append) for every
+frame in Pass 1.
+
+- The hot loop now only calls `rfs.append_raw()` and the progress emit.
+- After `rfs.seal()`, `_bulk_compute_store_stats(store, rfs)` replicates
+  the equivalent bookkeeping in a single numpy pass:
+  `np.unique` on the channel array for channel set + frame counts; a 20-
+  iteration Python loop for `first_frame_ids`.  Pass 2 still overwrites
+  `decoded_frames` and `unmatched_frames` as before.
+
+**Choices label lookup vectorised (Pass 2)**
+
+DBC enum signals previously built `disp_list` with a Python `for v in
+numeric_arr` loop — up to 500 K iterations for common status signals.
+
+- For the common DBC case (non-negative integer keys, max key < 65 536) a
+  numpy LUT is built once from the choices dict (`lut[k] = str(v)`,
+  `lut_valid[k] = True`), then the per-sample work is done entirely via numpy
+  fancy indexing: `lut[safe_idx[has_val]]`.  No Python loop over samples.
+  A Python loop fallback is kept for non-integer keys or very large key values.
+
+---
+
+## [v00.00.43] — 2026-05-12
+
+### Changed — Diagnostics rule syntax redesigned (expression engine)
+
+**Rule format is now a plain condition expression string**
+
+The previous YAML rule system (three separate rule types: `fault_signal`,
+`range_check`, `message_loss`, with `signal_map` and dict-based operator
+syntax) has been replaced by a single unified expression engine.
+
+- `condition:` is now the only required field per rule.  Everything else
+  (`id`, `title`, `severity`, `description`, `suggested_action`,
+  `plot_signals`, `enabled`) is optional.
+- Supported operators: `>` `<` `>=` `<=` `=` `!=`
+- Boolean connectors: `and` / `or` (left-to-right, no parentheses required
+  for simple rules).
+- Signal names inside the condition are matched **case-insensitively** against
+  the full `CH<n>::<MsgName>::<SigName>` store key.  A partial name is enough.
+  Rules for absent signals are silently skipped.
+- `signal_map` block is no longer needed or used (accepted but ignored for
+  backward compatibility).
+- `type:` field removed — all rules are expression rules.
+- `context_window_s:` domain-level key controls how many seconds of data
+  before/after each fault are captured for AI diagnosis context (default 2.0 s).
+
+**`config/diagnostics/README.md` fully rewritten** to document the current
+expression syntax, all optional fields, severity aliases, and `plot_signals`
+behaviour.
+
+---
+
+## [v00.00.42] — 2026-05-11
+
+### Added — Multi-axis Y-axis spacing and per-axis visibility toggle
+
+**Proper axis spacing in Multi-Axis mode**
+
+Previously all extra Y axes were positioned at a fixed `55 × idx` offset from
+the viewport left edge, causing every axis to stack on top of the others.
+
+- `_update_multi_axis_views` now assigns axes to consecutive **slots** rather
+  than fixed index offsets: each visible axis occupies its own non-overlapping
+  panel (55 px wide, 4 px gap between panels).
+- `_rebuild_overlay` expands the left layout margin via
+  `plot.getAxis('left').setWidth(55 + n_visible × 59)` so the viewport shifts
+  right and makes room — extra axes are never clipped or overlapping the data area.
+- Hidden axes are parked off-screen (`x = −9999`) so no blank gap is left in
+  the axis area.
+
+**"Axis" column in the signal table (Multi-Axis mode only)**
+
+- Signal table expanded from 5 to 6 columns; column 5 is **"Axis"** (36 px fixed,
+  checkbox only).
+- The column is hidden in Normal and Stacked modes; it becomes visible
+  automatically when Multi-Axis is enabled.
+- Unchecking an axis checkbox hides that signal's Y axis and frees its layout
+  slot — the plot area expands horizontally to fill the recovered space.
+- Re-checking restores the axis in the next available slot.
+- The `axis_visible` state is persisted through undo snapshots and restored
+  correctly after mode switches and curve rebuilds.
+- `PlottedSignal` gains `axis_visible: bool = True` field (slot-safe).
+
+### Fixed
+
+- **Plot area did not expand when axes were hidden** — `setWidth` was computed
+  once at build time for all extra axes (visible or not).  `_toggle_axis_visibility`
+  now recomputes the required margin from currently-visible axes only and calls
+  `setWidth` immediately so the layout shrinks and the viewport grows.
+
+---
+
+## [v00.00.41] — 2026-05-11
+
+### Added — Fault auto-plot, zoom to trigger point
+
+- **Fault detection auto-plot** — when a diagnostic rule fires, the signals
+  listed under `plot_signals:` in the YAML rule are automatically added to the
+  main plot and the view zooms to the trigger point (0→1 transition) with a
+  ±0.5 s margin.  Signal list is fully configurable per rule.
+- **`plot_signals:` field in rule YAML** — list signal names to auto-plot when
+  a fault fires.  Names are matched case-insensitively against the loaded
+  measurement.  If omitted, falls back to the fault signal itself.
+- **`MainWindow.plot_finding(finding)`** — adds signals and calls
+  `plot_panel.zoom_to_time(t0, t1)`.
+- **`PlotPanel.zoom_to_time(t_start, t_end, margin=0.5)`** — zooms X to
+  `[t_start − margin, t_end + margin]` and calls `fit_vertical()` to rescale Y.
+  Works in all three plot modes (Normal, Multi-Axis, Stacked).
+- **`DiagnosticContext.resolve_signal_key(name)`** — silent case-insensitive
+  lookup that returns the full store key without writing to the progress log.
+- **`Finding.plot_signals`** — new field (`list[str]`) carrying resolved store
+  keys for the signals to auto-plot.
+
+### Fixed — Cursor drag responsiveness
+
+- **`_nearest_index`** replaced Python `while` binary-search loop with
+  `np.searchsorted` (C-level, O(log n)).
+- **`_row_lookup`** — key → table-row mapping rebuilt once in `_refresh_table`
+  and cached; `_update_table_values` uses it directly (eliminates O(rows) scan
+  on every drag event).
+- **`SignalProxy` removed** — direct `scene.sigMouseMoved.connect(slot)`
+  replaces `pg.SignalProxy(rateLimit=60)`, eliminating up to 16 ms of
+  artificial throttle.  `_mouse_moved` signature changed from `(event: tuple)`
+  to `(pos)` to match the direct signal.
+- **`setUpdatesEnabled(False/True)`** wraps `_update_table_values` so the
+  entire cursor-value column update triggers one repaint instead of one per cell.
+
+### Fixed — Show/hide data points hang on large files (>150 MB)
+
+- **Style-only update path** — `_apply_curve_style(set_data=False)` uses
+  per-property setters (`setPen`, `setSymbol`, `setSymbolSize`, etc.) instead
+  of `setData(full_arrays)`.  The data arrays are never re-read; toggle is instant.
+- **`setClipToView(True)` + `setDownsampling(auto=True, method='peak')`** added
+  to every new `PlotDataItem` via `_configure_curve()`.  Only viewport-visible
+  samples are rendered; out-of-view samples are skipped by pyqtgraph.
+- **`np.asarray` instead of `np.frombuffer`** in the data-set path — zero-copy
+  via buffer protocol and returns a writable array as required by pyqtgraph
+  internals (`np.frombuffer` returns read-only).
+
+---
+
+## [v00.00.40] — 2026-05-07
 
 ### Added — DBC Manager channel pre-scan
 
@@ -33,7 +380,7 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
-## [v00.00.38] — 2026-05-07
+## [v00.00.39] — 2026-05-07
 
 ### Added — Vectorized BLF/ASC decode (30× faster)
 

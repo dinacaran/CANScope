@@ -52,6 +52,7 @@ import numpy as np
 # ── Constants ─────────────────────────────────────────────────────────────
 _DATA_BYTES        = 64          # bytes of raw data stored per frame (CAN FD max)
 _DIR_RX,_DIR_TX,_DIR_UNK = 0, 1, 2
+_ZEROS_64          = b'\x00' * _DATA_BYTES   # module-level constant — no allocation per frame
 _LARGE_STORE_LIMIT = 500_000     # frames; disable data-hex search above this
 
 _DIR_STRINGS = ['Rx', 'Tx', 'Unknown']
@@ -103,6 +104,10 @@ class RawFrameStore:
         self._mmap:      mmap.mmap | None = None   # read phase (after seal)
         self._sealed = False
 
+        # Pre-allocated 64-byte buffer for zero-copy disk writes (Bottleneck 2).
+        # Re-used on every append_raw() call — no per-frame bytes() allocation.
+        self._write_buf: bytearray = bytearray(_DATA_BYTES)
+
         # Create temp file immediately
         fd, path = tempfile.mkstemp(prefix='canscope_', suffix='.rawdata')
         self._data_path = path
@@ -147,6 +152,38 @@ class RawFrameStore:
         # Write data bytes to disk (pad to _DATA_BYTES)
         raw = bytes(data)[:_DATA_BYTES]
         self._data_file.write(raw + b'\x00' * (_DATA_BYTES - len(raw)))
+
+    def append_raw(self, timestamp: float, channel_byte: int,
+                   arb_id: int, dlc: int, direction_int: int,
+                   is_extended: bool, is_fd: bool, data) -> None:
+        """
+        Optimised append for the 2-pass load path.
+
+        Differences from :meth:`append` that eliminate hot-loop overhead:
+
+        * Accepts ``channel_byte`` (uint8, 255=None) — skips None→255 branch.
+        * Accepts ``direction_int`` (0/1/2) — skips string comparison.
+        * Always ``frame_name=''``, ``decoded=False`` — skips name-table
+          lookup (always ``nid=0``) and the decoded-bit shift (Bottleneck 4).
+        * Disk write uses a pre-allocated ``bytearray`` buffer filled by two
+          C-level memcopy calls instead of three temporary ``bytes`` objects
+          (Bottleneck 2).
+        """
+        self.timestamps.append(timestamp)
+        self.channels.append(channel_byte)
+        self.arb_ids.append(arb_id & 0xFFFF_FFFF)
+        self.dlcs.append(min(dlc, 255))
+        self.directions.append(direction_int)
+        self.flags.append((1 if is_extended else 0) | (2 if is_fd else 0))
+        self.name_ids.append(0)   # always '' for 2-pass path
+
+        # Zero-copy disk write: zero the buffer, copy data in — no bytes alloc.
+        buf = self._write_buf
+        n   = min(len(data), _DATA_BYTES)
+        buf[:] = _ZEROS_64        # C-level memcopy of 64 B, no Python object
+        if n:
+            buf[:n] = data[:n]    # C-level memcopy of payload
+        self._data_file.write(buf)
 
     def seal(self) -> None:
         """

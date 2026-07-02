@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────
+#  CANScope diagnostics — Motor Control fault rules
+#
+#  Each rule is just:
+#    condition: <signal> <operator> <value>  [and|or  <signal> <operator> <value> ...]
+#
+#  Operators:  >   <   >=   <=   =   !=
+#  Boolean:    and   or
+#
+#  Examples:
+#    condition: EDS_Err > 0
+#    condition: MotorTemp > 130
+#    condition: MotorTemp > 120 and MotorTemp < 135
+#    condition: Status = 3 or Status = 5
+#    condition: EDS_Err = 1 and EDS_sts = 2
+#
+#  Signal names are matched case-insensitively against the loaded measurement.
+#  After editing, click "Reload Rules" in the Diagnostics window.
+# ─────────────────────────────────────────────────────────────────────────
+
+domain: Motor Control
+description: Fault rules for motor controllers and inverters.
+
+# Seconds of data captured before and after each fault for AI diagnosis context.
+context_window_s: 1.0
+
+rules:
+
+  - condition: EDS_Err > 0
+    # Signals to auto-plot (and zoom to) when this fault fires.
+    # Add any related signal names you want visible alongside the fault signal.
+    # Names are matched case-insensitively against the loaded measurement.
+    plot_signals:
+     - EDS_Err       # the fault signal itself
+     - EDS_sts     # optional related signals — remove if not present
+     - EngSpeed
+
+ # - condition: EDS_sts = 1 or EDS_sts = 2

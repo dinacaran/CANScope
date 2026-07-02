@@ -6,8 +6,8 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF
-from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QSize
+from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QPen, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QInputDialog,
@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -28,6 +30,46 @@ from core.signal_store import SignalSeries
 from gui.signal_tree import SignalTreeWidget
 
 
+class _LeftAxis(pg.AxisItem):
+    """Left AxisItem that keeps its title adjacent to tick labels even when setWidth()
+    expands the item far beyond its natural content width.
+
+    Also routes Y-axis drag events to the correct floating ViewBox when in
+    multi-axis mode.  The expanded setWidth() causes this item to cover the
+    entire left margin, so without the override every drag would pan only the
+    main ViewBox regardless of which floating axis the user clicked on.
+    """
+
+    def __init__(self) -> None:
+        super().__init__('left')
+        self._title_x: float | None = None  # if set, overrides pyqtgraph's default x=-5
+        self._panel: Any = None             # set by PlotPanel after construction
+        self._drag_vb: Any = None           # floating ViewBox claimed at drag start
+
+    def mouseDragEvent(self, event) -> None:
+        panel = self._panel
+        if panel is not None and panel._extra_axes:
+            if event.isStart():
+                self._drag_vb = None
+                scene_pos = event.buttonDownScenePos()
+                for axis, vb in panel._extra_axes:
+                    if axis.isVisible() and axis.sceneBoundingRect().contains(scene_pos):
+                        self._drag_vb = vb
+                        break
+            if self._drag_vb is not None:
+                self._drag_vb.mouseDragEvent(event, axis=1)
+                if event.isFinish():
+                    self._drag_vb = None
+                return
+        super().mouseDragEvent(event)
+
+    def resizeEvent(self, ev=None) -> None:
+        super().resizeEvent(ev)
+        title_x = getattr(self, '_title_x', None)
+        if title_x is not None and self.label is not None and self.label.isVisible():
+            self.label.setX(title_x)
+
+
 @dataclass(slots=True)
 class PlottedSignal:
     key: str
@@ -36,8 +78,9 @@ class PlottedSignal:
     color: str
     axis: Any = None
     view_box: Any = None
-    visible: bool = True   # checkbox state — False hides curve and stacked row
-    group: str = ''        # '' = ungrouped; any string = group name
+    visible: bool = True        # checkbox state — False hides curve and stacked row
+    group: str = ''             # '' = ungrouped; any string = group name
+    axis_visible: bool = True   # multi-axis mode: show/hide the Y axis for this signal
 
 
 
@@ -121,6 +164,106 @@ class _StackedLeftAxis(pg.AxisItem):
         label.set_clip_x(max(0.0, ax_h - 2 * m))
 
 
+# Manual checkbox paint — QSS ::indicator with SVG mark was unreliable across PySide6 versions.
+class _CheckDelegate(QStyledItemDelegate):
+    """Paints checkable table cells with theme-aware border, fill,
+    and checkmark. Non-checkable cells fall through to default."""
+
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self._panel = panel  # PlotPanel — read theme colours from it
+
+    def paint(self, painter: QPainter, option, index):
+        flags = index.flags()
+        if not (flags & Qt.ItemFlag.ItemIsUserCheckable):
+            super().paint(painter, option, index)
+            return
+
+        # Background — respect per-item background brush (group header rows use one)
+        bg_brush = index.data(Qt.ItemDataRole.BackgroundRole)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        elif bg_brush is not None:
+            painter.fillRect(option.rect, bg_brush)
+        else:
+            painter.fillRect(option.rect, option.palette.base())
+
+        t = self._panel._theme_colors()
+        state = index.data(Qt.ItemDataRole.CheckStateRole)
+        checked = (state == Qt.CheckState.Checked.value or
+                   state == Qt.CheckState.Checked)
+        partial = (state == Qt.CheckState.PartiallyChecked.value or
+                   state == Qt.CheckState.PartiallyChecked)
+
+        # Text (group header arrow) — left-aligned; reserve right edge for checkbox
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            fg_brush = index.data(Qt.ItemDataRole.ForegroundRole)
+            if option.state & QStyle.StateFlag.State_Selected:
+                painter.setPen(option.palette.highlightedText().color())
+            elif fg_brush is not None:
+                painter.setPen(fg_brush.color())
+            else:
+                painter.setPen(option.palette.text().color())
+            font = index.data(Qt.ItemDataRole.FontRole)
+            if font is not None:
+                painter.setFont(font)
+            text_rect = option.rect.adjusted(2, 0, -18, 0)
+            painter.drawText(text_rect,
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             str(text))
+            # Checkbox on the right side when text is present
+            box = 14
+            cx = option.rect.right() - box - 2
+            cy = option.rect.center().y() - box // 2
+        else:
+            # No text — centre the checkbox
+            box = 14
+            cx = option.rect.center().x() - box // 2
+            cy = option.rect.center().y() - box // 2
+
+        rect = QRectF(cx, cy, box, box)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Border + fill
+        painter.setPen(QPen(QColor(t['check_border']), 1.2))
+        painter.setBrush(QBrush(QColor(t['check_bg'])))
+        painter.drawRoundedRect(rect, 2, 2)
+        # Checkmark
+        if checked:
+            pen = QPen(QColor(t['check_mark']), 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            x, y = rect.x(), rect.y()
+            painter.drawPolyline([
+                QPointF(x + 3,        y + box * 0.55),
+                QPointF(x + box*0.42, y + box * 0.78),
+                QPointF(x + box - 3,  y + box * 0.28),
+            ])
+        elif partial:
+            # Dash for partially-checked group header rows
+            pen = QPen(QColor(t['check_mark']), 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            mid_y = rect.center().y()
+            painter.drawLine(
+                QPointF(rect.x() + 3, mid_y),
+                QPointF(rect.right() - 3, mid_y),
+            )
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QSize(22, 22)
+
+    def editorEvent(self, event, model, option, index):
+        # Preserve native click-to-toggle behaviour.
+        return super().editorEvent(event, model, option, index)
+
+
 class PlotPanel(QWidget):
     selectionChanged = Signal(str)
     signalDropped = Signal(list)
@@ -142,7 +285,8 @@ class PlotPanel(QWidget):
         # (one InfiniteLine per row — they cannot be shared across scenes)
         self._stacked_c1_lines: list[pg.InfiniteLine] = []
         self._stacked_c2_lines: list[pg.InfiniteLine] = []
-        self._proxy = None
+        self._proxy = None          # legacy name kept; now stores the connected scene
+        self._row_lookup: dict[str, int] = {}   # key → table row; rebuilt by _refresh_table
         self._color_cycle = cycle([
             '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
             '#a65628', '#f781bf', '#17becf', '#bcbd22', '#1f77b4',
@@ -161,10 +305,13 @@ class PlotPanel(QWidget):
         self._cursor2_enabled: bool = False
         self._group_vis_changed: bool = False  # True when itemChanged fired before cellClicked
         self._batch_mode: bool = False          # True while batch-adding signals; suppresses per-add rebuilds
+        self._rebuild_seq: int = 0              # bumped each rebuild and by fit_to_window(); lets deferred restores detect staleness
         self.setAcceptDrops(True)
 
         # ── Normal / multi-axis plot ──────────────────────────────────────
-        self.plot = pg.PlotWidget()
+        _left_axis = _LeftAxis()
+        self.plot = pg.PlotWidget(axisItems={'left': _left_axis})
+        _left_axis._panel = self  # enables multi-axis drag routing in mouseDragEvent
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self._legend = self.plot.addLegend()
         self.plot.setLabel('bottom', 'Time (seconds)')
@@ -227,9 +374,9 @@ class PlotPanel(QWidget):
         # v_line2 not added to plot until cursor 2 is enabled
 
         # ── Signal table ──────────────────────────────────────────────────
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit'])
+            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit', 'Axis'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemSelectionChanged.connect(self._emit_selection)
@@ -242,19 +389,21 @@ class PlotPanel(QWidget):
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
         hdr.setStretchLastSection(False)
-        # Fix 1: all three columns user-resizable
-        hdr.setMinimumSectionSize(0)  # allow col 0 to be as narrow as we set it
+        hdr.setMinimumSectionSize(0)
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)      # ☑
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive) # Signal
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive) # Cursor 1
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive) # Cursor 2
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive) # Unit
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Axis
         self.table.setColumnWidth(0, 36)    # ☑ checkbox + group arrow
         self.table.setColumnWidth(1, 190)   # Signal
         self.table.setColumnWidth(2, 90)    # Cursor 1
         self.table.setColumnWidth(3, 90)    # Cursor 2
         self.table.setColumnWidth(4, 55)    # Unit
+        self.table.setColumnWidth(5, 36)    # Axis (multi-axis mode only)
         self.table.setColumnHidden(3, True) # hidden until cursor 2 enabled
+        self.table.setColumnHidden(5, True) # hidden until multi-axis mode enabled
 
         self.table_panel = QWidget()
         _tbl_layout = QVBoxLayout(self.table_panel)
@@ -268,6 +417,9 @@ class PlotPanel(QWidget):
         self.table.dragMoveEvent  = self._table_drag_enter   # same check
         self.table.dropEvent      = self._table_drop
         self._apply_panel_background()
+        self._check_delegate = _CheckDelegate(self, self.table)
+        self.table.setItemDelegateForColumn(0, self._check_delegate)
+        self.table.setItemDelegateForColumn(5, self._check_delegate)
 
         # ── Root layout ───────────────────────────────────────────────────
         _root = QVBoxLayout(self)
@@ -304,12 +456,21 @@ class PlotPanel(QWidget):
 
     def set_show_points(self, show: bool) -> None:
         self._show_points = bool(show)
-        # Bug 2 fix: applies to ALL plotted signals (PlotDataItem supports symbols)
-        for plotted in self._items.values():
-            self._apply_curve_style(plotted)
+        # In stacked mode each PlotItem triggers its own repaint when its curve
+        # style changes.  Suppress individual paint events so all N rows coalesce
+        # into one repaint pass when setUpdatesEnabled(True) is restored.
+        if self._stacked_mode:
+            self.glw.setUpdatesEnabled(False)
+        try:
+            for plotted in self._items.values():
+                self._apply_curve_style(plotted, set_data=False)
+        finally:
+            if self._stacked_mode:
+                self.glw.setUpdatesEnabled(True)
 
     def set_multi_axis(self, enabled: bool) -> None:
         self._multi_axis = bool(enabled)
+        self.table.setColumnHidden(5, not self._multi_axis)
         self._rebuild_curves(preserve_selection=True)
         self.fit_to_window()
 
@@ -416,18 +577,23 @@ class PlotPanel(QWidget):
         if not self._batch_mode:
             self._push_undo()
         color = color or next(self._color_cycle)
+        was_empty = not self._items
         self._items[key] = PlottedSignal(key=key, series=series, curve=None, color=color)
         if self._current_key is None:
             self._current_key = key
         if not self._batch_mode:
             self._rebuild_curves(preserve_selection=True)
             self._update_empty_state_ui()
-            self.fit_to_window()
+            # Only auto-fit when adding the very first signal; otherwise
+            # _rebuild_curves has already restored the saved view range.
+            if was_empty:
+                self.fit_to_window()
 
     def begin_batch_add(self) -> None:
         """Start a batch-add session. Suppresses per-signal rebuilds; call end_batch_add() when done."""
         self._push_undo()
         self._batch_mode = True
+        self._batch_started_empty = not bool(self._items)
 
     def end_batch_add(self) -> None:
         """Finish a batch-add session. Triggers a single rebuild + fit for all queued signals."""
@@ -435,7 +601,10 @@ class PlotPanel(QWidget):
         if self._items:
             self._rebuild_curves(preserve_selection=True)
             self._update_empty_state_ui()
-            self.fit_to_window()
+            # Auto-fit only when the plot was empty before the batch (e.g. loading
+            # a config into an empty plot); otherwise preserve the existing view.
+            if self._batch_started_empty:
+                self.fit_to_window()
 
     # ── Internal: clear all rendered items ────────────────────────────────
 
@@ -530,18 +699,47 @@ class PlotPanel(QWidget):
     def _rebuild_curves(self, preserve_selection: bool = False) -> None:
         selected = self.selected_keys() if preserve_selection else []
 
-        # Save X view range and cursor positions before destroying rendered items
+        # Save X and Y view ranges before destroying rendered items so that
+        # add/remove operations don't snap the viewport back to full extent.
         _saved_xr: list | None = None
+        _saved_yr: list | None = None          # standard overlay: one shared Y range
+        _saved_yr_by_key: dict[str, list] = {}  # stacked / multi-axis: per-signal key
+
         if self._stacked_mode and self._stacked_plots:
             try:
                 _saved_xr = list(self._stacked_plots[0].vb.viewRange()[0])
             except Exception:
                 pass
+            order = [k for k, p in self._items.items() if p.visible]
+            for i, key in enumerate(order):
+                if i < len(self._stacked_plots):
+                    try:
+                        _saved_yr_by_key[key] = list(self._stacked_plots[i].vb.viewRange()[1])
+                    except Exception:
+                        pass
         elif not self._stacked_mode:
             try:
                 _saved_xr = list(self.plot.plotItem.vb.viewRange()[0])
             except Exception:
                 pass
+            if self._multi_axis:
+                first_visible = True
+                for key, plotted in self._items.items():
+                    if not plotted.visible:
+                        continue
+                    try:
+                        if first_visible or plotted.view_box is None:
+                            _saved_yr_by_key[key] = list(self.plot.plotItem.vb.viewRange()[1])
+                        else:
+                            _saved_yr_by_key[key] = list(plotted.view_box.viewRange()[1])
+                    except Exception:
+                        pass
+                    first_visible = False
+            else:
+                try:
+                    _saved_yr = list(self.plot.plotItem.vb.viewRange()[1])
+                except Exception:
+                    pass
 
         self._clear_rendered_items()
 
@@ -550,24 +748,125 @@ class PlotPanel(QWidget):
             self._update_empty_state_ui()
             return
 
+        # Each rebuild gets a unique sequence number.  The closures below
+        # capture it so a deferred restore can bail out if fit_to_window()
+        # or a newer rebuild has run in the meantime.
+        self._rebuild_seq += 1
+        _seq = self._rebuild_seq
+
         if self._stacked_mode:
             self.view_stack.setCurrentIndex(1)
             self._rebuild_stacked()
-            # Restore X range so the view doesn't jump when rows are added/removed
-            if _saved_xr and self._stacked_plots:
-                try:
-                    self._stacked_plots[0].setXRange(_saved_xr[0], _saved_xr[1], padding=0)
-                except Exception:
-                    pass
+
+            def _restore_stacked() -> None:
+                # Bail if a newer rebuild or fit_to_window() supersedes us.
+                if self._rebuild_seq != _seq:
+                    return
+                if _saved_xr and self._stacked_plots:
+                    try:
+                        self._stacked_plots[0].setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    except Exception:
+                        pass
+                if _saved_yr_by_key and self._stacked_plots:
+                    order_after = [k for k, p in self._items.items() if p.visible]
+                    for i, key in enumerate(order_after):
+                        if i < len(self._stacked_plots) and key in _saved_yr_by_key:
+                            try:
+                                yr = _saved_yr_by_key[key]
+                                self._stacked_plots[i].setYRange(yr[0], yr[1], padding=0)
+                            except Exception:
+                                pass
+                # Disable auto-range so pyqtgraph's deferred updateAutoRange()
+                # (queued by curve.setData inside _rebuild_stacked) cannot
+                # override the restored ranges. fit_to_window() re-enables it.
+                for p in self._stacked_plots:
+                    try:
+                        p.vb.enableAutoRange(x=False, y=False)
+                        p.vb.setAutoVisible(x=False, y=False)
+                    except Exception:
+                        pass
+
+            # Synchronous pass locks in the range before Qt paints the frame.
+            # Deferred pass (singleShot 0) runs after pyqtgraph's own
+            # singleShot-0 auto-range update that setData() queues.
+            _restore_stacked()
+            QTimer.singleShot(0, _restore_stacked)
         else:
             self.view_stack.setCurrentIndex(0)
             self._rebuild_overlay()
-            # Restore X range for overlay mode
-            if _saved_xr:
+
+            def _restore_overlay() -> None:
+                # Bail if a newer rebuild or fit_to_window() supersedes us.
+                if self._rebuild_seq != _seq:
+                    return
+                if _saved_xr:
+                    try:
+                        self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    except Exception:
+                        pass
+                if self._multi_axis and _saved_yr_by_key:
+                    first_visible = True
+                    for key, plotted in self._items.items():
+                        if not plotted.visible or key not in _saved_yr_by_key:
+                            continue
+                        try:
+                            yr = _saved_yr_by_key[key]
+                            if first_visible or plotted.view_box is None:
+                                self.plot.setYRange(yr[0], yr[1], padding=0)
+                            else:
+                                plotted.view_box.setYRange(yr[0], yr[1], padding=0)
+                        except Exception:
+                            pass
+                        first_visible = False
+                elif _saved_yr:
+                    try:
+                        self.plot.setYRange(_saved_yr[0], _saved_yr[1], padding=0)
+                    except Exception:
+                        pass
+                # Auto-fit Y for newly added signals that have no saved range.
+                # Only applies to floating ViewBoxes (idx > 0 in multi-axis);
+                # the first signal's VB is the main one and is handled above.
+                if self._multi_axis:
+                    for key, plotted in self._items.items():
+                        if not plotted.visible or plotted.view_box is None:
+                            continue
+                        if key in _saved_yr_by_key:
+                            continue
+                        try:
+                            y = np.asarray(plotted.series.values, dtype=np.float64)
+                            finite = y[np.isfinite(y)]
+                            if len(finite):
+                                ymin, ymax = float(finite.min()), float(finite.max())
+                                if ymin == ymax:
+                                    ymin, ymax = ymin - 0.5, ymax + 0.5
+                                pad = (ymax - ymin) * 0.05
+                                plotted.view_box.setYRange(ymin - pad, ymax + pad, padding=0)
+                        except Exception:
+                            pass
+                # Disable auto-range on every affected ViewBox so pyqtgraph's
+                # deferred updateAutoRange() (queued by curve.setData inside
+                # _rebuild_overlay) cannot override the restored ranges.
+                # fit_to_window() re-enables it explicitly when needed.
                 try:
-                    self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
+                    vb = self.plot.plotItem.vb
+                    vb.enableAutoRange(x=False, y=False)
+                    vb.setAutoVisible(x=False, y=False)
                 except Exception:
                     pass
+                if self._multi_axis:
+                    for plotted in self._items.values():
+                        if plotted.view_box is not None:
+                            try:
+                                plotted.view_box.enableAutoRange(x=False, y=False)
+                                plotted.view_box.setAutoVisible(x=False, y=False)
+                            except Exception:
+                                pass
+
+            # Synchronous pass locks in the range before Qt paints the frame.
+            # Deferred pass (singleShot 0) runs after pyqtgraph's own
+            # singleShot-0 auto-range update that setData() queues.
+            _restore_overlay()
+            QTimer.singleShot(0, _restore_overlay)
 
         self._set_axis_label(self._current_key)
         self._refresh_table()
@@ -594,26 +893,37 @@ class PlotPanel(QWidget):
             vis_idx += 1
 
             if self._multi_axis and idx > 0:
-                # ── BUG 1 FIX ──
                 # Use PlotDataItem (not PlotCurveItem) so symbol kwargs work.
                 # sigResized is connected below so geometry is maintained on resize.
                 axis = pg.AxisItem('left')
                 vb   = pg.ViewBox()
+                # Lock auto-range OFF before X-linking — otherwise the first
+                # setData on this curve triggers auto-range that propagates
+                # through the link and resets the main plot's X.
+                vb.enableAutoRange(x=False, y=False)
+                vb.setAutoVisible(x=False, y=False)
                 self.plot.plotItem.scene().addItem(vb)
                 self.plot.plotItem.scene().addItem(axis)
                 axis.linkToView(vb)
                 vb.setXLink(self.plot.plotItem.vb)
-                curve = pg.PlotDataItem()       # <-- was PlotCurveItem
+                curve = pg.PlotDataItem()
+                self._configure_curve(curve)
                 vb.addItem(curve)
                 plotted.curve     = curve
                 plotted.axis      = axis
                 plotted.view_box  = vb
                 self._extra_axes.append((axis, vb))
+                # Restore axis visibility state (toggled via Axis column checkbox)
+                axis.setVisible(plotted.axis_visible)
             else:
                 curve = self.plot.plot([], [], name=key)
+                self._configure_curve(curve)
                 plotted.curve    = curve
                 plotted.axis     = self.plot.getAxis('left')
                 plotted.view_box = None
+                # First signal uses main left axis — respect its axis_visible flag
+                if self._multi_axis:
+                    self.plot.getAxis('left').setVisible(plotted.axis_visible)
 
             self._apply_curve_style(plotted)
             try:
@@ -622,10 +932,25 @@ class PlotPanel(QWidget):
                 pass
 
         if self._extra_axes:
+            # Reserve left-margin space for VISIBLE extra axes only.
+            n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
+            total_left_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            main_axis = self.plot.getAxis('left')
+            main_axis.setWidth(total_left_w)
+            # Anchor the main axis title adjacent to its tick labels rather than at
+            # the far-left of the expanded axis item (pyqtgraph default is x = -5).
+            # _title_x is read by _LeftAxis.resizeEvent on every resize.
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = total_left_w - self._MAIN_AXIS_W - 5
             # Connect once; disconnect happens in _clear_rendered_items
             self.plot.plotItem.vb.sigResized.connect(self._update_multi_axis_views)
-            # Defer initial geometry until widget is painted
+            # Defer initial geometry until widget is painted and layout has settled
             QTimer.singleShot(10, self._update_multi_axis_views)
+        else:
+            # Reset title anchor when no extra axes are present
+            main_axis = self.plot.getAxis('left')
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = None
 
     def _rebuild_stacked(self) -> None:
         """
@@ -686,6 +1011,7 @@ class PlotPanel(QWidget):
                 p.setXLink(ref_plot)
 
             curve = pg.PlotDataItem()
+            self._configure_curve(curve)
             p.addItem(curve)
             plotted.curve    = curve
             plotted.axis     = p.getAxis('left')
@@ -730,45 +1056,95 @@ class PlotPanel(QWidget):
 
             self._stacked_plots.append(p)
 
-    # ── Curve style ───────────────────────────────────────────────────────
+    # ── Curve configuration & style ──────────────────────────────────────
+
+    @staticmethod
+    def _configure_curve(curve: pg.PlotDataItem) -> None:
+        """One-time performance settings applied to every new PlotDataItem.
+
+        clipToView  — pyqtgraph only sends samples inside the current
+                      viewport to the renderer; the rest are never touched.
+                      For a 150 MB file this keeps every redraw O(visible)
+                      instead of O(total).
+        autoDownsample / peak — when many samples map to the same pixel,
+                      collapse them to min+max so fault spikes are never
+                      missed even at high zoom-out levels.
+        """
+        curve.setClipToView(True)
+        curve.setDownsampling(auto=True, method='peak')   # kwarg is 'method', not 'mode'
 
     def _apply_curve_style(self, plotted: PlottedSignal,
-                           selected: bool = False) -> None:
-        """
-        Apply pen style.  Selected curves are drawn thicker (5.0 vs 2.8).
+                           selected: bool = False,
+                           set_data: bool = True) -> None:
+        """Apply pen + symbol style.  Selected curves are drawn thicker.
+
+        set_data=True  (default, called on initial add): pushes the full
+            data buffer into pyqtgraph via setData().
+        set_data=False (style toggle / highlight change): uses cheap
+            per-property setters so the data arrays are never re-read.
+            This is what makes show/hide points instant on large files.
         """
         if plotted.curve is None:
             return
-        ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
-        vs = np.asarray(plotted.series.values,     dtype=np.float64)
         width = 5.0 if selected else 2.8
-        kwargs: dict = {
-            'pen':     pg.mkPen(color=plotted.color, width=width),
-            'connect': 'finite',
-        }
-        if self._show_points:
-            kwargs.update({
-                'symbol':     'o',
-                'symbolSize':  5,
-                'symbolBrush': plotted.color,
-                'symbolPen':   pg.mkPen(color=plotted.color, width=1.2),
-            })
+        pen   = pg.mkPen(color=plotted.color, width=width)
+
+        if set_data:
+            # np.asarray on array.array('d') is zero-copy via the buffer
+            # protocol and returns a writable view — required by pyqtgraph.
+            ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
+            vs = np.asarray(plotted.series.values,     dtype=np.float64)
+            kwargs: dict = {'pen': pen, 'connect': 'finite'}
+            if self._show_points:
+                kwargs.update({
+                    'symbol':     'o',
+                    'symbolSize':  5,
+                    'symbolBrush': plotted.color,
+                    'symbolPen':   pg.mkPen(color=plotted.color, width=1.2),
+                })
+            else:
+                kwargs['symbol'] = None
+            plotted.curve.setData(ts, vs, **kwargs)
         else:
-            kwargs['symbol'] = None
-        plotted.curve.setData(ts, vs, **kwargs)
+            # Style-only path: use individual setters — each calls updateItems()
+            # internally, but actual Qt repaints are batched by the caller via
+            # setUpdatesEnabled(False/True) in set_show_points (stacked mode) and
+            # _refresh_highlight, so we still get only one render pass.
+            #
+            # NOTE: opts.update()+updateItems(styleUpdate=True) looks faster but
+            # styleUpdate=True calls scatter.updateSpots() which only refreshes
+            # EXISTING spot styles — it never pushes data into an empty scatter.
+            # Going from symbol=None → 'o' produces zero dots with that path.
+            plotted.curve.setPen(pen)
+            if self._show_points:
+                plotted.curve.setSymbol('o')
+                plotted.curve.setSymbolSize(5)
+                plotted.curve.setSymbolBrush(pg.mkBrush(plotted.color))
+                plotted.curve.setSymbolPen(pg.mkPen(color=plotted.color, width=1.2))
+            else:
+                plotted.curve.setSymbol(None)
 
     def _refresh_highlight(self) -> None:
         """Update curve thickness to reflect current table selection."""
         sel = set(self.selected_keys())
         for key, plotted in self._items.items():
             if plotted.curve is not None and plotted.visible:
-                self._apply_curve_style(plotted, selected=(key in sel))
+                self._apply_curve_style(plotted, selected=(key in sel),
+                                        set_data=False)
 
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
+    # Width constants for multi-axis layout
+    _MAIN_AXIS_W: int = 55        # width of the main (first) left axis ticks+labels
+    _MAIN_AXIS_TITLE_W: int = 20  # extra reserve for the rotated axis title (renders at far-left of setWidth area)
+    _EXTRA_AXIS_W: int = 55       # width of each additional floating axis
+    _EXTRA_AXIS_GAP: int = 4      # gap between adjacent axis panels
+
     def _update_multi_axis_views(self) -> None:
         """
-        Bug 1 fix: position floating ViewBoxes + axes to the LEFT of main plot.
+        Position floating ViewBoxes + axes to the LEFT of main plot.
+        Only VISIBLE extra axes occupy layout slots — hidden axes are parked
+        off-screen so their space is reclaimed by the viewport.
         Called on sigResized so geometry stays correct after window resize.
         """
         if not self._extra_axes:
@@ -777,19 +1153,31 @@ class PlotPanel(QWidget):
         if rect.width() < 10:                       # widget not yet painted
             QTimer.singleShot(20, self._update_multi_axis_views)
             return
-        axis_width = 55
-        for idx, (axis, vb) in enumerate(self._extra_axes, start=1):
+        aw  = self._EXTRA_AXIS_W
+        gap = self._EXTRA_AXIS_GAP
+        mw  = self._MAIN_AXIS_W
+        # Update ViewBox geometry for all axes (visible and hidden).
+        for axis, vb in self._extra_axes:
             vb.setGeometry(rect)
             vb.linkedViewChanged(self.plot.plotItem.vb, vb.XAxis)
-            x = rect.left() - axis_width * idx
-            axis.setGeometry(QRectF(x, rect.top(), axis_width, rect.height()))
+
+        slot = 0
+        for axis, vb in reversed(self._extra_axes):
+            if axis.isVisible():
+                x = rect.left() - mw - gap - aw - slot * (aw + gap)
+                axis.setGeometry(QRectF(x, rect.top(), aw, rect.height()))
+                slot += 1
+            else:
+                # Park off-screen — invisible, no overlap with plot area
+                axis.setGeometry(QRectF(-9999, rect.top(), 1, rect.height()))
 
     # ── Mouse proxy management ────────────────────────────────────────────
 
     def _setup_mouse_proxy(self) -> None:
+        # Disconnect the previous scene first
         if self._proxy is not None:
             try:
-                self._proxy.disconnect()
+                self._proxy.sigMouseMoved.disconnect(self._mouse_moved)
             except Exception:
                 pass
             self._proxy = None
@@ -799,9 +1187,10 @@ class PlotPanel(QWidget):
             if (self._stacked_mode and self._stacked_plots)
             else self.plot.scene()
         )
-        self._proxy = pg.SignalProxy(
-            scene.sigMouseMoved, rateLimit=60, slot=self._mouse_moved
-        )
+        # Direct connection — no SignalProxy throttle, so the h-line and cursor
+        # updates fire immediately on every mouse-move instead of up to 16 ms late.
+        scene.sigMouseMoved.connect(self._mouse_moved)
+        self._proxy = scene   # keep ref so we can disconnect on next rebuild
         # Fix 2: connect right-click handler for stacked mode
         if self._stacked_mode and self._stacked_plots:
             try:
@@ -813,30 +1202,53 @@ class PlotPanel(QWidget):
 
     def _on_stacked_c1_moved(self) -> None:
         """Sync all stacked C1 lines when any one is dragged."""
+        # ── Re-entry guard ──────────────────────────────────────────────────
+        # setPos() on each non-sender line re-fires sigPositionChanged, which
+        # would call this handler again for every line — O(n²) updates per
+        # drag event.  The flag is set BEFORE the loop and checked HERE so the
+        # recursive call returns immediately.
+        if getattr(self, '_syncing_c1', False):
+            return
         if not self._stacked_c1_lines:
             return
-        # Find which line triggered (the one that moved)
-        # Use the first line as the master position source since they're all
-        # connected to this handler and we just want consistency
         x = self.sender().value() if self.sender() else self._stacked_c1_lines[0].value()
-        self.v_line.setPos(x)   # keep normal-mode cursor in sync too
+        # Sync v_line silently — blockSignals prevents _on_cursor1_moved from
+        # firing and doing a redundant _update_table_values pass.
+        self.v_line.blockSignals(True)
+        self.v_line.setPos(x)
+        self.v_line.blockSignals(False)
+        # Batch all per-row line moves into one scene repaint.
         self._syncing_c1 = True
-        for line in self._stacked_c1_lines:
-            if line is not self.sender():
-                line.setPos(x)
-        self._syncing_c1 = False
+        self.glw.setUpdatesEnabled(False)
+        try:
+            for line in self._stacked_c1_lines:
+                if line is not self.sender():
+                    line.setPos(x)
+        finally:
+            self._syncing_c1 = False
+            self.glw.setUpdatesEnabled(True)
         self._update_table_values(x, col=2)
         self._update_cursor_labels()
 
     def _on_stacked_c2_moved(self) -> None:
         """Sync all stacked C2 lines when any one is dragged."""
+        if getattr(self, '_syncing_c2', False):
+            return
         if not self._stacked_c2_lines:
             return
         x = self.sender().value() if self.sender() else self._stacked_c2_lines[0].value()
-        self.v_line2.setPos(x)  # keep normal-mode cursor in sync too
-        for line in self._stacked_c2_lines:
-            if line is not self.sender():
-                line.setPos(x)
+        self.v_line2.blockSignals(True)
+        self.v_line2.setPos(x)
+        self.v_line2.blockSignals(False)
+        self._syncing_c2 = True
+        self.glw.setUpdatesEnabled(False)
+        try:
+            for line in self._stacked_c2_lines:
+                if line is not self.sender():
+                    line.setPos(x)
+        finally:
+            self._syncing_c2 = False
+            self.glw.setUpdatesEnabled(True)
         self._update_table_values(x, col=3)
         self._update_cursor_labels()
 
@@ -868,12 +1280,11 @@ class PlotPanel(QWidget):
 
     # ── Mouse cursor (hover tracking for h-line only) ─────────────────────
 
-    def _mouse_moved(self, event: tuple) -> None:
+    def _mouse_moved(self, pos) -> None:
         """Track mouse for horizontal reference line only.
         Vertical position is now controlled by draggable InfiniteLines."""
         if not self._items:
             return
-        pos = event[0]
         if self._stacked_mode:
             return   # stacked rows handle cursors via sigPositionChanged
         if not self.plot.sceneBoundingRect().contains(pos):
@@ -883,35 +1294,37 @@ class PlotPanel(QWidget):
 
     def _update_table_values(self, x: float, col: int = 2) -> None:
         """Update Cursor 1 (col=2) or Cursor 2 (col=3) value column."""
-        row_lookup: dict[str, int] = {}
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)   # signal key is now col 1
-            if item:
-                key = str(item.data(Qt.ItemDataRole.UserRole))
-                if not key.startswith('__'):
-                    row_lookup[key] = row
-        for key, plotted in self._items.items():
-            if not plotted.visible:
-                continue   # hidden signal — no cursor value shown
-            idx = self._nearest_index(plotted.series.timestamps, x)
-            if idx is None:
-                continue
-            value = plotted.series.display_value_at(idx)
-            row   = row_lookup.get(key)
-            if row is not None:
+        self.table.setUpdatesEnabled(False)
+        try:
+            for key, plotted in self._items.items():
+                if not plotted.visible:
+                    continue
+                row = self._row_lookup.get(key)
+                if row is None:
+                    continue
                 cell = self.table.item(row, col)
-                if cell is not None:
-                    if isinstance(value, str):
-                        cell.setText(value)
-                    else:
-                        try:
-                            cell.setText(f"{float(value):.3f}")
-                        except (TypeError, ValueError):
-                            cell.setText(str(value))
+                if cell is None:
+                    continue
+                idx = self._nearest_index(plotted.series.timestamps, x)
+                if idx is None:
+                    continue
+                value = plotted.series.display_value_at(idx)
+                if isinstance(value, str):
+                    cell.setText(value)
+                else:
+                    try:
+                        cell.setText(f"{float(value):.3f}")
+                    except (TypeError, ValueError):
+                        cell.setText(str(value))
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     # ── Fit to window ─────────────────────────────────────────────────────
 
     def fit_to_window(self) -> None:
+        # Cancel any deferred range-restore queued by _rebuild_curves so that
+        # an explicit fit is not silently overwritten on the next event-loop tick.
+        self._rebuild_seq += 1
         if not self._items:
             if not self._stacked_mode:
                 self.plot.enableAutoRange()
@@ -961,6 +1374,22 @@ class PlotPanel(QWidget):
                 y_min, y_max = min(numeric), max(numeric)
                 pad = (y_max - y_min) * 0.05 if y_min != y_max else (1.0 if y_min == 0 else abs(y_min) * 0.05)
                 self.plot.setYRange(y_min - pad, y_max + pad, padding=0)
+
+    def zoom_to_time(self, t_start: float, t_end: float, margin: float = 0.5) -> None:
+        """Zoom X to [t_start - margin, t_end + margin] and rescale Y to match."""
+        x0 = t_start - margin
+        x1 = t_end + margin
+        if x0 >= x1:
+            x1 = x0 + 1.0
+        if self._stacked_mode:
+            for p in self._stacked_plots:
+                p.setXRange(x0, x1, padding=0)
+        elif self._multi_axis:
+            self.plot.setXRange(x0, x1, padding=0)
+            self._update_multi_axis_views()
+        else:
+            self.plot.setXRange(x0, x1, padding=0)
+        self.fit_vertical()
 
     def fit_vertical(self) -> None:
         """
@@ -1058,6 +1487,7 @@ class PlotPanel(QWidget):
         self.plot.setBackground(color)
         self.glw.setBackground(color)
         self._apply_panel_background()
+        self.table.viewport().update()
         self.backgroundColorChanged.emit(color)
 
     def background_color(self) -> str:
@@ -1093,11 +1523,24 @@ class PlotPanel(QWidget):
         if not key or key not in self._items:
             self.plot.setLabel('left', 'Value')
             return
-        series = self._items[key].series
-        label  = series.signal_name + (f' ({series.unit})' if series.unit else '')
-        self.plot.setLabel('left', label, color=self._items[key].color)
-        self.plot.getAxis('left').setTextPen(pg.mkPen(self._items[key].color))
         if self._multi_axis:
+            # Main left axis always tracks the first visible signal assigned to it
+            # (view_box is None), regardless of which row is currently selected.
+            main_plotted = next(
+                (p for p in self._items.values() if p.visible and p.view_box is None),
+                None,
+            )
+            if main_plotted is not None:
+                if main_plotted.axis_visible:
+                    ms = main_plotted.series
+                    ml = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
+                    self.plot.setLabel('left', ml, color=main_plotted.color)
+                    self.plot.getAxis('left').setTextPen(pg.mkPen(main_plotted.color))
+                    self.plot.getAxis('left').setStyle(showValues=True)
+                else:
+                    self.plot.setLabel('left', '')
+                    self.plot.getAxis('left').setTextPen(pg.mkPen(None))
+                    self.plot.getAxis('left').setStyle(showValues=False)
             for axis_key in list(self._items.keys())[1:]:
                 plotted = self._items[axis_key]
                 if plotted.axis is not None and plotted.axis is not self.plot.getAxis('left'):
@@ -1107,6 +1550,11 @@ class PlotPanel(QWidget):
                     plotted.axis.setLabel(lbl, color=plotted.color)
                     plotted.axis.setTextPen(pg.mkPen(plotted.color))
                     plotted.axis.setWidth(55)
+        else:
+            series = self._items[key].series
+            label  = series.signal_name + (f' ({series.unit})' if series.unit else '')
+            self.plot.setLabel('left', label, color=self._items[key].color)
+            self.plot.getAxis('left').setTextPen(pg.mkPen(self._items[key].color))
 
     # ── Table ─────────────────────────────────────────────────────────────
 
@@ -1173,13 +1621,34 @@ class PlotPanel(QWidget):
                 for item in (sig_item, c1_item, c2_item, un_item):
                     item.setForeground(brush)
                 chk_item.setForeground(brush)
+                # Col 5: Axis visibility checkbox (multi-axis mode only)
+                ax_item = QTableWidgetItem()
+                ax_item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable |
+                    Qt.ItemFlag.ItemIsEnabled |
+                    Qt.ItemFlag.ItemIsSelectable
+                )
+                ax_item.setCheckState(
+                    Qt.CheckState.Checked if plotted.axis_visible
+                    else Qt.CheckState.Unchecked
+                )
+                ax_item.setData(Qt.ItemDataRole.UserRole, f'__axis__{key}')
                 self.table.setItem(row_idx, 0, chk_item)
                 self.table.setItem(row_idx, 1, sig_item)
                 self.table.setItem(row_idx, 2, c1_item)
                 self.table.setItem(row_idx, 3, c2_item)
                 self.table.setItem(row_idx, 4, un_item)
+                self.table.setItem(row_idx, 5, ax_item)
         self.table.blockSignals(False)
         self._apply_collapse_state()
+        # Rebuild the key→row index used by _update_table_values on every cursor drag.
+        self._row_lookup = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            if item:
+                key = str(item.data(Qt.ItemDataRole.UserRole))
+                if not key.startswith('__'):
+                    self._row_lookup[key] = row
         # widths are user-controlled — no resizeColumnsToContents
 
     def _emit_selection(self) -> None:
@@ -1219,6 +1688,9 @@ class PlotPanel(QWidget):
                 color=v.color,
                 axis=None,
                 view_box=None,
+                visible=v.visible,
+                group=v.group,
+                axis_visible=v.axis_visible,
             )
             for k, v in self._items.items()
         }
@@ -1249,7 +1721,6 @@ class PlotPanel(QWidget):
         self._rebuild_curves(preserve_selection=False)
         self._set_axis_label(self._current_key)
         self._update_empty_state_ui()
-        self.fit_to_window()
 
     def remove_selected_series(self) -> None:
         self._push_undo()
@@ -1259,7 +1730,6 @@ class PlotPanel(QWidget):
         self._rebuild_curves(preserve_selection=False)
         self._set_axis_label(self._current_key)
         self._update_empty_state_ui()
-        self.fit_to_window()
 
     def clear_all(self) -> None:
         self._push_undo()
@@ -1487,8 +1957,8 @@ class PlotPanel(QWidget):
         name_item.setForeground(QBrush(QColor('#8ab8e0')))  # light blue
         self.table.setItem(row_idx, 1, name_item)
 
-        # Cols 2-4: empty, same background
-        for col in (2, 3, 4):
+        # Cols 2-5: empty, same background
+        for col in (2, 3, 4, 5):
             cell = QTableWidgetItem('')
             cell.setFlags(Qt.ItemFlag.ItemIsEnabled)
             cell.setBackground(bg)
@@ -1517,6 +1987,15 @@ class PlotPanel(QWidget):
             return
         key = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(key, str):
+            return
+
+        # Col 5: Axis visibility toggle (multi-axis mode)
+        if key.startswith('__axis__'):
+            sig_key = key[len('__axis__'):]
+            if sig_key in self._items:
+                self._toggle_axis_visibility(
+                    sig_key, item.checkState() == Qt.CheckState.Checked
+                )
             return
 
         if key.startswith('__grpchk__'):
@@ -1558,21 +2037,66 @@ class PlotPanel(QWidget):
         For stacked mode: full rebuild is required (rows must be added/removed).
         The cursor lines are NOT touched — they persist regardless of signal visibility.
         """
-        if self._stacked_mode:
-            # Stacked needs full rebuild to add/remove rows
+        # Newly-enabled signals have no curve yet — _rebuild_overlay skipped them
+        # last pass. The lightweight setVisible toggle can't materialise a curve,
+        # so fall through to a full rebuild.
+        needs_rebuild = self._stacked_mode or any(
+            p.visible and p.curve is None for p in self._items.values()
+        )
+        if needs_rebuild:
             self._rebuild_curves(preserve_selection=True)
-        else:
-            # Lightweight: just toggle curve visibility on existing PlotDataItems
-            for key, plotted in self._items.items():
-                if plotted.curve is not None:
-                    plotted.curve.setVisible(plotted.visible)
-            # Refresh table to update checkbox states and row colours
-            self._refresh_table()
-            self._refresh_highlight()
-            # Repopulate cursor value columns — _refresh_table wipes them to ''
-            self._update_table_values(self.v_line.value(), col=2)
-            if self._cursor2_enabled:
-                self._update_table_values(self.v_line2.value(), col=3)
+            return
+        # Lightweight path — every visible signal already has a curve,
+        # just toggle setVisible on existing PlotDataItems.
+        for key, plotted in self._items.items():
+            if plotted.curve is not None:
+                plotted.curve.setVisible(plotted.visible)
+        # Refresh table to update checkbox states and row colours
+        self._refresh_table()
+        self._refresh_highlight()
+        # Repopulate cursor value columns — _refresh_table wipes them to ''
+        self._update_table_values(self.v_line.value(), col=2)
+        if self._cursor2_enabled:
+            self._update_table_values(self.v_line2.value(), col=3)
+
+    def _toggle_axis_visibility(self, key: str, visible: bool) -> None:
+        """Show or hide the Y axis for a single signal (multi-axis mode only).
+
+        Hiding an axis frees its layout slot so the plot area expands to fill
+        the gap.  Showing it re-inserts it at the next available slot.
+        """
+        plotted = self._items.get(key)
+        if plotted is None:
+            return
+        plotted.axis_visible = visible
+        if plotted.axis is not None:
+            if plotted.view_box is None:
+                # Main left axis: setVisible(False) collapses the entire left
+                # margin, destroying the layout space that floating extra axes
+                # depend on.  Fake "hidden" by blanking the visual content instead.
+                if visible:
+                    ms = plotted.series
+                    lbl = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
+                    plotted.axis.setLabel(lbl, color=plotted.color)
+                    plotted.axis.setTextPen(pg.mkPen(plotted.color))
+                    plotted.axis.setStyle(showValues=True)
+                else:
+                    plotted.axis.setLabel('')
+                    plotted.axis.setTextPen(pg.mkPen(None))
+                    plotted.axis.setStyle(showValues=False)
+            else:
+                plotted.axis.setVisible(visible)
+        if self._multi_axis and self._extra_axes:
+            # Resize the left margin to match the number of now-visible extra axes.
+            # sigResized will fire once the layout settles and reposition everything;
+            # the timer is a safety net for edge cases where sigResized doesn't fire.
+            n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
+            new_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            main_axis = self.plot.getAxis('left')
+            main_axis.setWidth(new_w)
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = new_w - self._MAIN_AXIS_W - 5
+            QTimer.singleShot(15, self._update_multi_axis_views)
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         """Double-click on group header (col 0 arrow or col 1 name) → rename group."""
@@ -1830,6 +2354,18 @@ class PlotPanel(QWidget):
         menu.addAction(act)
         menu.exec(self.plot.mapToGlobal(position))
 
+    def _theme_colors(self) -> dict:
+        """Return palette dict used by _CheckDelegate for theme-aware checkbox colours."""
+        bg = self._background_color.lstrip('#')
+        try:
+            r, g, b = int(bg[0:2], 16), int(bg[2:4], 16), int(bg[4:6], 16)
+            lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+        except (ValueError, IndexError):
+            lum = 0.0
+        if lum < 0.5:
+            return {'check_border': '#808080', 'check_bg': '#2a2a2a', 'check_mark': '#ffffff'}
+        return {'check_border': '#606060', 'check_bg': '#ffffff', 'check_mark': '#101010'}
+
     def _apply_panel_background(self) -> None:
         bg = self._background_color
         # Fix 3: header always grey/black — immune to plot background colour changes
@@ -1856,17 +2392,14 @@ class PlotPanel(QWidget):
 
     @staticmethod
     def _nearest_index(values, target: float) -> int | None:
-        if not len(values):
+        n = len(values)
+        if n == 0:
             return None
-        arr  = np.asarray(values, dtype=np.float64)
-        lo, hi = 0, len(arr) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if arr[mid] < target:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo == 0:
+        # Zero-copy view; searchsorted runs in C (O(log n), no Python loop).
+        arr = np.frombuffer(values, dtype=np.float64)
+        idx = int(np.searchsorted(arr, target, side='left'))
+        if idx >= n:
+            return n - 1
+        if idx == 0:
             return 0
-        before = lo - 1
-        return lo if abs(arr[lo] - target) < abs(arr[before] - target) else before
+        return idx if (arr[idx] - target) <= (target - arr[idx - 1]) else idx - 1
