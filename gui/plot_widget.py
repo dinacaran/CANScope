@@ -6,13 +6,14 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QSize
-from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QPen, QPainter
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QSize, QByteArray, QMimeData
+from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QDragEnterEvent, QDropEvent, QPen, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QInputDialog,
     QGraphicsTextItem,
     QColorDialog,
+    QFrame,
     QGridLayout,
     QHeaderView,
     QLabel,
@@ -63,11 +64,26 @@ class _LeftAxis(pg.AxisItem):
                 return
         super().mouseDragEvent(event)
 
-    def resizeEvent(self, ev=None) -> None:
-        super().resizeEvent(ev)
+    def _apply_title_pos(self) -> None:
+        """Move the axis label so it sits beside its own tick numbers.
+
+        Called after every label rebuild and on resize so the position stays
+        correct regardless of which event triggers a label update.
+        """
         title_x = getattr(self, '_title_x', None)
         if title_x is not None and self.label is not None and self.label.isVisible():
             self.label.setX(title_x)
+
+    def resizeEvent(self, ev=None) -> None:
+        super().resizeEvent(ev)
+        self._apply_title_pos()
+
+    def setLabel(self, text='', units='', unitPrefix='', **args) -> None:
+        super().setLabel(text=text, units=units, unitPrefix=unitPrefix, **args)
+        # pyqtgraph repositions the label item after setLabel() returns, so
+        # defer the anchor correction by one event-loop tick.
+        if getattr(self, '_title_x', None) is not None:
+            QTimer.singleShot(0, self._apply_title_pos)
 
 
 @dataclass(slots=True)
@@ -81,6 +97,8 @@ class PlottedSignal:
     visible: bool = True        # checkbox state — False hides curve and stacked row
     group: str = ''             # '' = ungrouped; any string = group name
     axis_visible: bool = True   # multi-axis mode: show/hide the Y axis for this signal
+    unit_group: str = ''        # multi-axis mode: normalized unit-group key
+    own_axis: bool = False      # multi-axis mode: detach onto individual Y axis
 
 
 
@@ -264,6 +282,35 @@ class _CheckDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
 
+class _ReorderTable(QTableWidget):
+    """QTableWidget that fires a custom internal MIME drag so row-reorder drops
+    are distinguishable from external SignalTree drops."""
+
+    _ROW_REORDER_MIME = 'application/x-canscope-row-reorder'
+
+    def __init__(self, rows: int, cols: int, parent=None) -> None:
+        super().__init__(rows, cols, parent)
+        self._panel: Any = None  # set to PlotPanel immediately after creation
+
+    def startDrag(self, supported_actions: Qt.DropActions) -> None:  # type: ignore[override]
+        panel = self._panel
+        if panel is None:
+            super().startDrag(supported_actions)
+            return
+        # Collect selected signal keys in their current _items order so that
+        # multi-row drags preserve the existing relative ordering.
+        sel_set = set(panel.selected_keys())
+        keys = [k for k in panel._items if k in sel_set]
+        if not keys:
+            return
+        mime = QMimeData()
+        mime.setData(self._ROW_REORDER_MIME,
+                     QByteArray('\n'.join(keys).encode('utf-8')))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+
+
 class PlotPanel(QWidget):
     selectionChanged = Signal(str)
     signalDropped = Signal(list)
@@ -374,9 +421,9 @@ class PlotPanel(QWidget):
         # v_line2 not added to plot until cursor 2 is enabled
 
         # ── Signal table ──────────────────────────────────────────────────
-        self.table = QTableWidget(0, 6)
+        self.table = _ReorderTable(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit', 'Axis'])
+            ['☑', 'Signal', 'Cursor 1', 'Cursor 2', 'Unit', 'Ax', 'Axis'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemSelectionChanged.connect(self._emit_selection)
@@ -395,31 +442,51 @@ class PlotPanel(QWidget):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive) # Cursor 1
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive) # Cursor 2
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive) # Unit
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Axis
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)      # Ax
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)      # Axis
         self.table.setColumnWidth(0, 36)    # ☑ checkbox + group arrow
         self.table.setColumnWidth(1, 190)   # Signal
         self.table.setColumnWidth(2, 90)    # Cursor 1
         self.table.setColumnWidth(3, 90)    # Cursor 2
         self.table.setColumnWidth(4, 55)    # Unit
-        self.table.setColumnWidth(5, 36)    # Axis (multi-axis mode only)
+        self.table.setColumnWidth(5, 16)    # Ax swatch (multi-axis mode only)
+        self.table.setColumnWidth(6, 36)    # Axis checkbox (multi-axis mode only)
         self.table.setColumnHidden(3, True) # hidden until cursor 2 enabled
         self.table.setColumnHidden(5, True) # hidden until multi-axis mode enabled
+        self.table.setColumnHidden(6, True) # hidden until multi-axis mode enabled
 
         self.table_panel = QWidget()
         _tbl_layout = QVBoxLayout(self.table_panel)
         _tbl_layout.setContentsMargins(0, 0, 0, 0)
         _tbl_layout.addWidget(self.table, stretch=1)
-        # Drag-and-drop onto the signal table (same as plot area)
+        # Drag-and-drop onto the signal table:
+        #   • Internal drags (row reorder) use _ReorderTable.startDrag → custom MIME
+        #   • External drags (from SignalTreeWidget) use SignalTreeWidget.MIME_TYPE
+        # Both paths share the same dragEnter / drop handlers below.
         self.table.setAcceptDrops(True)
         self.table.viewport().setAcceptDrops(True)
-        self.table.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        self.table.dragEnterEvent = self._table_drag_enter
-        self.table.dragMoveEvent  = self._table_drag_enter   # same check
-        self.table.dropEvent      = self._table_drop
+        self.table.setDragEnabled(True)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.table._panel = self  # back-reference used by _ReorderTable.startDrag
+        self.table.dragEnterEvent  = self._table_drag_enter
+        self.table.dragMoveEvent   = self._table_drag_move
+        self.table.dragLeaveEvent  = self._table_drag_leave
+        self.table.dropEvent       = self._table_drop
+
+        # Thin horizontal line shown during internal row-reorder drags to mark
+        # exactly where the dragged signal(s) will land.  It is a plain child
+        # widget of the viewport so it floats above table content without any
+        # paintEvent override.
+        self._drop_indicator = QFrame(self.table.viewport())
+        self._drop_indicator.setFixedHeight(2)
+        self._drop_indicator.setStyleSheet('background-color: #3d9ef0;')
+        self._drop_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._drop_indicator.hide()
         self._apply_panel_background()
         self._check_delegate = _CheckDelegate(self, self.table)
         self.table.setItemDelegateForColumn(0, self._check_delegate)
-        self.table.setItemDelegateForColumn(5, self._check_delegate)
+        self.table.setItemDelegateForColumn(6, self._check_delegate)
 
         # ── Root layout ───────────────────────────────────────────────────
         _root = QVBoxLayout(self)
@@ -470,9 +537,23 @@ class PlotPanel(QWidget):
 
     def set_multi_axis(self, enabled: bool) -> None:
         self._multi_axis = bool(enabled)
-        self.table.setColumnHidden(5, not self._multi_axis)
+        self.table.setColumnHidden(5, not self._multi_axis)  # Ax swatch
+        self.table.setColumnHidden(6, not self._multi_axis)  # Axis checkbox
         self._rebuild_curves(preserve_selection=True)
         self.fit_to_window()
+
+    def _unit_key(self, unit: str | None, signal_key: str, own_axis: bool = False) -> str:
+        """Normalize a unit string to a group key.
+
+        Signals with the same normalized unit share one Y axis in multi-axis mode.
+        Empty/None units are never merged — each gets its own unique key.
+        own_axis=True forces a per-signal key regardless of unit.
+        """
+        if own_axis:
+            return f'__own__{signal_key}'
+        if unit and unit.strip():
+            return unit.strip().lower()
+        return f'__no_unit__{signal_key}'
 
     def _current_view_centre(self) -> float:
         """Return the x-centre of the currently visible range (any mode)."""
@@ -702,8 +783,9 @@ class PlotPanel(QWidget):
         # Save X and Y view ranges before destroying rendered items so that
         # add/remove operations don't snap the viewport back to full extent.
         _saved_xr: list | None = None
-        _saved_yr: list | None = None          # standard overlay: one shared Y range
-        _saved_yr_by_key: dict[str, list] = {}  # stacked / multi-axis: per-signal key
+        _saved_yr: list | None = None           # standard overlay: one shared Y range
+        _saved_yr_by_key: dict[str, list] = {}  # stacked: per-signal key
+        _saved_yr_by_unit: dict[str, list] = {} # multi-axis: per-unit-group key
 
         if self._stacked_mode and self._stacked_plots:
             try:
@@ -723,18 +805,25 @@ class PlotPanel(QWidget):
             except Exception:
                 pass
             if self._multi_axis:
-                first_visible = True
+                # Save one Y range per unit group (keyed by normalized unit).
+                # Multiple signals sharing a ViewBox get the same range entry.
+                _seen_ukeys: set[str] = set()
                 for key, plotted in self._items.items():
                     if not plotted.visible:
                         continue
+                    ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+                    if ukey in _seen_ukeys:
+                        continue
+                    _seen_ukeys.add(ukey)
                     try:
-                        if first_visible or plotted.view_box is None:
-                            _saved_yr_by_key[key] = list(self.plot.plotItem.vb.viewRange()[1])
+                        if plotted.view_box is None:
+                            _saved_yr_by_unit[ukey] = list(
+                                self.plot.plotItem.vb.viewRange()[1])
                         else:
-                            _saved_yr_by_key[key] = list(plotted.view_box.viewRange()[1])
+                            _saved_yr_by_unit[ukey] = list(
+                                plotted.view_box.viewRange()[1])
                     except Exception:
                         pass
-                    first_visible = False
             else:
                 try:
                     _saved_yr = list(self.plot.plotItem.vb.viewRange()[1])
@@ -804,43 +893,63 @@ class PlotPanel(QWidget):
                         self.plot.setXRange(_saved_xr[0], _saved_xr[1], padding=0)
                     except Exception:
                         pass
-                if self._multi_axis and _saved_yr_by_key:
-                    first_visible = True
+                if self._multi_axis and _saved_yr_by_unit:
+                    # Restore one Y range per unit group (first visible signal
+                    # in the group gives us the right ViewBox reference).
+                    _restored_groups: set[str] = set()
                     for key, plotted in self._items.items():
-                        if not plotted.visible or key not in _saved_yr_by_key:
+                        if not plotted.visible:
                             continue
+                        ukey = plotted.unit_group
+                        if ukey in _restored_groups or ukey not in _saved_yr_by_unit:
+                            continue
+                        _restored_groups.add(ukey)
+                        yr = _saved_yr_by_unit[ukey]
                         try:
-                            yr = _saved_yr_by_key[key]
-                            if first_visible or plotted.view_box is None:
-                                self.plot.setYRange(yr[0], yr[1], padding=0)
-                            else:
-                                plotted.view_box.setYRange(yr[0], yr[1], padding=0)
+                            vb = (self.plot.plotItem.vb
+                                  if plotted.view_box is None else plotted.view_box)
+                            vb.setYRange(yr[0], yr[1], padding=0)
                         except Exception:
                             pass
-                        first_visible = False
                 elif _saved_yr:
                     try:
                         self.plot.setYRange(_saved_yr[0], _saved_yr[1], padding=0)
                     except Exception:
                         pass
-                # Auto-fit Y for newly added signals that have no saved range.
-                # Only applies to floating ViewBoxes (idx > 0 in multi-axis);
-                # the first signal's VB is the main one and is handled above.
+                # Auto-fit Y for unit groups that have no saved range (newly added).
                 if self._multi_axis:
+                    # Collect union Y range per ViewBox for unsaved groups.
+                    _new_vb_ranges: dict[int, list[float]] = {}
+                    _new_vb_objs:   dict[int, Any]         = {}
                     for key, plotted in self._items.items():
-                        if not plotted.visible or plotted.view_box is None:
+                        if not plotted.visible:
                             continue
-                        if key in _saved_yr_by_key:
+                        if plotted.unit_group in _saved_yr_by_unit:
                             continue
+                        vb = (self.plot.plotItem.vb
+                              if plotted.view_box is None else plotted.view_box)
+                        vb_id = id(vb)
+                        _new_vb_objs[vb_id] = vb
                         try:
                             y = np.asarray(plotted.series.values, dtype=np.float64)
                             finite = y[np.isfinite(y)]
                             if len(finite):
                                 ymin, ymax = float(finite.min()), float(finite.max())
-                                if ymin == ymax:
-                                    ymin, ymax = ymin - 0.5, ymax + 0.5
-                                pad = (ymax - ymin) * 0.05
-                                plotted.view_box.setYRange(ymin - pad, ymax + pad, padding=0)
+                                if vb_id in _new_vb_ranges:
+                                    _new_vb_ranges[vb_id][0] = min(
+                                        _new_vb_ranges[vb_id][0], ymin)
+                                    _new_vb_ranges[vb_id][1] = max(
+                                        _new_vb_ranges[vb_id][1], ymax)
+                                else:
+                                    _new_vb_ranges[vb_id] = [ymin, ymax]
+                        except Exception:
+                            pass
+                    for vb_id, (ymin, ymax) in _new_vb_ranges.items():
+                        if ymin == ymax:
+                            ymin, ymax = ymin - 0.5, ymax + 0.5
+                        pad = (ymax - ymin) * 0.05
+                        try:
+                            _new_vb_objs[vb_id].setYRange(ymin - pad, ymax + pad, padding=0)
                         except Exception:
                             pass
                 # Disable auto-range on every affected ViewBox so pyqtgraph's
@@ -854,13 +963,17 @@ class PlotPanel(QWidget):
                 except Exception:
                     pass
                 if self._multi_axis:
+                    _seen_vbs: set[int] = set()
                     for plotted in self._items.values():
                         if plotted.view_box is not None:
-                            try:
-                                plotted.view_box.enableAutoRange(x=False, y=False)
-                                plotted.view_box.setAutoVisible(x=False, y=False)
-                            except Exception:
-                                pass
+                            vb_id = id(plotted.view_box)
+                            if vb_id not in _seen_vbs:
+                                _seen_vbs.add(vb_id)
+                                try:
+                                    plotted.view_box.enableAutoRange(x=False, y=False)
+                                    plotted.view_box.setAutoVisible(x=False, y=False)
+                                except Exception:
+                                    pass
 
             # Synchronous pass locks in the range before Qt paints the frame.
             # Deferred pass (singleShot 0) runs after pyqtgraph's own
@@ -882,73 +995,131 @@ class PlotPanel(QWidget):
 
     def _rebuild_overlay(self) -> None:
         """Normal or multi-axis: all signals on one PlotWidget, extra axes to the left."""
-        vis_idx = 0  # count only visible signals for multi-axis numbering
-        for key in self._items:
-            plotted = self._items[key]
-            idx = vis_idx
+        main_axis = self.plot.getAxis('left')
 
+        if not self._multi_axis:
+            # ── Single-axis mode ─────────────────────────────────────────────
+            for key, plotted in self._items.items():
+                if not plotted.visible:
+                    plotted.curve      = None
+                    plotted.unit_group = ''
+                    continue
+                curve = self.plot.plot([], [], name=key)
+                self._configure_curve(curve)
+                plotted.curve      = curve
+                plotted.axis       = main_axis
+                plotted.view_box   = None
+                plotted.unit_group = ''
+                self._apply_curve_style(plotted)
+                try:
+                    self._legend.addItem(plotted.curve, key)
+                except Exception:
+                    pass
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = None
+            return
+
+        # ── Multi-axis mode: group visible signals by unit ───────────────────
+        # Assign unit_group for invisible signals first (needed for table swatch
+        # and axis-visibility sync even when the signal has no curve).
+        for key, plotted in self._items.items():
             if not plotted.visible:
-                plotted.curve = None
-                continue
-            vis_idx += 1
+                plotted.curve      = None
+                plotted.unit_group = self._unit_key(plotted.series.unit, key, plotted.own_axis)
 
-            if self._multi_axis and idx > 0:
-                # Use PlotDataItem (not PlotCurveItem) so symbol kwargs work.
-                # sigResized is connected below so geometry is maintained on resize.
+        # Build ordered unit groups (insertion-order of first visible signal per unit)
+        unit_groups: dict[str, list[str]] = {}
+        for key, plotted in self._items.items():
+            if not plotted.visible:
+                continue
+            ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+            if ukey not in unit_groups:
+                unit_groups[ukey] = []
+            unit_groups[ukey].append(key)
+
+        if not unit_groups:
+            if isinstance(main_axis, _LeftAxis):
+                main_axis._title_x = None
+            return
+
+        for group_idx, (ukey, keys) in enumerate(unit_groups.items()):
+            first         = self._items[keys[0]]
+            axis_color    = first.color
+            unit_label    = self._axis_group_label(keys)
+            ax_vis        = first.axis_visible   # first signal's state drives the group
+
+            if group_idx == 0:
+                # First group → main left axis + main ViewBox
+                group_axis = main_axis
+                group_vb   = None
+                if ax_vis:
+                    self.plot.setLabel('left', unit_label, color=axis_color)
+                    main_axis.setTextPen(pg.mkPen(axis_color))
+                    main_axis.setStyle(showValues=True)
+                    main_axis.setVisible(True)
+                else:
+                    # Fake-hide: blanking content preserves layout space that
+                    # floating extra axes depend on (setVisible(False) collapses it).
+                    self.plot.setLabel('left', '')
+                    main_axis.setTextPen(pg.mkPen(None))
+                    main_axis.setStyle(showValues=False)
+            else:
+                # Extra group → new floating AxisItem + ViewBox
                 axis = pg.AxisItem('left')
                 vb   = pg.ViewBox()
-                # Lock auto-range OFF before X-linking — otherwise the first
-                # setData on this curve triggers auto-range that propagates
-                # through the link and resets the main plot's X.
+                # Disable auto-range before X-linking so the first setData()
+                # doesn't propagate an auto-range reset to the main plot.
                 vb.enableAutoRange(x=False, y=False)
                 vb.setAutoVisible(x=False, y=False)
                 self.plot.plotItem.scene().addItem(vb)
                 self.plot.plotItem.scene().addItem(axis)
                 axis.linkToView(vb)
                 vb.setXLink(self.plot.plotItem.vb)
-                curve = pg.PlotDataItem()
-                self._configure_curve(curve)
-                vb.addItem(curve)
-                plotted.curve     = curve
-                plotted.axis      = axis
-                plotted.view_box  = vb
+                axis.setLabel(unit_label, color=axis_color)
+                axis.setTextPen(pg.mkPen(axis_color))
+                axis.setWidth(self._EXTRA_AXIS_W)
+                axis.setStyle(autoExpandTextSpace=False, tickTextOffset=2)
+                axis.setVisible(ax_vis)
+                group_axis = axis
+                group_vb   = vb
                 self._extra_axes.append((axis, vb))
-                # Restore axis visibility state (toggled via Axis column checkbox)
-                axis.setVisible(plotted.axis_visible)
-            else:
-                curve = self.plot.plot([], [], name=key)
-                self._configure_curve(curve)
-                plotted.curve    = curve
-                plotted.axis     = self.plot.getAxis('left')
-                plotted.view_box = None
-                # First signal uses main left axis — respect its axis_visible flag
-                if self._multi_axis:
-                    self.plot.getAxis('left').setVisible(plotted.axis_visible)
 
-            self._apply_curve_style(plotted)
-            try:
-                self._legend.addItem(plotted.curve, key)
-            except Exception:
-                pass
+            # Add one curve per signal in this group — all share the same ViewBox.
+            for key in keys:
+                plotted              = self._items[key]
+                plotted.unit_group   = ukey
+                plotted.axis         = group_axis
+                plotted.view_box     = group_vb
+                plotted.axis_visible = ax_vis   # keep all group members in sync
+                if group_idx == 0:
+                    curve = self.plot.plot([], [], name=key)
+                else:
+                    curve = pg.PlotDataItem()
+                    group_vb.addItem(curve)
+                self._configure_curve(curve)
+                plotted.curve = curve
+                self._apply_curve_style(plotted)
+                try:
+                    self._legend.addItem(plotted.curve, key)
+                except Exception:
+                    pass
 
         if self._extra_axes:
-            # Reserve left-margin space for VISIBLE extra axes only.
-            n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
-            total_left_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
-            main_axis = self.plot.getAxis('left')
+            n_vis        = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
+            total_left_w = self._compute_main_axis_width(n_vis)
             main_axis.setWidth(total_left_w)
+            main_axis.setStyle(autoExpandTextSpace=False, tickTextOffset=3)
             # Anchor the main axis title adjacent to its tick labels rather than at
             # the far-left of the expanded axis item (pyqtgraph default is x = -5).
-            # _title_x is read by _LeftAxis.resizeEvent on every resize.
             if isinstance(main_axis, _LeftAxis):
                 main_axis._title_x = total_left_w - self._MAIN_AXIS_W - 5
-            # Connect once; disconnect happens in _clear_rendered_items
+                # setLabel() was called above before _title_x was known (group_idx==0
+                # branch), so schedule the anchor now in case setWidth() doesn't fire
+                # a resizeEvent (e.g. same width after signal reorder).
+                QTimer.singleShot(0, main_axis._apply_title_pos)
             self.plot.plotItem.vb.sigResized.connect(self._update_multi_axis_views)
-            # Defer initial geometry until widget is painted and layout has settled
             QTimer.singleShot(10, self._update_multi_axis_views)
         else:
-            # Reset title anchor when no extra axes are present
-            main_axis = self.plot.getAxis('left')
             if isinstance(main_axis, _LeftAxis):
                 main_axis._title_x = None
 
@@ -1135,10 +1306,15 @@ class PlotPanel(QWidget):
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
     # Width constants for multi-axis layout
-    _MAIN_AXIS_W: int = 55        # width of the main (first) left axis ticks+labels
-    _MAIN_AXIS_TITLE_W: int = 20  # extra reserve for the rotated axis title (renders at far-left of setWidth area)
-    _EXTRA_AXIS_W: int = 55       # width of each additional floating axis
+    _MAIN_AXIS_W: int = 50        # width of the main (first) left axis ticks+labels
+    _MAIN_AXIS_TITLE_W: int = 5  # extra reserve for the rotated axis title (renders at far-left of setWidth area)
+    _EXTRA_AXIS_W: int = 50       # width of each additional floating axis (60px fits 5-digit tick text)
     _EXTRA_AXIS_GAP: int = 4      # gap between adjacent axis panels
+
+    def _compute_main_axis_width(self, n_vis: int) -> int:
+        """Total left-margin width: main axis + title reserve + visible floating axes."""
+        return (self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W
+                + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP))
 
     def _update_multi_axis_views(self) -> None:
         """
@@ -1356,6 +1532,9 @@ class PlotPanel(QWidget):
             self.plot.setXRange(x_min, x_max, padding=0.02)
             # Geometry must be current before setYRange on floating ViewBoxes
             self._update_multi_axis_views()
+            # Union Y range across all signals that share the same ViewBox.
+            _vb_y: dict[int, list[float]] = {}
+            _vb_obj: dict[int, Any] = {}
             for key, plotted in self._items.items():
                 if not plotted.visible:
                     continue
@@ -1363,10 +1542,19 @@ class PlotPanel(QWidget):
                 if not vals:
                     continue
                 y_min, y_max = min(vals), max(vals)
-                pad = (y_max - y_min) * 0.05 if y_min != y_max else (1.0 if y_min == 0 else abs(y_min) * 0.05)
-                target = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
-                target.disableAutoRange()
-                target.setYRange(y_min - pad, y_max + pad, padding=0)
+                vb    = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
+                vb_id = id(vb)
+                _vb_obj[vb_id] = vb
+                if vb_id in _vb_y:
+                    _vb_y[vb_id][0] = min(_vb_y[vb_id][0], y_min)
+                    _vb_y[vb_id][1] = max(_vb_y[vb_id][1], y_max)
+                else:
+                    _vb_y[vb_id] = [y_min, y_max]
+            for vb_id, (y_min, y_max) in _vb_y.items():
+                pad = (y_max - y_min) * 0.05 if y_min != y_max else (
+                    1.0 if y_min == 0 else abs(y_min) * 0.05)
+                _vb_obj[vb_id].disableAutoRange()
+                _vb_obj[vb_id].setYRange(y_min - pad, y_max + pad, padding=0)
         else:
             self.plot.setXRange(x_min, x_max, padding=0.02)
             numeric = [v for it in self._items.values() for v in it.series.values if v == v]
@@ -1433,18 +1621,30 @@ class PlotPanel(QWidget):
 
         elif self._multi_axis:
             self._update_multi_axis_views()  # ensure geometry is current
+            # Union Y range for the visible data within each ViewBox's X range.
+            _fv_y: dict[int, list[float]] = {}
+            _fv_obj: dict[int, Any] = {}
             for key, plotted in self._items.items():
                 if not plotted.visible:
                     continue
-                vb = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
+                vb    = self.plot.plotItem.vb if plotted.view_box is None else plotted.view_box
+                vb_id = id(vb)
+                _fv_obj[vb_id] = vb
                 try:
                     xr = vb.viewRange()[0]
                 except Exception:
                     continue
                 result = _y_range_for_visible(plotted.series, xr[0], xr[1])
-                if result:
-                    vb.disableAutoRange()
-                    vb.setYRange(result[0], result[1], padding=0)
+                if result is None:
+                    continue
+                if vb_id in _fv_y:
+                    _fv_y[vb_id][0] = min(_fv_y[vb_id][0], result[0])
+                    _fv_y[vb_id][1] = max(_fv_y[vb_id][1], result[1])
+                else:
+                    _fv_y[vb_id] = list(result)
+            for vb_id, (y_min, y_max) in _fv_y.items():
+                _fv_obj[vb_id].disableAutoRange()
+                _fv_obj[vb_id].setYRange(y_min, y_max, padding=0)
 
         else:
             # Normal mode: all signals share one Y axis
@@ -1517,6 +1717,22 @@ class PlotPanel(QWidget):
 
     # ── Axis label ────────────────────────────────────────────────────────
 
+    def _axis_group_label(self, keys: list[str]) -> str:
+        """Compute the Y-axis label for a unit group.
+
+        Single-member group: 'unit (Name)' when unit is present, else just 'Name'.
+        Multi-member group:  unit string only (all members share the same unit).
+        Signal names longer than 20 chars are truncated with an ellipsis.
+        """
+        first = self._items[keys[0]]
+        unit = (first.series.unit or '').strip()
+        if len(keys) == 1:
+            name = first.series.signal_name
+            if len(name) > 20:
+                name = name[:19] + '…'
+            return f'{unit} ({name})' if unit else name
+        return unit
+
     def _set_axis_label(self, key: str | None) -> None:
         if self._stacked_mode:
             return   # each row already has its own label
@@ -1524,32 +1740,31 @@ class PlotPanel(QWidget):
             self.plot.setLabel('left', 'Value')
             return
         if self._multi_axis:
-            # Main left axis always tracks the first visible signal assigned to it
-            # (view_box is None), regardless of which row is currently selected.
-            main_plotted = next(
-                (p for p in self._items.values() if p.visible and p.view_box is None),
-                None,
-            )
-            if main_plotted is not None:
-                if main_plotted.axis_visible:
-                    ms = main_plotted.series
-                    ml = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
-                    self.plot.setLabel('left', ml, color=main_plotted.color)
-                    self.plot.getAxis('left').setTextPen(pg.mkPen(main_plotted.color))
-                    self.plot.getAxis('left').setStyle(showValues=True)
+            # Build axis_id → keys map (visible signals only) so _axis_group_label
+            # can distinguish single- from multi-member groups.
+            axis_keys: dict[int, list[str]] = {}
+            for k, p in self._items.items():
+                if p.visible and p.axis is not None:
+                    axis_keys.setdefault(id(p.axis), []).append(k)
+            _seen_axes: set[int] = set()
+            for k, p in self._items.items():
+                if not p.visible or p.axis is None:
+                    continue
+                ax_id = id(p.axis)
+                if ax_id in _seen_axes:
+                    continue
+                _seen_axes.add(ax_id)
+                unit_lbl = self._axis_group_label(axis_keys.get(ax_id, [k]))
+                if p.view_box is None:
+                    # Main left axis
+                    if p.axis_visible:
+                        self.plot.setLabel('left', unit_lbl, color=p.color)
+                        self.plot.getAxis('left').setTextPen(pg.mkPen(p.color))
+                        self.plot.getAxis('left').setStyle(showValues=True)
                 else:
-                    self.plot.setLabel('left', '')
-                    self.plot.getAxis('left').setTextPen(pg.mkPen(None))
-                    self.plot.getAxis('left').setStyle(showValues=False)
-            for axis_key in list(self._items.keys())[1:]:
-                plotted = self._items[axis_key]
-                if plotted.axis is not None and plotted.axis is not self.plot.getAxis('left'):
-                    lbl = plotted.series.signal_name + (
-                        f' ({plotted.series.unit})' if plotted.series.unit else ''
-                    )
-                    plotted.axis.setLabel(lbl, color=plotted.color)
-                    plotted.axis.setTextPen(pg.mkPen(plotted.color))
-                    plotted.axis.setWidth(55)
+                    if p.axis_visible:
+                        p.axis.setLabel(unit_lbl, color=p.color)
+                        p.axis.setTextPen(pg.mkPen(p.color))
         else:
             series = self._items[key].series
             label  = series.signal_name + (f' ({series.unit})' if series.unit else '')
@@ -1581,6 +1796,17 @@ class PlotPanel(QWidget):
 
     def _refresh_table(self) -> None:
         self.table.blockSignals(True)
+
+        # Pre-compute unit-group axis colors (first visible signal per group).
+        # Used for the Ax swatch column in multi-axis mode.
+        _unit_axis_colors: dict[str, str] = {}
+        for key, plotted in self._items.items():
+            if not plotted.visible:
+                continue
+            ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+            if ukey not in _unit_axis_colors:
+                _unit_axis_colors[ukey] = plotted.color
+
         # Build ordered list: group headers interleaved with signal rows
         rows: list[tuple[str, str | None]] = []  # (type, key): type='group'|'signal'
         seen_groups: set[str] = set()
@@ -1621,7 +1847,14 @@ class PlotPanel(QWidget):
                 for item in (sig_item, c1_item, c2_item, un_item):
                     item.setForeground(brush)
                 chk_item.setForeground(brush)
-                # Col 5: Axis visibility checkbox (multi-axis mode only)
+                # Col 5: Ax — colored swatch showing the unit-group axis color
+                ukey         = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+                swatch_color = _unit_axis_colors.get(ukey, '#606060')
+                sw_item = QTableWidgetItem('▮')
+                sw_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                sw_item.setForeground(QBrush(QColor(swatch_color)))
+                sw_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Col 6: Axis visibility checkbox (multi-axis mode only)
                 ax_item = QTableWidgetItem()
                 ax_item.setFlags(
                     Qt.ItemFlag.ItemIsUserCheckable |
@@ -1638,7 +1871,8 @@ class PlotPanel(QWidget):
                 self.table.setItem(row_idx, 2, c1_item)
                 self.table.setItem(row_idx, 3, c2_item)
                 self.table.setItem(row_idx, 4, un_item)
-                self.table.setItem(row_idx, 5, ax_item)
+                self.table.setItem(row_idx, 5, sw_item)
+                self.table.setItem(row_idx, 6, ax_item)
         self.table.blockSignals(False)
         self._apply_collapse_state()
         # Rebuild the key→row index used by _update_table_values on every cursor drag.
@@ -1691,6 +1925,7 @@ class PlotPanel(QWidget):
                 visible=v.visible,
                 group=v.group,
                 axis_visible=v.axis_visible,
+                own_axis=v.own_axis,
             )
             for k, v in self._items.items()
         }
@@ -1847,24 +2082,209 @@ class PlotPanel(QWidget):
 
     # ── Drag-and-drop onto the signal table ─────────────────────────────
 
+    # ── Shared helper: insertion-point from a viewport y coordinate ───────
+
+    def _reorder_insert_row(self, vp_y: int) -> int:
+        """Convert a y position in VIEWPORT coordinates to a logical insert row.
+
+        Returns a value in [0, rowCount()] where rowCount() means "append at
+        end".  Correctly handles the edge cases where rowAt() returns -1:
+          • y above the first visible row → insert before that row (= first row)
+          • y below the last row's bottom  → append (= rowCount())
+        """
+        n = self.table.rowCount()
+        if n == 0:
+            return 0
+
+        drop_row = self.table.rowAt(vp_y)
+        if drop_row == -1:
+            # rowAt returns -1 for y above the content area OR below the last row.
+            # Distinguish by comparing against the first visible row's top edge.
+            for r in range(n):
+                if not self.table.isRowHidden(r):
+                    top = self.table.visualRect(
+                        self.table.model().index(r, 0)
+                    ).top()
+                    return r if vp_y < top else n
+            return n  # all rows hidden
+
+        rect = self.table.visualRect(self.table.model().index(drop_row, 0))
+        if vp_y < rect.top() + rect.height() / 2:
+            return drop_row      # top half → insert before this row
+        else:
+            return drop_row + 1  # bottom half → insert after this row
+
+    # ── Indicator show / hide ─────────────────────────────────────────────
+
+    def _show_drop_indicator(self, insert_row: int) -> None:
+        """Position and show the blue drop-indicator line inside the viewport."""
+        n = self.table.rowCount()
+        vp_w = self.table.viewport().width()
+
+        if insert_row >= n:
+            # Append: line below the last visible row
+            y = 0
+            for r in range(n - 1, -1, -1):
+                if not self.table.isRowHidden(r):
+                    y = self.table.visualRect(
+                        self.table.model().index(r, 0)
+                    ).bottom()
+                    break
+        else:
+            # Find the first non-hidden row at or after insert_row and use its top
+            y = 0
+            for r in range(insert_row, n):
+                if not self.table.isRowHidden(r):
+                    y = self.table.visualRect(
+                        self.table.model().index(r, 0)
+                    ).top()
+                    break
+            else:
+                # All rows from insert_row onward are hidden (collapsed) →
+                # fall back to the bottom of the last visible row before insert_row
+                for r in range(insert_row - 1, -1, -1):
+                    if not self.table.isRowHidden(r):
+                        y = self.table.visualRect(
+                            self.table.model().index(r, 0)
+                        ).bottom()
+                        break
+
+        # Clamp so the indicator stays inside the viewport
+        y = max(0, min(y, self.table.viewport().height() - 2))
+        self._drop_indicator.setGeometry(0, y, vp_w, 2)
+        self._drop_indicator.show()
+        self._drop_indicator.raise_()
+
+    def _hide_drop_indicator(self) -> None:
+        self._drop_indicator.hide()
+
+    # ── Table drag / drop event handlers ─────────────────────────────────
+
     def _table_drag_enter(self, event) -> None:
-        if event.mimeData().hasFormat(SignalTreeWidget.MIME_TYPE):
+        if (event.mimeData().hasFormat(SignalTreeWidget.MIME_TYPE) or
+                event.mimeData().hasFormat(_ReorderTable._ROW_REORDER_MIME)):
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def _table_drop(self, event) -> None:
-        if not event.mimeData().hasFormat(SignalTreeWidget.MIME_TYPE):
-            event.ignore()
-            return
-        payload = bytes(event.mimeData().data(
-            SignalTreeWidget.MIME_TYPE)).decode('utf-8')
-        keys = [p.strip() for p in payload.splitlines() if p.strip()]
-        if keys:
-            self.signalDropped.emit(keys)
+    def _table_drag_move(self, event) -> None:
+        """Accept the move event; show the indicator only for internal reorder drags."""
+        mime = event.mimeData()
+        if mime.hasFormat(_ReorderTable._ROW_REORDER_MIME):
             event.acceptProposedAction()
+            # event.position() is already in viewport coordinates (the
+            # monkey-patch receives events forwarded from the viewport).
+            vp_y = event.position().toPoint().y()
+            self._show_drop_indicator(self._reorder_insert_row(vp_y))
+        elif mime.hasFormat(SignalTreeWidget.MIME_TYPE):
+            event.acceptProposedAction()
+            self._hide_drop_indicator()
         else:
             event.ignore()
+            self._hide_drop_indicator()
+
+    def _table_drag_leave(self, event) -> None:
+        self._hide_drop_indicator()
+
+    def _table_drop(self, event) -> None:
+        self._hide_drop_indicator()
+        mime = event.mimeData()
+        if mime.hasFormat(_ReorderTable._ROW_REORDER_MIME):
+            self._handle_row_reorder_drop(event)
+        elif mime.hasFormat(SignalTreeWidget.MIME_TYPE):
+            payload = bytes(mime.data(SignalTreeWidget.MIME_TYPE)).decode('utf-8')
+            keys = [p.strip() for p in payload.splitlines() if p.strip()]
+            if keys:
+                self.signalDropped.emit(keys)
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        else:
+            event.ignore()
+
+    def _handle_row_reorder_drop(self, event) -> None:
+        """Reorder self._items when the user drags and drops signal rows internally."""
+        payload = bytes(
+            event.mimeData().data(_ReorderTable._ROW_REORDER_MIME)
+        ).decode('utf-8')
+        dragged_keys = [
+            k.strip() for k in payload.splitlines()
+            if k.strip() and k.strip() in self._items
+        ]
+        if not dragged_keys:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+        # event.position() is already in viewport coordinates — no mapping needed.
+        # (The monkey-patch receives the event that Qt forwards from the viewport,
+        # so the position is already relative to the viewport widget.)
+        vp_y = event.position().toPoint().y()
+        insert_row = self._reorder_insert_row(vp_y)
+
+        # ── Build list of (row, type, key) for visible rows ───────────────
+        rows_info: list[tuple[int, str, str]] = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            item0 = self.table.item(row, 0)
+            if not item0:
+                continue
+            k = item0.data(Qt.ItemDataRole.UserRole)
+            if isinstance(k, str) and k.startswith('__group__'):
+                rows_info.append((row, 'group', k[len('__group__'):]))
+            elif isinstance(k, str) and k in self._items:
+                rows_info.append((row, 'signal', k))
+
+        # ── Determine target group at the insertion point ──────────────────
+        # Scan forward through visible rows; track "current group" as each
+        # group header is passed.  An ungrouped signal resets the group context
+        # (so dropping after an ungrouped signal yields no group).
+        target_group = ''
+        for row, rtype, rkey in rows_info:
+            if row >= insert_row:
+                break
+            if rtype == 'group':
+                target_group = rkey
+            elif rtype == 'signal':
+                sig_group = self._items[rkey].group if rkey in self._items else ''
+                if not sig_group:
+                    target_group = ''  # ungrouped signal resets group context
+
+        # ── Find the signal key the dragged block should be inserted before ─
+        # Uses _row_lookup (key→row, rebuilt by _refresh_table); correctly
+        # handles hidden rows in collapsed groups (their real row indices are
+        # stored in _row_lookup even when they are not visible).
+        dragged_set = set(dragged_keys)
+        insert_before_key: str | None = None
+        for key in self._items:
+            if key in dragged_set:
+                continue
+            row = self._row_lookup.get(key)
+            if row is not None and row >= insert_row:
+                insert_before_key = key
+                break
+
+        # ── Compute new key order ──────────────────────────────────────────
+        remaining = [k for k in self._items if k not in dragged_set]
+        if insert_before_key is None:
+            new_order = remaining + dragged_keys
+        else:
+            idx = remaining.index(insert_before_key)
+            new_order = remaining[:idx] + dragged_keys + remaining[idx:]
+
+        # ── Snapshot state BEFORE mutation (consistent with existing convention)
+        self._push_undo()
+
+        # ── Apply group assignment ─────────────────────────────────────────
+        for k in dragged_keys:
+            self._items[k].group = target_group
+
+        # ── Reorder _items (dict order = display order) ────────────────────
+        self._items = {k: self._items[k] for k in new_order}
+
+        # ── Rebuild all views; view ranges are preserved by _rebuild_curves ─
+        self._rebuild_curves(preserve_selection=True)
 
     def _restore_selection(self, keys: list[str]) -> None:
         self.table.clearSelection()
@@ -1957,8 +2377,8 @@ class PlotPanel(QWidget):
         name_item.setForeground(QBrush(QColor('#8ab8e0')))  # light blue
         self.table.setItem(row_idx, 1, name_item)
 
-        # Cols 2-5: empty, same background
-        for col in (2, 3, 4, 5):
+        # Cols 2-6: empty, same background
+        for col in (2, 3, 4, 5, 6):
             cell = QTableWidgetItem('')
             cell.setFlags(Qt.ItemFlag.ItemIsEnabled)
             cell.setBackground(bg)
@@ -2040,7 +2460,9 @@ class PlotPanel(QWidget):
         # Newly-enabled signals have no curve yet — _rebuild_overlay skipped them
         # last pass. The lightweight setVisible toggle can't materialise a curve,
         # so fall through to a full rebuild.
-        needs_rebuild = self._stacked_mode or any(
+        # Multi-axis mode also always rebuilds: axis colors depend on the first
+        # visible signal per unit group, which can change on any visibility toggle.
+        needs_rebuild = self._stacked_mode or self._multi_axis or any(
             p.visible and p.curve is None for p in self._items.values()
         )
         if needs_rebuild:
@@ -2060,23 +2482,30 @@ class PlotPanel(QWidget):
             self._update_table_values(self.v_line2.value(), col=3)
 
     def _toggle_axis_visibility(self, key: str, visible: bool) -> None:
-        """Show or hide the Y axis for a single signal (multi-axis mode only).
+        """Show or hide the Y axis for the unit group of the given signal.
 
+        All signals sharing the same unit group get their axis_visible synced.
         Hiding an axis frees its layout slot so the plot area expands to fill
         the gap.  Showing it re-inserts it at the next available slot.
         """
         plotted = self._items.get(key)
         if plotted is None:
             return
-        plotted.axis_visible = visible
+        # Determine this signal's unit group and sync axis_visible for the whole group.
+        target_ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+        group_keys = [k for k, p in self._items.items()
+                      if self._unit_key(p.series.unit, k, p.own_axis) == target_ukey]
+        for k, p in self._items.items():
+            if self._unit_key(p.series.unit, k, p.own_axis) == target_ukey:
+                p.axis_visible = visible
+        # Apply to the shared axis object (only needs to happen once).
         if plotted.axis is not None:
             if plotted.view_box is None:
                 # Main left axis: setVisible(False) collapses the entire left
                 # margin, destroying the layout space that floating extra axes
                 # depend on.  Fake "hidden" by blanking the visual content instead.
                 if visible:
-                    ms = plotted.series
-                    lbl = ms.signal_name + (f' ({ms.unit})' if ms.unit else '')
+                    lbl = self._axis_group_label(group_keys)
                     plotted.axis.setLabel(lbl, color=plotted.color)
                     plotted.axis.setTextPen(pg.mkPen(plotted.color))
                     plotted.axis.setStyle(showValues=True)
@@ -2088,15 +2517,24 @@ class PlotPanel(QWidget):
                 plotted.axis.setVisible(visible)
         if self._multi_axis and self._extra_axes:
             # Resize the left margin to match the number of now-visible extra axes.
-            # sigResized will fire once the layout settles and reposition everything;
-            # the timer is a safety net for edge cases where sigResized doesn't fire.
             n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
-            new_w = self._MAIN_AXIS_W + self._MAIN_AXIS_TITLE_W + n_vis * (self._EXTRA_AXIS_W + self._EXTRA_AXIS_GAP)
+            new_w = self._compute_main_axis_width(n_vis)
             main_axis = self.plot.getAxis('left')
             main_axis.setWidth(new_w)
             if isinstance(main_axis, _LeftAxis):
                 main_axis._title_x = new_w - self._MAIN_AXIS_W - 5
+                QTimer.singleShot(0, main_axis._apply_title_pos)
             QTimer.singleShot(15, self._update_multi_axis_views)
+        # Refresh table so all rows in the group show the updated checkbox state.
+        self._refresh_table()
+
+    def _set_own_axis(self, keys: list[str], enabled: bool) -> None:
+        """Detach or rejoin signals onto their own individual Y axis in multi-axis mode."""
+        self._push_undo()
+        for key in keys:
+            if key in self._items:
+                self._items[key].own_axis = enabled
+        self._rebuild_curves(preserve_selection=True)
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         """Double-click on group header (col 0 arrow or col 1 name) → rename group."""
@@ -2236,6 +2674,20 @@ class PlotPanel(QWidget):
         grp_act.triggered.connect(self.group_selected)
         grp_act.setEnabled(has_sel)
         menu.addAction(grp_act)
+        # Multi-axis: individual axis option
+        if self._multi_axis:
+            menu.addSeparator()
+            sel_signals = [k for k in selected_keys if k in self._items]
+            all_own = bool(sel_signals) and all(self._items[k].own_axis for k in sel_signals)
+            own_act = QAction('Individual axis', menu)
+            own_act.setCheckable(True)
+            own_act.setChecked(all_own)
+            own_act.setEnabled(has_sel)
+            _keys_snap = list(selected_keys)
+            own_act.triggered.connect(
+                lambda checked, ks=_keys_snap: self._set_own_axis(ks, checked)
+            )
+            menu.addAction(own_act)
         # Signal display sub-menu
         menu.addSeparator()
         disp_menu = self._make_menu(menu)
