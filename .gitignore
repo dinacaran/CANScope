@@ -70,3 +70,5 @@ htmlcov/
 *.key
 .env.*
 secrets.json
+
+.claude/worktrees/
