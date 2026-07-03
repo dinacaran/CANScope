@@ -1,0 +1,8 @@
+{
+  "type": "canscope_channel_config",
+  "version": 1,
+  "name": "Legacy Config",
+  "channels": {
+    "1": "C:/fake/engine.dbc"
+  }
+}

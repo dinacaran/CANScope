@@ -1,0 +1,18 @@
+domain: MotorControl
+description: Motor control fault detection rules
+context_window_s: 1.0
+rules:
+  - id: speed_high
+    condition: EngSpeed > 5000
+    title: Engine speed too high
+    severity: high
+
+  - id: gear_neutral
+    condition: Gear = 3
+    title: Stuck in neutral
+    severity: medium
+
+  - id: compound_fault
+    condition: EngSpeed > 4000 and Throttle > 80
+    title: High speed and high throttle
+    severity: critical
