@@ -7,6 +7,18 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.46] — 2026-07-03
+
+### Changed — Multi-axis mode: shared Y axis per unit, axis-color swatch column, Individual axis in right-click menu.
+
+**Unit grouping** (`gui/plot_widget.py` — `PlotPanel._rebuild_overlay`)
+
+**`fit_to_window` / `fit_vertical`** — multi-axis Y-fit now computes the union
+range across all signals sharing a ViewBox, ensuring the axis is not
+over-zoomed to just the first signal in each group.
+
+---
+
 ## [v00.00.45] — 2026-06-30
 
 ### Added — Test suite

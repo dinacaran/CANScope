@@ -69,7 +69,7 @@ SIGNAL  OPERATOR  VALUE  [and|or  SIGNAL  OPERATOR  VALUE ...]
 ```yaml
 - condition: MotorTemp > 120 and MotorTemp < 135
 - condition: Status = 3 or Status = 5
-- condition: EDS_Err = 1 and EDS_opsts = 2
+- condition: motot_Err = 1 and motot_opstatus = 2
 ```
 
 **Signal name matching** — names in the condition are matched
@@ -85,7 +85,7 @@ signal in the loaded measurement matches, the rule is silently skipped.
 Only `condition` is required. Everything else is optional.
 
 ```yaml
-- condition: EDS_Err > 0          # required — the detection expression
+- condition: motot_Err > 0          # required — the detection expression
 
   id: motor_fault_active          # unique identifier; auto-generated if omitted
   title: Motor fault flag active  # display name; defaults to the condition string
@@ -93,14 +93,14 @@ Only `condition` is required. Everything else is optional.
   enabled: false                  # set to false to disable without deleting (default: true)
 
   description: >                  # free-form text appended to the finding
-    EDS fault flag was asserted. Check the EDS error log.
+    motot fault flag was asserted. Check the motot error log.
 
   suggested_action: >             # hint fed to the LLM
-    Read out the EDS fault memory and compare with the inverter manual.
+    Read out the motot fault memory and compare with the inverter manual.
 
   plot_signals:                   # signals to auto-plot when this fault fires
-    - EDS_Err                     # matched case-insensitively, same as condition
-    - EDS_sts
+    - motot_Err                     # matched case-insensitively, same as condition
+    - motot_status
     - EngSpeed
 ```
 
@@ -140,12 +140,12 @@ context_window_s: 1.0
 
 rules:
 
-  # Fault flag: fire whenever EDS_Err is non-zero
-  - condition: EDS_Err > 0
+  # Fault flag: fire whenever motot_Err is non-zero
+  - condition: motot_Err > 0
     severity: critical
     plot_signals:
-      - EDS_Err
-      - EDS_opsts
+      - motot_Err
+      - motot_opstatus
 
   # Range violation: temperature outside operating band
   - condition: MotorTemp > 130
@@ -247,7 +247,7 @@ Common mistakes:
 
 | Error | Cause |
 |-------|-------|
-| `each rule needs a 'condition' expression` | `condition` key missing or empty |
+| `each rule nemotot a 'condition' expression` | `condition` key missing or empty |
 | `Cannot parse: '...'` | Expression is not in `SIGNAL OP VALUE` format |
 | `severity must be one of ...` | Unknown severity string |
 | `duplicate rule id '...'` | Two rules share the same `id` |
