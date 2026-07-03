@@ -4,13 +4,13 @@
 
 \- \[x] Adding/deleting a new signal resets the plot window, so the focus point of the time range is lost. I want to keep the view x range and y range after adding a signal.
 
-\- \[ ] In light background color, the signal ON/OFF check mark and unit ON/OFF are not visible
+\- \[x] In light background color, the signal ON/OFF check mark and unit ON/OFF are not visible
 
-\- \[ ] Disabled signals are too dark in light background.
+\- \[x] Disabled signals are too dark in light background.
 
 \- \[x] Sometimes when I switch ON, the signal does not render/display
 
-\- \[ ] Shortcut for Color and cursor
+\- \[x] Shortcut for Color and cursor
 
 \- \[ ] Group heading background color not changing with respect to Background color change
 
