@@ -16,20 +16,15 @@ build/
 .eggs/
 pip-wheel-metadata/
 *.whl
-
 # ── Virtual environments ──────────────────────────────────────────────────
 .venv/
 venv/
 env/
 ENV/
 .env
-
 # ── PyInstaller ───────────────────────────────────────────────────────────
 # Keep CANScope.spec in source control; exclude build artefacts
-dist/
-build/
 *.spec.bak
-
 # ── IDE / editors ─────────────────────────────────────────────────────────
 .vscode/
 .idea/
@@ -38,12 +33,10 @@ build/
 *.swp
 *.swo
 *~
-
 # ── OS artefacts ──────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
-
 # ── CAN Scope runtime files ───────────────────────────────────────────────
 canscope_dev.log
 canscope_config.json
@@ -52,23 +45,20 @@ canscope_config.json
 *.mdf
 *.asc
 *.dbc
-
 # ── Test / coverage ───────────────────────────────────────────────────────
 .pytest_cache/
 .coverage
 htmlcov/
 *.coveragerc
-
 # ── Test fixtures ─────────────────────────────────────────────────────────
 # sample.blf and sample.asc are generated locally by tests/fixtures/_generate.py
 # and intentionally NOT committed (already caught by *.blf / *.asc above).
 # sample.dbc is a hand-written text fixture that IS committed — un-exclude it.
 !tests/fixtures/sample.dbc
-
 # ── Secrets ───────────────────────────────────────────────────────────────
 *.pem
 *.key
 .env.*
 secrets.json
-
 .claude/worktrees/
+*.bak
