@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self._pending_plot_visible: dict[str, bool] = {}
         self._pending_plot_groups:  dict[str, str]  = {}
         self._pending_plot_axis_visible: dict[str, bool] = {}
+        self._pending_plot_own_axis: dict[str, bool] = {}
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
@@ -271,6 +272,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         QShortcut(QKeySequence('Ctrl+S'), self, activated=self.save_configuration)
         QShortcut(QKeySequence('F'), self, activated=self.plot_panel.fit_to_window)
         QShortcut(QKeySequence('V'), self, activated=self.plot_panel.fit_vertical)
+        QShortcut(QKeySequence('C'), self, activated=self._shortcut_change_signal_color)
+        QShortcut(QKeySequence('R'), self, activated=self._shortcut_toggle_cursors)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=lambda: self.add_signals_to_plot(self.signal_tree.selected_signal_keys()))
         QShortcut(QKeySequence('Ctrl+Up'), self, activated=self.plot_panel.move_selected_up)
         # Raw Frames hidden from GUI to prevent hang on large files — accessible via shortcut
@@ -411,6 +414,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_status('Cursor 2 updated',
                             'Drag C2 line to measure time delta between cursors')
 
+    def _shortcut_change_signal_color(self) -> None:
+        key = self.plot_panel._current_key
+        if not key or key not in self.plot_panel._items:
+            keys = self.plot_panel.selected_keys()
+            key = keys[0] if keys else None
+        if key:
+            self.plot_panel._choose_color_for_key(str(key))
+
+    def _shortcut_toggle_cursors(self) -> None:
+        both_on = self.btn_cursor1.isChecked() and self.btn_cursor2.isChecked()
+        target = not both_on
+        self.btn_cursor1.setChecked(target)
+        self.btn_cursor2.setChecked(target)
+
     def show_raw_frames(self) -> None:
         rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
         if not rfs or len(rfs) == 0:
@@ -441,6 +458,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     'visible':      self.plot_panel._items[k].visible,
                     'group':        self.plot_panel._items[k].group,
                     'axis_visible': self.plot_panel._items[k].axis_visible,
+                    'own_axis':     self.plot_panel._items[k].own_axis,
                 }
                 for k in self.plot_panel.plotted_keys()
             ],
@@ -494,6 +512,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         pending_visible      = {}
         pending_groups       = {}
         pending_axis_visible = {}
+        pending_own_axis     = {}
         for s in signals_data:
             if isinstance(s, str):
                 pending_keys.append(s)
@@ -507,6 +526,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         pending_groups[k] = str(s['group'])
                     if 'axis_visible' in s:
                         pending_axis_visible[k] = bool(s['axis_visible'])
+                    if 'own_axis' in s:
+                        pending_own_axis[k] = bool(s['own_axis'])
         pending_colors = dict(data.get('signal_colors') or {})
 
         # Fix 6: if data is already decoded, ask the user what to do
@@ -559,6 +580,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if key in pending_axis_visible:
                         self.plot_panel._items[key].axis_visible = pending_axis_visible[key]
                         needs_rebuild = True
+                    if key in pending_own_axis:
+                        self.plot_panel._items[key].own_axis = pending_own_axis[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             return
@@ -572,6 +596,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._pending_plot_visible      = pending_visible
         self._pending_plot_groups       = pending_groups
         self._pending_plot_axis_visible = pending_axis_visible
+        self._pending_plot_own_axis     = pending_own_axis
         self._update_measurement_tab()
         if not self.blf_path or not self.dbc_path:
             QMessageBox.warning(self, 'Incomplete configuration', 'The configuration file does not contain both BLF and DBC paths.')
@@ -766,6 +791,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             visible      = dict(getattr(self, '_pending_plot_visible',      {}))
             groups       = dict(getattr(self, '_pending_plot_groups',       {}))
             axis_visible = dict(getattr(self, '_pending_plot_axis_visible', {}))
+            own_axis     = dict(getattr(self, '_pending_plot_own_axis',     {}))
             self._pending_plot_keys = []
             self.add_signals_to_plot(wanted)
             for key, color in colors.items():
@@ -783,12 +809,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if key in axis_visible:
                         self.plot_panel._items[key].axis_visible = axis_visible[key]
                         needs_rebuild = True
+                    if key in own_axis:
+                        self.plot_panel._items[key].own_axis = own_axis[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             self._pending_plot_colors       = {}
             self._pending_plot_visible      = {}
             self._pending_plot_groups       = {}
             self._pending_plot_axis_visible = {}
+            self._pending_plot_own_axis     = {}
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:
