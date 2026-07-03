@@ -70,3 +70,4 @@ htmlcov/
 *.key
 .env.*
 secrets.json
+*.bak
