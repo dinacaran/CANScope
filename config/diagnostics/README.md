@@ -11,18 +11,25 @@ After editing, click **Reload Rules** in the Diagnostics window
 
 ## File layout
 
-One YAML file per **domain** (e.g. motor control, chassis, ADAS):
+One YAML file per **domain** (e.g. motor control, chassis, ADAS). Put your
+rule files in the **`base_rules/`** sub-folder:
 
 ```
 config/diagnostics/
-├── motor_control.yaml        ← shipped example
-├── chassis.yaml              ← add your own
-├── adas.yaml
-└── ...
+├── base_rules/               ← YOUR hand-written rule files go here
+│   ├── motor_control.yaml    ← shipped example
+│   ├── chassis.yaml          ← add your own
+│   └── ...
+├── generated/                ← AI-agent workspace (auto-managed; do not edit)
+├── knowledge/                ← diagnostic docs the AI agent reads (see agent.yaml)
+├── agent.yaml                ← AI agent on/off switch + settings
+└── README.md                 ← this file
 ```
 
-The diagnostics engine auto-discovers every `*.yaml` / `*.yml` file in
-this directory.
+The diagnostics engine auto-discovers every `*.yaml` / `*.yml` file under
+`base_rules/` (and any the agent writes under `generated/`). Files that share
+the same `domain:` name are merged. **Tip:** the *Edit Rules…* button opens the
+`base_rules/` folder for you.
 
 ---
 
@@ -199,9 +206,35 @@ rules:
 
 ---
 
+## Advanced rule types (optional)
+
+Besides the `condition` expression above, a rule can declare an explicit
+`type` for a dedicated check. These are handy for the AI agent but you can use
+them by hand too:
+
+```yaml
+# Range check — flag samples outside a band
+- type: range_check
+  signal: dc_bus_voltage
+  max: 450            # at least one of min / max
+  unit: V
+
+# Message loss — flag gaps between samples (ECU off-bus / heartbeat lost)
+- type: message_loss
+  signal: rpm_actual
+  max_gap_s: 0.5
+
+# Fault signal — flag a fault flag / state
+- type: fault_signal
+  signal: motor_fault_flag
+  fault_when: { not_equals: 0 }   # or equals/gt/lt/ge/le/in/bit_set
+```
+
+---
+
 ## Adding a new domain
 
-Create a new YAML file in this folder, e.g. `chassis.yaml`:
+Create a new YAML file in the `base_rules/` folder, e.g. `chassis.yaml`:
 
 ```yaml
 domain: Chassis
@@ -251,6 +284,45 @@ Common mistakes:
 | `Cannot parse: '...'` | Expression is not in `SIGNAL OP VALUE` format |
 | `severity must be one of ...` | Unknown severity string |
 | `duplicate rule id '...'` | Two rules share the same `id` |
+
+---
+
+## Excel manuals (optional, for the AI agent)
+
+If you maintain a diagnostic manual in Excel, drop the `.xlsx` file straight
+into the `knowledge/` folder — no conversion to Markdown needed:
+
+```
+config/diagnostics/knowledge/
+├── my_manual.xlsx            ← shared across ALL platforms
+└── generic/                  ← knowledge for the "generic" platform (agent.yaml)
+    ├── another_manual.xlsx   ← platform-specific
+    └── *.md
+```
+
+The AI agent (Phase 2, `agent.yaml`) reads every `*.xlsx` it finds in both the
+`knowledge/` root and your platform's sub-folder, alongside the `*.md` files.
+Files starting with `~$` (Excel's temporary lock files) are ignored. Changes
+are picked up automatically the next time you click **Start Agent** — no
+restart, and unchanged files aren't re-parsed.
+
+Each sheet is inspected by its **column headers**, not its sheet name, so the
+layout below is a guide, not a strict template:
+
+| Sheet shape | Needs at least | Produces |
+|---|---|---|
+| **DTC manual** | a `DTC` or `Measurement_ID` column, plus one explanatory column (e.g. `Fault Title`, `Root Cause`, `Troubleshooting Steps`, `Detection Logic`, `Repair Action`) | one doc per row |
+| **Rule/diagnosis sheet** | a `Rule ID` column plus a signal-condition column (e.g. `Signal Condition`) | one doc per row, with the condition kept verbatim — useful for writing YAML rules |
+| **Signal dictionary** | a `Signal Name` column (with, e.g., `Unit` / `Normal Range` / `Diagnostic Use`) | one combined doc for the whole sheet |
+
+Any other column is still included — it just shows up as `Column Header:
+value` in the doc text instead of being dropped. Sheets with none of the
+columns above (dashboards, lookup helpers, raw per-sample data dumps) are
+skipped automatically.
+
+Both the numeric form of a DTC (e.g. `522`) and its full code (`P0522`) are
+indexed, so either one — or a plain-English query like "oil pressure low" —
+can retrieve the same doc.
 
 ---
 

@@ -28,6 +28,7 @@ import numpy as np
 from core.diagnostics.config_loader import RuleConfig
 from core.diagnostics.context import DiagnosticContext
 from core.diagnostics.models import Finding
+from core.diagnostics.rules import episodes
 
 
 def run(rule: RuleConfig, ctx: DiagnosticContext) -> list[Finding]:
@@ -39,57 +40,101 @@ def run(rule: RuleConfig, ctx: DiagnosticContext) -> list[Finding]:
     if len(vals) == 0:
         return []
 
-    op, target = next(iter(rule.condition.items()))
+    if not rule.fault_when:
+        return []
+    op, target = next(iter(rule.fault_when.items()))
     mask = _apply_operator(op, vals, target)
     if mask is None or not mask.any():
         return []
 
-    n_fault = int(mask.sum())
-    fault_ts = ts[mask]
-    t_first = float(fault_ts[0])
-    t_last  = float(fault_ts[-1])
-    fault_values = vals[mask]
-    sample_value = float(fault_values[0])
-
-    distinct_values = sorted({float(v) for v in fault_values[:50]})
-    distinct_str = ", ".join(f"{v:g}" for v in distinct_values[:5])
-    if len(distinct_values) > 5:
-        distinct_str += f", … (+{len(distinct_values) - 5} more)"
-
-    description = rule.description or (
-        f"{series.signal_name} asserted a fault condition "
-        f"({op} {target!r}) on {n_fault} sample(s)."
-    )
-    description += (
-        f" First occurrence at t={t_first:.2f}s, last at t={t_last:.2f}s. "
-        f"Observed fault value(s): {distinct_str}."
-    )
+    total_samples = int(len(vals))
+    fault_ts   = ts[mask]
+    fault_vals = vals[mask]
 
     series_key = next(
         (k for k, v in ctx.store._series_by_key.items() if v is series),
         series.signal_name,
     )
 
-    finding = Finding(
-        detector_name=f"yaml::{rule.id}",
-        title=rule.title,
-        description=description,
-        severity=rule.severity,
-        time_window=(t_first, t_last),
-        signals=[series_key],
-        metrics={
-            "rule_id":         rule.id,
-            "rule_type":       rule.type,
-            "operator":        op,
-            "target":          target,
-            "fault_samples":   n_fault,
-            "total_samples":   int(len(vals)),
-            "fault_fraction":  n_fault / len(vals),
-            "first_value":     sample_value,
-            "distinct_values": distinct_values[:10],
-        },
-    )
-    return [finding]
+    merge_gap = ctx.domain.context_window_s if ctx.domain is not None else 2.0
+    ranges = episodes.index_ranges(fault_ts, merge_gap)
+    episode_count = len(ranges)
+
+    kept = ranges[: episodes.MAX_FINDINGS_PER_RULE]
+    findings: list[Finding] = []
+    for ep_i, (a, b) in enumerate(kept, start=1):
+        t_first = float(fault_ts[a])
+        t_last  = float(fault_ts[b])
+        ep_vals = fault_vals[a:b + 1]
+        n_fault = b - a + 1
+        sample_value = float(ep_vals[0])
+
+        distinct_values = sorted({float(v) for v in ep_vals[:50]})
+        distinct_str = ", ".join(f"{v:g}" for v in distinct_values[:5])
+        if len(distinct_values) > 5:
+            distinct_str += f", … (+{len(distinct_values) - 5} more)"
+
+        description = rule.description or (
+            f"{series.signal_name} asserted a fault condition "
+            f"({op} {target!r}) in episode {ep_i}/{episode_count} "
+            f"on {n_fault} sample(s)."
+        )
+        description += (
+            f" From t={t_first:.2f}s to t={t_last:.2f}s "
+            f"(duration {t_last - t_first:.2f}s). "
+            f"Observed fault value(s): {distinct_str}."
+        )
+
+        findings.append(Finding(
+            detector_name=f"yaml::{rule.id}",
+            title=rule.title,
+            description=description,
+            severity=rule.severity,
+            time_window=(t_first, t_last),
+            signals=[series_key],
+            metrics={
+                "rule_id":         rule.id,
+                "rule_type":       rule.type,
+                "operator":        op,
+                "target":          target,
+                "fault_samples":   int(n_fault),
+                "total_samples":   total_samples,
+                "fault_fraction":  n_fault / total_samples,
+                "first_value":     sample_value,
+                "distinct_values": distinct_values[:10],
+                "episode_index":   ep_i,
+                "episode_count":   episode_count,
+                "duration_s":      t_last - t_first,
+            },
+        ))
+
+    if episode_count > episodes.MAX_FINDINGS_PER_RULE:
+        dropped = ranges[episodes.MAX_FINDINGS_PER_RULE:]
+        span_start = float(fault_ts[dropped[0][0]])
+        span_end   = float(fault_ts[dropped[-1][1]])
+        extra = len(dropped)
+        findings.append(Finding(
+            detector_name=f"yaml::{rule.id}",
+            title=f"{rule.title} (+{extra} more episodes)",
+            description=(
+                f"{series.signal_name} asserted a fault in {episode_count} "
+                f"episodes total; only the first {episodes.MAX_FINDINGS_PER_RULE} "
+                f"are listed individually. The remaining {extra} span "
+                f"t={span_start:.2f}s–{span_end:.2f}s."
+            ),
+            severity=rule.severity,
+            time_window=(span_start, span_end),
+            signals=[series_key],
+            metrics={
+                "rule_id":            rule.id,
+                "rule_type":          rule.type,
+                "episode_count":      episode_count,
+                "episodes_truncated": True,
+                "episodes_omitted":   extra,
+            },
+        ))
+
+    return findings
 
 
 # ── operator implementations ─────────────────────────────────────────────

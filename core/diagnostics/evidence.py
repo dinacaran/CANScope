@@ -6,10 +6,88 @@ millions of samples (tens of MB) but each Evidence packet is < 5 KB.
 """
 from __future__ import annotations
 
+import re
+from typing import TYPE_CHECKING
+
 import numpy as np
 
 from core.diagnostics.context import DiagnosticContext
 from core.diagnostics.models import Evidence, Finding
+
+if TYPE_CHECKING:
+    from core.diagnostics.agent.knowledge import KnowledgeIndex
+
+# A signal is treated as the Diagnostic Trouble Code channel if its name looks
+# like a DTC id (e.g. "Active_DTC_ID", "DTC", "Full_DTC").
+_DTC_SIGNAL_RE = re.compile(r"dtc", re.IGNORECASE)
+
+
+def related_signal_keys(
+    finding: Finding,
+    ctx: DiagnosticContext,
+    knowledge: "KnowledgeIndex",
+    *,
+    limit: int,
+) -> list[str]:
+    """Store keys of signals the knowledge manual associates with an active DTC.
+
+    The DTC (e.g. ``Active_DTC_ID``) frequently flips to its fault code
+    *slightly after* the fault trigger, so the code is read over the finding's
+    window **expanded by ``context_window_s``** (forward padding catches the
+    late transition).  Every distinct non-zero code is looked up in *knowledge*
+    and its "CANscope Signals to Plot" names are resolved to store keys.
+
+    Returns keys not already in ``finding.signals`` (rule-referenced signals keep
+    priority), at most *limit*.  Returns ``[]`` when knowledge is empty, no DTC
+    signal exists, or nothing resolves — so plain-engine mode is unchanged.
+    """
+    if knowledge is None or not getattr(knowledge, "docs", None) or limit <= 0:
+        return []
+
+    win_start, win_end = _padded_window(finding, ctx)
+    codes = _active_dtc_codes(ctx, win_start, win_end)
+    if not codes:
+        return []
+
+    already = set(finding.signals)
+    out: list[str] = []
+    for code in codes:
+        for name in knowledge.candidate_signals(str(code), k=3):
+            key = ctx.resolve_signal_key(name)
+            if key is None or key in already or key in out:
+                continue
+            out.append(key)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _padded_window(finding: Finding, ctx: DiagnosticContext) -> tuple[float, float]:
+    t_start, t_end = finding.time_window
+    padding = (
+        ctx.domain.context_window_s
+        if ctx.domain is not None
+        else EvidenceBuilder.WINDOW_PADDING_S
+    )
+    return max(0.0, t_start - padding), t_end + padding
+
+
+def _active_dtc_codes(
+    ctx: DiagnosticContext, win_start: float, win_end: float
+) -> list[int]:
+    """Distinct non-zero DTC codes present on any DTC signal within the window."""
+    codes: list[int] = []
+    for series in ctx.store._series_by_key.values():
+        name = getattr(series, "signal_name", "") or ""
+        if not _DTC_SIGNAL_RE.search(name):
+            continue
+        _ts, vals = ctx.values_in_window(series, win_start, win_end)
+        for v in vals:
+            if np.isfinite(v) and v != 0:
+                code = int(v)
+                if code not in codes:
+                    codes.append(code)
+    return codes
 
 
 class EvidenceBuilder:
@@ -30,24 +108,30 @@ class EvidenceBuilder:
     """
 
     MAX_POINTS_PER_SIGNAL: int = 100
-    MAX_SIGNALS_PER_FINDING: int = 6
+    MAX_SIGNALS_PER_FINDING: int = 8
     WINDOW_PADDING_S: float = 2.0
 
     def build_for_finding(
         self,
         finding: Finding,
         ctx: DiagnosticContext,
+        knowledge: "KnowledgeIndex | None" = None,
+        extra_signal_keys: list[str] | None = None,
     ) -> Evidence:
-        t_start, t_end = finding.time_window
-        padding = (
-            ctx.domain.context_window_s
-            if ctx.domain is not None
-            else self.WINDOW_PADDING_S
-        )
-        win_start = max(0.0, t_start - padding)
-        win_end   = t_end + padding
+        win_start, win_end = _padded_window(finding, ctx)
 
-        signals_to_use = finding.signals[: self.MAX_SIGNALS_PER_FINDING]
+        # Rule-referenced signals keep priority; knowledge-derived related
+        # signals (DTC manual) fill any remaining slots up to the cap.
+        if extra_signal_keys is None and knowledge is not None:
+            extra_signal_keys = related_signal_keys(
+                finding, ctx, knowledge,
+                limit=max(0, self.MAX_SIGNALS_PER_FINDING - len(finding.signals)),
+            )
+        combined = list(finding.signals)
+        for key in (extra_signal_keys or []):
+            if key not in combined:
+                combined.append(key)
+        signals_to_use = combined[: self.MAX_SIGNALS_PER_FINDING]
 
         # Per-signal stats over the *whole recording* (not just the window)
         signals_summary: dict[str, dict[str, float]] = {}

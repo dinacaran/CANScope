@@ -27,7 +27,6 @@ The client is intentionally vendor-neutral — to swap providers, point
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -181,23 +180,22 @@ class GitHubModelsClient:
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _resolve_token() -> str:
-    """Resolve a GitHub token from env vars or the user's .canscope folder."""
-    for env_name in ("GITHUB_TOKEN", "GITHUB_PAT"):
-        tok = os.environ.get(env_name)
-        if tok:
-            return tok.strip()
+    """Resolve a GitHub token from env vars or the user's .canscope folder.
 
-    home = Path(os.path.expanduser("~"))
-    token_file = home / ".canscope" / "copilot_token"
-    if token_file.exists():
-        try:
-            return token_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
+    Delegates the precedence logic to :mod:`token_store` so the GUI can share
+    the exact same resolution when reporting status.
+    """
+    from core.diagnostics.llm.token_store import (
+        resolve_token_source, token_file_path,
+    )
+
+    token, _source = resolve_token_source()
+    if token:
+        return token
 
     raise LLMError(
         "No GitHub token found. Set the GITHUB_TOKEN environment variable "
-        f"or place a PAT at {token_file}.\n"
+        f"or place a PAT at {token_file_path()}.\n"
         "Generate a token at https://github.com/settings/tokens with "
         "'models: read' permission."
     )

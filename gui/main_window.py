@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
+    QButtonGroup,
     QSizePolicy,
     QStatusBar,
     QTabWidget,
@@ -113,8 +115,6 @@ class MainWindow(QMainWindow):
         button_layout.setContentsMargins(0, 0, 0, 0)
         self.btn_fit = QPushButton('Fit to Window')
         self.btn_fit_v = QPushButton('Fit Vertical')
-        self.btn_move_up = QPushButton('Move Up')
-        self.btn_move_down = QPushButton('Move Down')
         self.btn_remove = QPushButton('Remove Selected')
         self.btn_multi_axis = QPushButton('Multi-Axis')
         self.btn_multi_axis.setCheckable(True)
@@ -127,14 +127,12 @@ class MainWindow(QMainWindow):
         self.btn_cursor2.setCheckable(True)
         self.btn_points = QPushButton('Show Data Points')
         self.btn_points.setCheckable(True)
-        for btn in (self.btn_fit, self.btn_fit_v, self.btn_move_up, self.btn_move_down, self.btn_remove, self.btn_multi_axis, self.btn_stacked, self.btn_cursor1, self.btn_cursor2, self.btn_points):
+        for btn in (self.btn_fit, self.btn_fit_v, self.btn_remove, self.btn_multi_axis, self.btn_stacked, self.btn_cursor1, self.btn_cursor2, self.btn_points):
             button_layout.addWidget(btn)
         button_layout.addStretch(1)
 
         self.btn_fit.clicked.connect(self.plot_panel.fit_to_window)
         self.btn_fit_v.clicked.connect(self.plot_panel.fit_vertical)
-        self.btn_move_up.clicked.connect(self.plot_panel.move_selected_up)
-        self.btn_move_down.clicked.connect(self.plot_panel.move_selected_down)
         self.btn_remove.clicked.connect(self.plot_panel.remove_selected_series)
         self.btn_multi_axis.toggled.connect(self._toggle_multi_axis)
         self.btn_stacked.toggled.connect(self._toggle_stacked)
@@ -249,7 +247,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ('Load + Decode',self.load_data),
             ('Save Config',  self.save_configuration),
             ('Load Config',  self.load_configuration),
-            ('Export CSV',   self.export_selected_csv),
+            ('Export',       self.export_selected),
             ('Clear Plots',  self.plot_panel.clear_all),
         ]:
             act = QAction(text, self)
@@ -275,10 +273,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         QShortcut(QKeySequence('C'), self, activated=self._shortcut_change_signal_color)
         QShortcut(QKeySequence('R'), self, activated=self._shortcut_toggle_cursors)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=lambda: self.add_signals_to_plot(self.signal_tree.selected_signal_keys()))
-        QShortcut(QKeySequence('Ctrl+Up'), self, activated=self.plot_panel.move_selected_up)
         # Raw Frames hidden from GUI to prevent hang on large files — accessible via shortcut
         QShortcut(QKeySequence('Ctrl+Shift+R'), self, activated=self.show_raw_frames)
-        QShortcut(QKeySequence('Ctrl+Down'), self, activated=self.plot_panel.move_selected_down)
         QShortcut(QKeySequence('Ctrl+Z'), self, activated=self.plot_panel.undo)
 
     def choose_blf(self) -> None:
@@ -706,19 +702,91 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if t0 or t1:
             self.plot_panel.zoom_to_time(t0, t1)
 
-    def export_selected_csv(self) -> None:
+    # Export formats, in the order shown in the picker. Add a new format by
+    # appending one (label, file_filter, default_ext, handler) entry — the
+    # handler returns True if a file was written, False if the user backed out.
+    def _export_formats(self) -> list[tuple[str, str, str, object]]:
+        return [
+            ('CAN CSV',      'CSV Files (*.csv)',   '.csv',  self._write_export_csv),
+            ('Excel (.xlsx)', 'Excel Files (*.xlsx)', '.xlsx', self._write_export_xlsx),
+        ]
+
+    def export_selected(self) -> None:
         series_items = self.plot_panel.plotted_series()
         if not series_items:
-            QMessageBox.information(self, 'No plots', 'Plot one or more signals before exporting CSV.')
+            QMessageBox.information(self, 'No plots', 'Plot one or more signals before exporting.')
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'Export selected signals', 'selected_signals.csv', 'CSV Files (*.csv)')
+
+        formats = self._export_formats()
+        choice = self._ask_export_format(formats)
+        if choice is None:
+            return
+        label, file_filter, default_ext, handler = choice
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Export selected signals', f'selected_signals{default_ext}', file_filter,
+        )
         if not path:
             return
+        if not path.lower().endswith(default_ext):
+            path += default_ext
+
         try:
-            ExportService.export_series_to_csv(series_items, path)
-            self._log(f'Exported CSV: {path}')
+            wrote = handler(series_items, path)
         except Exception as exc:
             QMessageBox.critical(self, 'Export failed', str(exc))
+            return
+        if wrote:
+            self._log(f'Exported {label}: {path}')
+
+    def _ask_export_format(self, formats):
+        """Modal format picker (radio list); returns the chosen entry or None."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Export')
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel('Choose an export format:'))
+        group = QButtonGroup(dlg)
+        for i, (label, *_rest) in enumerate(formats):
+            rb = QRadioButton(label, dlg)
+            if i == 0:
+                rb.setChecked(True)
+            group.addButton(rb, i)
+            layout.addWidget(rb)
+        buttons = QHBoxLayout()
+        export_btn = QPushButton('Export')
+        cancel_btn = QPushButton('Cancel')
+        export_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return formats[group.checkedId()]
+
+    def _write_export_csv(self, series_items, path) -> bool:
+        ExportService.export_series_to_csv(series_items, path)
+        return True
+
+    def _write_export_xlsx(self, series_items, path) -> bool:
+        data_rows = ExportService.count_data_rows(series_items)
+        max_data_rows = None
+        if data_rows + 1 > ExportService.EXCEL_MAX_ROWS:
+            cap = ExportService.EXCEL_MAX_ROWS - 1
+            answer = QMessageBox.warning(
+                self, 'Row limit exceeded',
+                f'The data has {data_rows:,} rows, but Excel supports at most '
+                f'{ExportService.EXCEL_MAX_ROWS:,} rows per sheet (including the '
+                f'header).\n\nContinue and keep only the first {cap:,} rows, or cancel?',
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Ok:
+                return False
+            max_data_rows = cap
+        ExportService.export_series_to_excel(series_items, path, max_data_rows=max_data_rows)
+        return True
 
     # ── Shortcuts dialog ──────────────────────────────────────────────────
 
@@ -730,8 +798,6 @@ QToolButton:pressed { background-color: #1a2a3a; }
         ('Delete',          'Remove selected signal from plot'),
         ('Ctrl + Z',        'Undo last plot action (up to 3 levels)'),
         ('Ctrl + S',        'Save current configuration to JSON'),
-        ('Ctrl + Up',       'Move selected signal up in the plot list'),
-        ('Ctrl + Down',     'Move selected signal down in the plot list'),
         ('Ctrl + Shift + R','Open Raw CAN Frame viewer (BLF / ASC only)'),
     ]
 
@@ -835,7 +901,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._thread = None
 
     def _on_plot_selection_changed(self, key: str) -> None:
-        self._update_status(f'Selected plot: {key}', 'Delete removes selected plot rows; Ctrl+Up/Down reorders them')
+        self._update_status(f'Selected plot: {key}', 'Delete removes selected plot rows; drag rows to reorder them')
 
     def _toggle_left_panel(self) -> None:
         self.left_dock.setVisible(not self.left_dock.isVisible())
@@ -893,7 +959,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
     # needs_file  = requires measurement file to be selected
     # needs_store = requires decode to have completed
     _ACTS_NEEDS_FILE  = {'Load + Decode'}
-    _ACTS_NEEDS_STORE = {'Save Config', 'Export CSV', 'Clear Plots'}
+    _ACTS_NEEDS_STORE = {'Save Config', 'Export', 'Clear Plots'}
 
     def _update_action_states(self) -> None:
         """Grey out toolbar actions that are not yet usable."""

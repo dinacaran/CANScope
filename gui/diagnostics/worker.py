@@ -60,9 +60,18 @@ class LLMWorker(QObject):
 # ── Helper: spawn a worker on a fresh QThread, auto-clean on finish ─────
 
 def run_worker(parent: QObject, worker: QObject) -> QThread:
-    """Move *worker* to a new QThread, connect its lifetime, start it."""
+    """Move *worker* to a new QThread, connect its lifetime, start it.
+
+    The thread keeps a strong reference to *worker* for its whole lifetime.
+    Without this, nothing holds the Python object alive once the caller's
+    local variable goes out of scope — PySide6 does not keep a slot's
+    receiver alive just because a signal is connected to it — so *worker*
+    could be garbage-collected before ``thread.started`` fires, leaving
+    ``run()`` never called and ``finished``/``failed`` never emitted.
+    """
     thread = QThread(parent)
     worker.moveToThread(thread)
+    thread._worker = worker
     thread.started.connect(worker.run)
 
     def _quit_thread(*args, **kwargs):

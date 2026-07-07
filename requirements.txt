@@ -9,6 +9,8 @@ pyinstaller>=6.0
 pyyaml>=6.0
 # HTTP client for GitHub Models API (AI diagnosis feature, hidden Ctrl+Shift+A)
 requests>=2.31
+# Read-only .xlsx parsing for Excel diagnostic manuals under config/diagnostics/knowledge/
+openpyxl>=3.1
 # canmatrix is required by python-can's MF4Reader for MDF bus logging support.
 # Install if you plan to open MDF files that contain raw CAN bus frames.
 # canmatrix

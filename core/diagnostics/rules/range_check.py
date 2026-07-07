@@ -23,6 +23,7 @@ import numpy as np
 from core.diagnostics.config_loader import RuleConfig
 from core.diagnostics.context import DiagnosticContext
 from core.diagnostics.models import Finding, Severity
+from core.diagnostics.rules import episodes
 
 
 def run(rule: RuleConfig, ctx: DiagnosticContext) -> list[Finding]:
@@ -42,16 +43,11 @@ def run(rule: RuleConfig, ctx: DiagnosticContext) -> list[Finding]:
     if not mask.any():
         return []
 
+    total_samples = int(len(vals))
     n_violate = int(mask.sum())
-    violating_ts   = ts[mask]
-    violating_vals = vals[mask]
-    t_first = float(violating_ts[0])
-    t_last  = float(violating_ts[-1])
-    v_min   = float(violating_vals.min())
-    v_max   = float(violating_vals.max())
-    fraction = n_violate / len(vals)
+    fraction = n_violate / total_samples
 
-    # Auto-escalate severity if violations dominate the recording
+    # Auto-escalate severity if violations dominate the recording (global rate).
     severity = rule.severity
     if fraction > 0.10 and severity < Severity.CRITICAL:
         severity = Severity.CRITICAL
@@ -60,40 +56,88 @@ def run(rule: RuleConfig, ctx: DiagnosticContext) -> list[Finding]:
 
     unit = rule.unit or series.unit or ""
     bound_text = _format_bounds(rule.min_value, rule.max_value, unit)
-    description = rule.description or (
-        f"{series.signal_name} exceeded its allowed range {bound_text}."
-    )
-    description += (
-        f" Observed extremes: {v_min:g}…{v_max:g} {unit}. "
-        f"{n_violate} samples ({fraction*100:.2f}%) outside range, "
-        f"first at t={t_first:.2f}s, last at t={t_last:.2f}s."
-    )
+
+    violating_ts   = ts[mask]
+    violating_vals = vals[mask]
 
     series_key = next(
         (k for k, v in ctx.store._series_by_key.items() if v is series),
         series.signal_name,
     )
 
-    finding = Finding(
-        detector_name=f"yaml::{rule.id}",
-        title=rule.title,
-        description=description,
-        severity=severity,
-        time_window=(t_first, t_last),
-        signals=[series_key],
-        metrics={
-            "rule_id":            rule.id,
-            "rule_type":          rule.type,
-            "min_allowed":        rule.min_value if rule.min_value is not None else float("nan"),
-            "max_allowed":        rule.max_value if rule.max_value is not None else float("nan"),
-            "violation_count":    n_violate,
-            "total_samples":      int(len(vals)),
-            "violation_fraction": fraction,
-            "observed_min":       v_min,
-            "observed_max":       v_max,
-        },
-    )
-    return [finding]
+    merge_gap = ctx.domain.context_window_s if ctx.domain is not None else 2.0
+    ranges = episodes.index_ranges(violating_ts, merge_gap)
+    episode_count = len(ranges)
+
+    kept = ranges[: episodes.MAX_FINDINGS_PER_RULE]
+    findings: list[Finding] = []
+    for ep_i, (a, b) in enumerate(kept, start=1):
+        t_first = float(violating_ts[a])
+        t_last  = float(violating_ts[b])
+        ep_vals = violating_vals[a:b + 1]
+        n_ep    = b - a + 1
+        v_min   = float(ep_vals.min())
+        v_max   = float(ep_vals.max())
+
+        description = rule.description or (
+            f"{series.signal_name} exceeded its allowed range {bound_text}."
+        )
+        description += (
+            f" Episode {ep_i}/{episode_count}: observed extremes "
+            f"{v_min:g}…{v_max:g} {unit}, {n_ep} samples outside range, "
+            f"t={t_first:.2f}s–{t_last:.2f}s (duration {t_last - t_first:.2f}s)."
+        )
+
+        findings.append(Finding(
+            detector_name=f"yaml::{rule.id}",
+            title=rule.title,
+            description=description,
+            severity=severity,
+            time_window=(t_first, t_last),
+            signals=[series_key],
+            metrics={
+                "rule_id":            rule.id,
+                "rule_type":          rule.type,
+                "min_allowed":        rule.min_value if rule.min_value is not None else float("nan"),
+                "max_allowed":        rule.max_value if rule.max_value is not None else float("nan"),
+                "violation_count":    int(n_ep),
+                "total_samples":      total_samples,
+                "violation_fraction": fraction,
+                "observed_min":       v_min,
+                "observed_max":       v_max,
+                "episode_index":      ep_i,
+                "episode_count":      episode_count,
+                "duration_s":         t_last - t_first,
+            },
+        ))
+
+    if episode_count > episodes.MAX_FINDINGS_PER_RULE:
+        dropped = ranges[episodes.MAX_FINDINGS_PER_RULE:]
+        span_start = float(violating_ts[dropped[0][0]])
+        span_end   = float(violating_ts[dropped[-1][1]])
+        extra = len(dropped)
+        findings.append(Finding(
+            detector_name=f"yaml::{rule.id}",
+            title=f"{rule.title} (+{extra} more episodes)",
+            description=(
+                f"{series.signal_name} exceeded its allowed range in "
+                f"{episode_count} episodes total; only the first "
+                f"{episodes.MAX_FINDINGS_PER_RULE} are listed individually. "
+                f"The remaining {extra} span t={span_start:.2f}s–{span_end:.2f}s."
+            ),
+            severity=severity,
+            time_window=(span_start, span_end),
+            signals=[series_key],
+            metrics={
+                "rule_id":            rule.id,
+                "rule_type":          rule.type,
+                "episode_count":      episode_count,
+                "episodes_truncated": True,
+                "episodes_omitted":   extra,
+            },
+        ))
+
+    return findings
 
 
 def _format_bounds(lo: float | None, hi: float | None, unit: str) -> str:

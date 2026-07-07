@@ -23,9 +23,10 @@ from core.diagnostics.config_loader import (
     DomainConfig, load_domain_configs, default_config_dir, ConfigError,
 )
 from core.diagnostics.context import DiagnosticContext
-from core.diagnostics.evidence import EvidenceBuilder
+from core.diagnostics.evidence import EvidenceBuilder, related_signal_keys
 from core.diagnostics.models import AnalysisResult, Finding
 from core.diagnostics.rules import RULE_PROCESSORS
+from core.diagnostics import telemetry
 
 ProgressCb = Callable[[str], None]
 
@@ -36,11 +37,14 @@ class DiagnosticEngine:
     GUI's "Reload Rules" button is the only thing that re-reads disk.
     """
 
-    def __init__(self, config_dir: Path | None = None) -> None:
+    def __init__(self, config_dir: Path | None = None, knowledge=None) -> None:
         self.config_dir = config_dir or default_config_dir()
         self._domains: list[DomainConfig] = []
         self._loaded: bool = False
         self._evidence_builder = EvidenceBuilder()
+        # Optional KnowledgeIndex — enriches evidence/plot with DTC-related
+        # signals. None (default) leaves plain-engine behavior unchanged.
+        self._knowledge = knowledge
 
     # ── config management ────────────────────────────────────────────────
 
@@ -68,13 +72,19 @@ class DiagnosticEngine:
         store,
         domain_name: str,
         progress: ProgressCb | None = None,
+        knowledge=None,
     ) -> AnalysisResult:
         """
         Run rule-based detection only — does NOT call the LLM.
 
         The GUI/chat panel calls :meth:`run_with_llm` separately so that the
         rule findings appear immediately while the LLM is still thinking.
+
+        *knowledge* (a KnowledgeIndex) overrides the engine's default index for
+        this run; when present, DTC-related signals from the manual are added to
+        each finding's evidence and ``plot_signals``.
         """
+        kb = knowledge if knowledge is not None else self._knowledge
         if progress:
             progress(f"Loading rules for '{domain_name}'…")
         domain = self.find_domain(domain_name)
@@ -91,7 +101,7 @@ class DiagnosticEngine:
         rules = domain.enabled_rules()
         for i, rule in enumerate(rules, 1):
             if progress:
-                progress(f"Rule {i}/{len(rules)}: {rule.condition}")
+                progress(f"Rule {i}/{len(rules)}: {rule.condition or rule.title}")
             processor = RULE_PROCESSORS.get(rule.type)
             if processor is None:
                 continue
@@ -134,16 +144,61 @@ class DiagnosticEngine:
         # them even if the LLM step is skipped).
         if progress:
             progress("Building evidence packets…")
+        enrich = kb is not None and getattr(kb, "docs", None)
         for f in findings:
-            f.evidence = self._evidence_builder.build_for_finding(f, ctx)
+            extra = None
+            if enrich:
+                extra = related_signal_keys(
+                    f, ctx, kb,
+                    limit=max(
+                        0,
+                        EvidenceBuilder.MAX_SIGNALS_PER_FINDING - len(f.signals),
+                    ),
+                )
+                # Surface DTC-related signals on the plot for the user to review.
+                for key in extra:
+                    if key not in f.plot_signals:
+                        f.plot_signals.append(key)
+            f.evidence = self._evidence_builder.build_for_finding(
+                f, ctx, knowledge=kb, extra_signal_keys=extra,
+            )
 
         duration = time.perf_counter() - t0
-        return AnalysisResult(
+        result = AnalysisResult(
             domain_name=domain.name,
             findings=findings,
             duration_s=duration,
             signal_count=len(store._series_by_key),
         )
+        telemetry.write_run_log({
+            "mode": "manual",
+            "domain": domain.name,
+            "rules_run": len(rules),
+            "findings_count": len(findings),
+            "duration_s": duration,
+            "iterations": 1,
+            "approx_llm_tokens": 0,
+        })
+        return result
+
+    def reload_and_run(
+        self,
+        store,
+        domain_name: str,
+        progress: ProgressCb | None = None,
+        knowledge=None,
+    ) -> AnalysisResult:
+        """Re-parse the YAML rule files from disk, then rerun against *store*.
+
+        Reuses the already-loaded :class:`SignalStore` — there is no
+        measurement reload.  This is the hot path for the closed-loop agent,
+        which rewrites candidate rules under ``config/diagnostics/generated/``
+        between iterations.
+        """
+        if progress:
+            progress("Reloading rules from disk…")
+        self.load_configs()
+        return self.run(store, domain_name, progress=progress, knowledge=knowledge)
 
     def build_manifest(self, store, domain_name: str) -> str:
         """

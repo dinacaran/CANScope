@@ -94,6 +94,7 @@ class PlottedSignal:
     color: str
     axis: Any = None
     view_box: Any = None
+    scatter: Any = None         # dedicated ScatterPlotItem for adaptive point display
     visible: bool = True        # checkbox state — False hides curve and stacked row
     group: str = ''             # '' = ungrouped; any string = group name
     axis_visible: bool = True   # multi-axis mode: show/hide the Y axis for this signal
@@ -317,12 +318,29 @@ class PlotPanel(QWidget):
     backgroundColorChanged = Signal(str)
     signalColorChanged = Signal(str, str)
 
+    # Adaptive data-point display: symbols are drawn only when the number of
+    # samples visible in the current X viewport is at or below this cap (per
+    # curve). Above it, the curve renders as a line only — this keeps huge
+    # files fast while still revealing individual samples when zoomed in.
+    _POINTS_VISIBLE_THRESHOLD: int = 2000
+    # Debounce for recomputing the visible point slice on X-range changes, so
+    # nothing is recomputed during an interactive drag-zoom (ms).
+    _POINTS_DEBOUNCE_MS: int = 120
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._items: dict[str, PlottedSignal] = {}
         self._current_key: str | None = None
         self._cursor_label_base = 'Cursor: move mouse over plot'
         self._show_points = False
+        # Adaptive-point machinery: a single-shot debounce timer coalesces the
+        # bursts of sigXRangeChanged emitted during a drag-zoom into one
+        # recompute, and _xrange_vb tracks which ViewBox we're currently
+        # listening to (recreated on every rebuild / mode switch).
+        self._points_timer = QTimer(self)
+        self._points_timer.setSingleShot(True)
+        self._points_timer.timeout.connect(self._update_adaptive_points)
+        self._xrange_vb: Any = None
         self._multi_axis = False
         self._stacked_mode = False
         self._extra_axes: list[tuple[Any, Any]] = []
@@ -522,15 +540,29 @@ class PlotPanel(QWidget):
     # ── Public setters ────────────────────────────────────────────────────
 
     def set_show_points(self, show: bool) -> None:
+        """Toggle adaptive data-point display.
+
+        Points live on a per-curve ScatterPlotItem that is only ever fed the
+        visible slice (see :meth:`_update_adaptive_points`), so toggling is
+        instant even on multi-million-sample files — no data is re-pushed into
+        the line.
+        """
         self._show_points = bool(show)
-        # In stacked mode each PlotItem triggers its own repaint when its curve
-        # style changes.  Suppress individual paint events so all N rows coalesce
-        # into one repaint pass when setUpdatesEnabled(True) is restored.
+        # In stacked mode each PlotItem triggers its own repaint when its scene
+        # changes.  Suppress individual paint events so all N rows coalesce into
+        # one repaint pass when setUpdatesEnabled(True) is restored.
         if self._stacked_mode:
             self.glw.setUpdatesEnabled(False)
         try:
-            for plotted in self._items.values():
-                self._apply_curve_style(plotted, set_data=False)
+            if self._show_points:
+                # Create a scatter for each visible curve, then fill the
+                # currently-visible slice in one pass.
+                self._ensure_scatters()
+                self._update_adaptive_points()
+            else:
+                # Tear the scatters down entirely so nothing lingers to repaint.
+                for plotted in self._items.values():
+                    self._remove_scatter(plotted)
         finally:
             if self._stacked_mode:
                 self.glw.setUpdatesEnabled(True)
@@ -696,13 +728,27 @@ class PlotPanel(QWidget):
         except Exception:
             pass
 
+        # Stop listening for X-range changes and cancel any pending point
+        # recompute — the ViewBoxes and scatters are about to be destroyed.
+        self._points_timer.stop()
+        if self._xrange_vb is not None:
+            try:
+                self._xrange_vb.sigXRangeChanged.disconnect(self._on_xrange_changed)
+            except Exception:
+                pass
+            self._xrange_vb = None
+
         try:
             self.plot.plotItem.clear()
         except Exception:
             pass
 
+        # Scatters are children of the main plot / extra ViewBoxes / stacked
+        # plots, so plotItem.clear(), the extra-axis scene removal below, and
+        # glw.clear() all destroy them — just drop our references.
         for plotted in self._items.values():
             plotted.curve = None
+            plotted.scatter = None
             plotted.axis = None
             plotted.view_box = None
 
@@ -988,6 +1034,14 @@ class PlotPanel(QWidget):
             self._restore_selection(selected)
         self._refresh_highlight()
         self._setup_mouse_proxy()
+        # Points: (re)attach the X-range listener for the new ViewBoxes, then —
+        # if points are on — create a fresh scatter per curve and fill in the
+        # currently-visible slice. Deferred so it runs after the range-restore
+        # above has settled the viewport.
+        self._connect_xrange_signals()
+        if self._show_points:
+            self._ensure_scatters()
+            QTimer.singleShot(0, self._update_adaptive_points)
         # Repopulate cursor value columns — _refresh_table wipes them to ''
         self._update_table_values(self.v_line.value(), col=2)
         if self._cursor2_enabled:
@@ -1182,8 +1236,12 @@ class PlotPanel(QWidget):
                 p.setXLink(ref_plot)
 
             curve = pg.PlotDataItem()
-            self._configure_curve(curve)
             p.addItem(curve)
+            # NB: _configure_curve MUST run after addItem — PlotItem.addItem
+            # overwrites the item's clipToView / autoDownsample with the
+            # PlotItem's own (off-by-default) modes, so configuring beforehand
+            # would be silently wiped and the row would render every sample.
+            self._configure_curve(curve)
             plotted.curve    = curve
             plotted.axis     = p.getAxis('left')
             plotted.view_box = p.vb
@@ -1247,13 +1305,26 @@ class PlotPanel(QWidget):
     def _apply_curve_style(self, plotted: PlottedSignal,
                            selected: bool = False,
                            set_data: bool = True) -> None:
-        """Apply pen + symbol style.  Selected curves are drawn thicker.
+        """Apply the line pen.  Selected curves are drawn thicker.
 
-        set_data=True  (default, called on initial add): pushes the full
-            data buffer into pyqtgraph via setData().
-        set_data=False (style toggle / highlight change): uses cheap
-            per-property setters so the data arrays are never re-read.
-            This is what makes show/hide points instant on large files.
+        The PlotDataItem is **line only** — data points are never drawn via its
+        built-in symbol.  Feeding the full multi-million-sample array to the
+        symbol path costs ~7 s per add/rebuild on a 5 M-sample file, because the
+        internal ScatterPlotItem processes every sample.  Instead points live on
+        a separate ScatterPlotItem (``plotted.scatter``) that is fed only the
+        searchsorted-sliced visible window, capped at
+        ``_POINTS_VISIBLE_THRESHOLD`` — see :meth:`_update_adaptive_points`.
+
+        (Historical note: the old code toggled ``curve.setSymbol('o')``.  The
+        subtlety there was that ``updateItems(styleUpdate=True)`` only restyles
+        existing spots and never populates an empty scatter, so symbol=None → 'o'
+        needed a full setData.  That whole class of problem is gone now that the
+        scatter is managed explicitly.)
+
+        set_data=True  (default, called on initial add): pushes the full line
+            buffer into pyqtgraph via setData().
+        set_data=False (highlight change): uses the cheap setPen() setter so the
+            data arrays are never re-read.
         """
         if plotted.curve is None:
             return
@@ -1265,35 +1336,9 @@ class PlotPanel(QWidget):
             # protocol and returns a writable view — required by pyqtgraph.
             ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
             vs = np.asarray(plotted.series.values,     dtype=np.float64)
-            kwargs: dict = {'pen': pen, 'connect': 'finite'}
-            if self._show_points:
-                kwargs.update({
-                    'symbol':     'o',
-                    'symbolSize':  5,
-                    'symbolBrush': plotted.color,
-                    'symbolPen':   pg.mkPen(color=plotted.color, width=1.2),
-                })
-            else:
-                kwargs['symbol'] = None
-            plotted.curve.setData(ts, vs, **kwargs)
+            plotted.curve.setData(ts, vs, pen=pen, connect='finite')
         else:
-            # Style-only path: use individual setters — each calls updateItems()
-            # internally, but actual Qt repaints are batched by the caller via
-            # setUpdatesEnabled(False/True) in set_show_points (stacked mode) and
-            # _refresh_highlight, so we still get only one render pass.
-            #
-            # NOTE: opts.update()+updateItems(styleUpdate=True) looks faster but
-            # styleUpdate=True calls scatter.updateSpots() which only refreshes
-            # EXISTING spot styles — it never pushes data into an empty scatter.
-            # Going from symbol=None → 'o' produces zero dots with that path.
             plotted.curve.setPen(pen)
-            if self._show_points:
-                plotted.curve.setSymbol('o')
-                plotted.curve.setSymbolSize(5)
-                plotted.curve.setSymbolBrush(pg.mkBrush(plotted.color))
-                plotted.curve.setSymbolPen(pg.mkPen(color=plotted.color, width=1.2))
-            else:
-                plotted.curve.setSymbol(None)
 
     def _refresh_highlight(self) -> None:
         """Update curve thickness to reflect current table selection."""
@@ -1302,6 +1347,137 @@ class PlotPanel(QWidget):
             if plotted.curve is not None and plotted.visible:
                 self._apply_curve_style(plotted, selected=(key in sel),
                                         set_data=False)
+
+    # ── Adaptive data-point display ───────────────────────────────────────
+
+    def _scatter_container(self, plotted: PlottedSignal) -> Any:
+        """The graphics container a curve's scatter must live in.
+
+        Mirrors the rule used for curves: ``view_box is None`` means the main
+        PlotWidget (normal mode, or the first unit group in multi-axis); any
+        other value is a floating multi-axis ViewBox or a stacked-row ViewBox.
+        """
+        return self.plot if plotted.view_box is None else plotted.view_box
+
+    def _make_scatter(self, plotted: PlottedSignal) -> Any:
+        """Create + attach an empty ScatterPlotItem for *plotted* and return it.
+
+        Kept deliberately cheap so pyqtgraph reuses one cached spot pixmap for
+        every dot: uniform size, a single shared brush, and ``pen=None`` (no
+        per-spot outline).  Started empty; data is pushed by
+        :meth:`_update_adaptive_points`.
+        """
+        sc = pg.ScatterPlotItem(
+            size=5, pen=None, brush=pg.mkBrush(plotted.color), pxMode=True,
+        )
+        sc.setData(x=[], y=[])
+        try:
+            self._scatter_container(plotted).addItem(sc)
+        except Exception:
+            pass
+        plotted.scatter = sc
+        return sc
+
+    def _ensure_scatters(self) -> None:
+        """Create a scatter for every visible, rendered curve that lacks one.
+
+        Runs after a rebuild (curves already exist) so the scatters are added
+        on top of the lines. No-op when points are off.
+        """
+        if not self._show_points:
+            return
+        for plotted in self._items.values():
+            if (plotted.visible and plotted.curve is not None
+                    and plotted.scatter is None):
+                self._make_scatter(plotted)
+
+    def _remove_scatter(self, plotted: PlottedSignal) -> None:
+        """Detach and drop *plotted*'s scatter, if any."""
+        sc = plotted.scatter
+        if sc is None:
+            return
+        try:
+            self._scatter_container(plotted).removeItem(sc)
+        except Exception:
+            pass
+        plotted.scatter = None
+
+    def _driving_vb(self) -> Any:
+        """ViewBox whose X range governs what's visible in every curve.
+
+        Floating (multi-axis) and stacked ViewBoxes are all X-linked, so a
+        single X range applies to the whole plot.
+        """
+        if self._stacked_mode and self._stacked_plots:
+            return self._stacked_plots[0].vb
+        return self.plot.plotItem.vb
+
+    def _on_xrange_changed(self, *args) -> None:
+        """sigXRangeChanged slot — (re)arm the debounce so recompute happens
+        once the view stops moving, never during an interactive drag-zoom."""
+        if self._show_points:
+            self._points_timer.start(self._POINTS_DEBOUNCE_MS)
+
+    def _connect_xrange_signals(self) -> None:
+        """Listen to the current driving ViewBox's sigXRangeChanged.
+
+        Called after each rebuild because the driving ViewBox changes with the
+        mode (stacked rows are recreated every rebuild; the overlay vb is
+        stable but reconnecting is harmless and keeps the logic uniform).
+        """
+        vb = self._driving_vb()
+        if self._xrange_vb is vb:
+            return
+        if self._xrange_vb is not None:
+            try:
+                self._xrange_vb.sigXRangeChanged.disconnect(self._on_xrange_changed)
+            except Exception:
+                pass
+        self._xrange_vb = vb
+        if vb is not None:
+            try:
+                vb.sigXRangeChanged.connect(self._on_xrange_changed)
+            except Exception:
+                pass
+
+    def _update_adaptive_points(self) -> None:
+        """Refresh every scatter to hold only the visible slice of its series.
+
+        For each visible curve we searchsorted the (monotonic) timestamp array
+        for the current X range and, if the number of samples in view is at or
+        below the threshold, push just that slice into the scatter; otherwise
+        the scatter is emptied and the curve reads as a line.  The scatter is
+        therefore never handed more than ``_POINTS_VISIBLE_THRESHOLD`` points,
+        regardless of file size.
+        """
+        if not self._show_points or not self._items:
+            for plotted in self._items.values():
+                if plotted.scatter is not None:
+                    plotted.scatter.setData(x=[], y=[])
+            return
+        try:
+            xr = self._driving_vb().viewRange()[0]
+        except Exception:
+            return
+        x0, x1 = xr[0], xr[1]
+        thr = self._POINTS_VISIBLE_THRESHOLD
+        for plotted in self._items.values():
+            sc = plotted.scatter
+            if sc is None or not plotted.visible:
+                continue
+            ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
+            if ts.size == 0:
+                sc.setData(x=[], y=[])
+                continue
+            lo = int(np.searchsorted(ts, x0, side='left'))
+            hi = int(np.searchsorted(ts, x1, side='right'))
+            count = hi - lo
+            if 0 < count <= thr:
+                vs = np.asarray(plotted.series.values, dtype=np.float64)
+                sc.setData(x=ts[lo:hi], y=vs[lo:hi])
+            else:
+                # Zoomed out past the threshold (or nothing in view) → line only.
+                sc.setData(x=[], y=[])
 
     # ── Multi-axis geometry (called via sigResized) ───────────────────────
 
@@ -1673,8 +1849,12 @@ class PlotPanel(QWidget):
         if key not in self._items:
             return
         self._push_undo()
-        self._items[key].color = color
-        self._apply_curve_style(self._items[key])
+        plotted = self._items[key]
+        plotted.color = color
+        self._apply_curve_style(plotted)
+        # Recolor the point scatter too (cheap: restyles existing spots only).
+        if plotted.scatter is not None:
+            plotted.scatter.setBrush(pg.mkBrush(color))
         self._refresh_table()
         self._set_axis_label(self._current_key)
         self.signalColorChanged.emit(key, color)
@@ -1978,42 +2158,6 @@ class PlotPanel(QWidget):
         self._update_empty_state_ui()
         self.plot.enableAutoRange()
         self.plot.autoRange()
-
-    def move_selected_up(self)   -> None: self._move_selected(-1)
-    def move_selected_down(self) -> None: self._move_selected(1)
-
-    def _move_selected(self, direction: int) -> None:
-        keys  = self.selected_keys()
-        if not keys:
-            return
-        self._push_undo()
-        key_set = set(keys)
-        order   = list(self._items.keys())
-        if direction < 0:
-            for key in keys:
-                idx = order.index(key)
-                if idx > 0 and order[idx - 1] not in key_set:
-                    order[idx - 1], order[idx] = order[idx], order[idx - 1]
-        else:
-            for key in reversed(keys):
-                idx = order.index(key)
-                if idx < len(order) - 1 and order[idx + 1] not in key_set:
-                    order[idx + 1], order[idx] = order[idx], order[idx + 1]
-        self._items = {k: self._items[k] for k in order}
-
-        if self._stacked_mode or self._multi_axis:
-            # Stacked: row positions are visual — full rebuild required.
-            # Multi-axis: axis numbering is index-based — full rebuild required.
-            self._rebuild_curves(preserve_selection=True)
-        else:
-            # Overlay mode: curves are already rendered; only table order changes.
-            # Skip the expensive curve teardown/rebuild and just refresh the table.
-            self._refresh_table()
-            self._restore_selection(keys)
-            self._refresh_highlight()
-            self._update_table_values(self.v_line.value(), col=2)
-            if self._cursor2_enabled:
-                self._update_table_values(self.v_line2.value(), col=3)
 
     def selected_keys(self) -> list[str]:
         keys: list[str] = []
@@ -2654,15 +2798,6 @@ class PlotPanel(QWidget):
         menu.addAction(act_color)
         menu.addSeparator()
 
-        for label, slot in [
-            ('Move selected up',   self.move_selected_up),
-            ('Move selected down', self.move_selected_down),
-        ]:
-            a = QAction(label, menu)
-            a.triggered.connect(slot)
-            a.setEnabled(has_sel)
-            menu.addAction(a)
-        menu.addSeparator()
         rm_label = ('Remove selected signals' if len(selected_keys) > 1
                     else 'Remove selected signal')
         rm = QAction(rm_label, menu)

@@ -7,6 +7,18 @@ Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
 
 ---
 
+## [v00.00.47] — 2026-07-07
+
+### Added — General **Export** feature: export plotted signals to CSV or Excel (.xlsx) as a wide, time-aligned table (shared Time column, one column per signal).
+
+### Changed — "Show Data Points" renders adaptively (only visible points, capped per curve) for fast plotting on multi-million-sample signals, including stacked mode.
+
+### Changed — Removed the Move Up / Move Down buttons — reorder signals by dragging rows in the plot list.
+
+### Fixed — Token dialog "Test & Save" no longer hangs on "Testing token…".
+
+---
+
 ## [v00.00.46] — 2026-07-03
 
 ### Changed — Multi-axis mode: shared Y axis per unit, axis-color swatch column, Individual axis in right-click menu.

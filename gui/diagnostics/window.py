@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 from core.diagnostics import (
@@ -31,8 +31,13 @@ from core.diagnostics.llm import (
     build_analysis_prompt, build_chat_followup_prompt,
 )
 from core.diagnostics.llm.client import DEFAULT_MODEL, list_models
+from core.diagnostics.agent import (
+    AgentConfig, load_agent_config, KnowledgeIndex, AgentLoop, GateDecision,
+)
+from gui.diagnostics.agent_panel import AgentPanel
 from gui.diagnostics.chat_panel import ChatPanel
 from gui.diagnostics.findings_panel import FindingsPanel
+from gui.diagnostics.token_dialog import TokenConfigDialog
 from gui.diagnostics.worker import run_worker
 
 
@@ -55,6 +60,18 @@ class DiagnosticsWindow(QMainWindow):
         self.engine = DiagnosticEngine()
         self._llm_client: GitHubModelsClient | None = None
         self._latest_result: AnalysisResult | None = None
+        # Built once (lazily) and shared by manual analysis + the agent loop so
+        # both enrich evidence/plot with DTC-related signals from the manual.
+        self._knowledge: "KnowledgeIndex | None" = None
+
+        # Closed-loop agent (Phase 2). Disabled by default → no Agent tab.
+        self._agent_config: AgentConfig = load_agent_config()
+        self.agent_panel: AgentPanel | None = None
+        self._agent_cancel = False
+        self._agent_thread = None
+        self._agent_timer: QTimer | None = None
+        self._agent_event_q: "queue.Queue" = queue.Queue()
+        self._agent_gate_q: "queue.Queue" = queue.Queue()
 
         self._build_ui()
         self._refresh_domains()
@@ -92,6 +109,12 @@ class DiagnosticsWindow(QMainWindow):
             "Open the diagnostics config folder in your file manager"
         )
 
+        self.btn_configure = QPushButton("Configure…")
+        self.btn_configure.clicked.connect(self._on_configure)
+        self.btn_configure.setToolTip(
+            "Set the GitHub token used for AI diagnostics"
+        )
+
         top_bar = QHBoxLayout()
         top_bar.addWidget(QLabel("Domain:"))
         top_bar.addWidget(self.domain_combo)
@@ -102,16 +125,31 @@ class DiagnosticsWindow(QMainWindow):
         top_bar.addWidget(self.btn_run)
         top_bar.addWidget(self.btn_reload)
         top_bar.addWidget(self.btn_edit)
+        top_bar.addWidget(self.btn_configure)
         top_bar.addStretch()
 
-        # ── splitter: findings | chat ──
+        # ── splitter: (findings | agent) | chat ──
         self.findings_panel = FindingsPanel()
         self.findings_panel.findingSelected.connect(self._on_finding_selected)
         self.chat_panel = ChatPanel()
         self.chat_panel.sendRequested.connect(self._on_chat_send)
 
+        # When the agent is enabled, the left pane becomes tabs: Findings | Agent.
+        # When disabled, the left pane is just the findings panel — identical to
+        # today's behaviour.
+        if self._agent_config.enabled:
+            self.agent_panel = AgentPanel()
+            self.agent_panel.startRequested.connect(self._on_agent_start)
+            self.agent_panel.stopRequested.connect(self._on_agent_stop)
+            self.agent_panel.gateDecision.connect(self._on_agent_gate_decision)
+            left_widget: QWidget = QTabWidget()
+            left_widget.addTab(self.findings_panel, "Findings")
+            left_widget.addTab(self.agent_panel, "Agent")
+        else:
+            left_widget = self.findings_panel
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.findings_panel)
+        splitter.addWidget(left_widget)
         splitter.addWidget(self.chat_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
@@ -168,7 +206,10 @@ class DiagnosticsWindow(QMainWindow):
         self.statusBar().showMessage("Rules reloaded.")
 
     def _on_edit_rules(self) -> None:
-        path = self.engine.config_dir
+        # Prefer the engineer-authored rules folder; fall back to the config root.
+        path = self.engine.config_dir / "base_rules"
+        if not path.exists():
+            path = self.engine.config_dir
         path.mkdir(parents=True, exist_ok=True)
         # Cross-platform "open folder"
         try:
@@ -222,6 +263,7 @@ class DiagnosticsWindow(QMainWindow):
             QApplication.processEvents()
 
         try:
+            self._ensure_knowledge()
             result = self.engine.run(self.store, domain_name, progress=_progress)
             self._on_analysis_finished(result)
         except Exception as exc:
@@ -262,6 +304,19 @@ class DiagnosticsWindow(QMainWindow):
 
     # ── LLM calls ──────────────────────────────────────────────────────
 
+    def _on_configure(self) -> None:
+        """Open the GitHub-token configuration dialog."""
+        dlg = TokenConfigDialog(
+            self,
+            model=self.model_combo.currentText() or DEFAULT_MODEL,
+            on_saved=self._on_token_changed,
+        )
+        dlg.exec()
+
+    def _on_token_changed(self) -> None:
+        """Drop the cached client so the next LLM call picks up the new token."""
+        self._llm_client = None
+
     def _ensure_client(self) -> GitHubModelsClient | None:
         if self._llm_client is not None:
             return self._llm_client
@@ -270,7 +325,24 @@ class DiagnosticsWindow(QMainWindow):
                 model=self.model_combo.currentText() or DEFAULT_MODEL,
             )
         except LLMError as exc:
-            QMessageBox.warning(self, "AI not available", str(exc))
+            # First-run nudge: offer to configure a token instead of a dead end.
+            choice = QMessageBox.question(
+                self, "AI not available",
+                f"{exc}\n\nWould you like to configure a GitHub token now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if choice == QMessageBox.StandardButton.Yes:
+                self._on_configure()
+                # Retry once if the user saved a token in the dialog.
+                if self._llm_client is None:
+                    try:
+                        self._llm_client = GitHubModelsClient(
+                            model=self.model_combo.currentText() or DEFAULT_MODEL,
+                        )
+                    except LLMError:
+                        return None
+                return self._llm_client
             return None
         return self._llm_client
 
@@ -366,3 +438,127 @@ class DiagnosticsWindow(QMainWindow):
         self.chat_panel.set_send_enabled(True)
         self.chat_panel.set_ai_status(f"Error — see chat.", "#d04040")
         self.statusBar().showMessage(f"AI error: {msg}")
+
+    # ── closed-loop agent (Phase 2) ─────────────────────────────────────
+
+    def _ensure_knowledge(self) -> "KnowledgeIndex":
+        """Build the KnowledgeIndex once and share it with the engine.
+
+        Degrades silently to an empty index (plain-engine behavior) when no
+        manual is installed or parsing fails.
+        """
+        if self._knowledge is None:
+            try:
+                self._knowledge = KnowledgeIndex.build(self._agent_config.platform)
+            except Exception:
+                self._knowledge = KnowledgeIndex([])
+            self.engine._knowledge = self._knowledge
+        return self._knowledge
+
+    def _on_agent_start(self) -> None:
+        if self.agent_panel is None:
+            return
+        if self._agent_thread is not None and self._agent_thread.is_alive():
+            return
+        domain_name = self.domain_combo.currentData()
+        if not domain_name:
+            QMessageBox.information(self, "Agent", "Select a domain first.")
+            return
+        client = self._ensure_client()
+        if client is None:
+            return
+
+        # Fresh queues + cancel flag for this run.
+        self._agent_cancel = False
+        self._agent_event_q = queue.Queue()
+        self._agent_gate_q = queue.Queue()
+        self.agent_panel.set_running(True)
+        self.chat_panel.clear()
+
+        knowledge = self._ensure_knowledge()
+        generated_dir = self.engine.config_dir / "generated"
+        model = self.model_combo.currentText() or None
+
+        loop = AgentLoop(
+            self.engine, self.store, client, knowledge, self._agent_config,
+            domain_name,
+            generated_dir=generated_dir, model=model,
+            emit=self._agent_emit, gate_callback=self._agent_gate,
+            should_stop=lambda: self._agent_cancel,
+        )
+        self._agent_thread = threading.Thread(target=loop.run, daemon=True)
+        self._agent_thread.start()
+
+        self._agent_timer = QTimer(self)
+        self._agent_timer.timeout.connect(self._drain_agent_events)
+        self._agent_timer.start(50)
+        self.statusBar().showMessage("Agent started…")
+
+    def _on_agent_stop(self) -> None:
+        self._agent_cancel = True
+        # Unblock a pending gate so the loop can observe the cancel flag.
+        self._agent_gate_q.put(GateDecision("skip", ""))
+        if self.agent_panel is not None:
+            self.agent_panel.hide_gate()
+        self.statusBar().showMessage("Stopping agent…")
+
+    def _agent_emit(self, kind: str, payload=None) -> None:
+        """Called from the loop thread — only touches a thread-safe queue."""
+        self._agent_event_q.put((kind, payload))
+
+    def _agent_gate(self, yaml_text: str) -> GateDecision:
+        """Called from the loop thread. Blocks until the engineer decides."""
+        self._agent_event_q.put(("gate", yaml_text))
+        return self._agent_gate_q.get()
+
+    def _on_agent_gate_decision(self, action: str, edited_yaml: str) -> None:
+        self._agent_gate_q.put(GateDecision(action, edited_yaml))
+
+    def _drain_agent_events(self) -> None:
+        panel = self.agent_panel
+        while True:
+            try:
+                kind, payload = self._agent_event_q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "step":
+                if panel is not None:
+                    panel.set_step(str(payload))
+                self.statusBar().showMessage(str(payload))
+            elif kind == "iter":
+                n, total = payload
+                if panel is not None:
+                    panel.set_iteration(n, total)
+            elif kind == "gate":
+                if panel is not None:
+                    panel.show_gate(str(payload))
+            elif kind == "report_begin":
+                self.chat_panel.begin_assistant_message()
+            elif kind == "report_chunk":
+                self.chat_panel.append_chunk(str(payload))
+            elif kind == "report_end":
+                self.chat_panel.end_assistant_message()
+            elif kind == "error":
+                if panel is not None:
+                    panel.set_step(f"Error: {payload}", "#d04040")
+            elif kind == "done":
+                self._on_agent_done(payload)
+                return
+
+    def _on_agent_done(self, report) -> None:
+        if self._agent_timer is not None:
+            self._agent_timer.stop()
+            self._agent_timer.deleteLater()
+            self._agent_timer = None
+        if self.agent_panel is not None:
+            self.agent_panel.set_running(False)
+            if report.outcome == "root_cause":
+                label, colour = "Root cause found", "#60c060"
+            else:
+                label, colour = "Inconclusive", "#d08040"
+            self.agent_panel.set_step(
+                f"Done — {label} after {report.iterations} iteration(s), "
+                f"~{report.approx_llm_tokens} tokens.",
+                colour,
+            )
+        self.statusBar().showMessage(f"Agent finished: {report.outcome}.")
