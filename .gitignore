@@ -69,3 +69,5 @@ htmlcov/
 secrets.json
 .claude/worktrees/
 *.bak
+*.xlsx
+*.csv
