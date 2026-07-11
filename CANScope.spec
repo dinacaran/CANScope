@@ -3,6 +3,8 @@
 from pathlib import Path
 import os
 
+from PyInstaller.utils.hooks import collect_submodules
+
 # PyInstaller executes spec files without defining __file__.
 # Resolve the project root from the current working directory, which is
 # expected to be the project root when build.bat runs pyinstaller.
@@ -23,6 +25,12 @@ icon_png = project_root / "resources" / "CANScope_ICON.png"
 if icon_png.exists():
     datas.append((str(icon_png), "resources"))
 
+# asammdf asks canmatrix to load database format handlers by module name at
+# runtime. PyInstaller cannot discover those dynamic imports automatically;
+# without them the packaged app abandons native one-pass MF4 extraction and
+# falls back to the slow frame-by-frame reader.
+canmatrix_format_imports = collect_submodules("canmatrix.formats")
+
 hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",
@@ -31,10 +39,11 @@ hiddenimports = [
     "can.io.blf",
     "can.io.asc",
     "asammdf",
+    "canmatrix",
     "cantools.database",
     "cantools.database.can.formats.arxml",
     "lxml",
-]
+] + canmatrix_format_imports
 
 block_cipher = None
 

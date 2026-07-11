@@ -4,6 +4,9 @@ python-can>=4.6
 cantools>=39.4  # includes DBC + ARXML (AUTOSAR 3/4) database support; no [arxml] extras needed
 numpy>=1.26
 asammdf>=7.0
+# Required for asammdf native one-pass CAN bus extraction from MF4/MDF files.
+# Its format handlers are bundled explicitly by CANScope.spec.
+canmatrix>=1.0
 pyinstaller>=6.0
 # YAML config loader for the diagnostics engine (rules in config/diagnostics/)
 pyyaml>=6.0
@@ -11,6 +14,3 @@ pyyaml>=6.0
 requests>=2.31
 # Read-only .xlsx parsing for Excel diagnostic manuals under config/diagnostics/knowledge/
 openpyxl>=3.1
-# canmatrix is required by python-can's MF4Reader for MDF bus logging support.
-# Install if you plan to open MDF files that contain raw CAN bus frames.
-# canmatrix
