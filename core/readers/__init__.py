@@ -154,8 +154,7 @@ def reader_factory(
                     "Please configure channel → database mapping via 'Open Database'."
                 )
             from core.readers.mdf_can_reader import MDFCANReader
-            from core.dbc_decoder import DBCDecoder
-            return MDFCANReader(measurement_path, DBCDecoder(dbc_path))
+            return MDFCANReader(measurement_path, dbc_path)
         else:
             # Pre-decoded engineering values — no DBC needed
             return MDFReader(measurement_path)

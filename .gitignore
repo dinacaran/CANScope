@@ -67,7 +67,10 @@ htmlcov/
 *.key
 .env.*
 secrets.json
+
+# ── Others ───────────────────────────────────────────────────────────────
 .claude/worktrees/
 *.bak
 *.xlsx
 *.csv
+AGENTS.md

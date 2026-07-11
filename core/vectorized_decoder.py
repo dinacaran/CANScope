@@ -12,11 +12,12 @@ Coverage
   * little-endian integer signals, signed or unsigned, 1–64 bits
   * byte-aligned little-endian float32 / float64
   * arbitrary `start_bit` (need not be byte-aligned)
+  * simple and nested little-endian multiplexed branches
 
 **Slow path** (per-row cantools fallback, same speed as the old decoder):
   * big-endian (Motorola sawtooth) signals
   * non-byte-aligned floats
-  * multiplexed signals
+  * multiplexed signals with scaled/nonstandard multiplexer selectors
   * anything that fails the per-message correctness check (compared against
     `message.decode()` on the first row)
 
@@ -43,7 +44,8 @@ class SignalExtractor:
     __slots__ = (
         'name', 'unit', 'choices', 'scale', 'offset',
         'start_bit', 'length', 'byte_order', 'is_signed', 'is_float',
-        'fast_path',
+        'fast_path', 'is_multiplexer', 'multiplexer_ids',
+        'multiplexer_signal',
     )
 
     def __init__(self, signal: Any) -> None:
@@ -58,10 +60,11 @@ class SignalExtractor:
         self.is_signed  = bool(signal.is_signed)
         self.is_float   = bool(getattr(signal, 'is_float', False))
 
-        is_muxed = bool(getattr(signal, 'multiplexer_ids', None))
-        is_mux   = bool(getattr(signal, 'is_multiplexer', False))
+        self.is_multiplexer = bool(getattr(signal, 'is_multiplexer', False))
+        self.multiplexer_ids = tuple(getattr(signal, 'multiplexer_ids', None) or ())
+        self.multiplexer_signal = getattr(signal, 'multiplexer_signal', None)
 
-        if self.byte_order != 'little_endian' or is_muxed or is_mux:
+        if self.byte_order != 'little_endian':
             self.fast_path = False
         elif self.is_float:
             # Only byte-aligned LE floats of 4 or 8 bytes are fast.
@@ -152,6 +155,17 @@ class MessageVectorDecoder:
         self.signals     = list(getattr(message, 'signals', []))
         self.extractors  = [SignalExtractor(s) for s in self.signals]
         self.fully_fast  = bool(self.extractors) and all(e.fast_path for e in self.extractors)
+        mux_extractors = {e.name: e for e in self.extractors if e.is_multiplexer}
+        if any(
+            e.multiplexer_ids
+            and (
+                e.multiplexer_signal not in mux_extractors
+                or mux_extractors[e.multiplexer_signal].scale != 1.0
+                or mux_extractors[e.multiplexer_signal].offset != 0.0
+            )
+            for e in self.extractors
+        ):
+            self.fully_fast = False
         self.expected_length = int(getattr(message, 'length', 8) or 8)
         self._decode_kwargs = decode_kwargs or {
             'decode_choices': False, 'scaling': True,
@@ -188,6 +202,23 @@ class MessageVectorDecoder:
         view = data_arr[:, :self.expected_length]
         for ext in self.extractors:
             out[ext.name] = (ext, ext.extract_fast(view))
+
+        # Keep only rows where a multiplexed branch is active.  NaNs are
+        # removed by LoadWorker before bulk insertion, producing the same
+        # sparse time series as cantools/asammdf instead of one padded series
+        # per branch for every message occurrence.
+        for ext in self.extractors:
+            if not ext.multiplexer_ids or not ext.multiplexer_signal:
+                continue
+            mux_result = out.get(ext.multiplexer_signal)
+            if mux_result is None:
+                continue
+            values = out[ext.name][1]
+            active = np.isin(mux_result[1], ext.multiplexer_ids)
+            if not active.all():
+                values = values.copy()
+                values[~active] = np.nan
+                out[ext.name] = (ext, values)
         return out
 
     def _decode_slow(self, data_arr: np.ndarray) -> dict[str, tuple]:

@@ -38,7 +38,9 @@ class BLFCANReader:
             f"BLF + DBC  ({self._path.name} / {self._decoder.dbc_path.name})"
         )
         # Expose decoder load messages for diagnostics
-        self.load_messages: list[str] = list(decoder.load_messages)
+        self.load_messages: list[str] = list(decoder.load_messages) + [
+            "Fast path: batched BLF column extraction."
+        ]
 
     # ── Protocol-required iterator ────────────────────────────────────────
 
@@ -78,6 +80,10 @@ class BLFCANReader:
         ``iter_frames_only`` (Bottleneck 1).
         """
         yield from BLFReaderService(self._path).iter_raw_tuples()
+
+    def iter_raw_batches(self, batch_size: int = 16_384):
+        """Yield packed BLF column batches without per-frame tuples."""
+        yield from BLFReaderService(self._path).iter_raw_batches(batch_size)
 
     @property
     def decoder(self) -> DBCDecoder:

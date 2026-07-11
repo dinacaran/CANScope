@@ -87,6 +87,71 @@ class BLFReaderService:
         except Exception as exc:
             raise BLFReadError(f"Failed to read BLF file '{self.path}': {exc}") from exc
 
+    def iter_raw_batches(self, batch_size: int = 16_384):
+        """Extract python-can BLF messages directly into column batches."""
+        if not self.path.exists():
+            raise BLFReadError(f"BLF file not found: {self.path}")
+
+        timestamps: list[float] = []
+        channels: list[int] = []
+        arb_ids: list[int] = []
+        dlcs: list[int] = []
+        directions: list[int] = []
+        flags: list[int] = []
+        data_block = bytearray(batch_size * 64)
+        base_ts: float | None = None
+
+        try:
+            with can.BLFReader(str(self.path)) as reader:
+                for msg in reader:
+                    timestamp = float(msg.timestamp)
+                    if base_ts is None:
+                        base_ts = timestamp
+                    raw_ch = getattr(msg, "channel", None)
+                    channel = (
+                        (int(raw_ch) + 1) & 0xFF
+                        if isinstance(raw_ch, (int, float))
+                        else 255
+                    )
+                    data = msg.data if msg.data is not None else b""
+                    is_rx = getattr(msg, "is_rx", None)
+                    slot = len(timestamps)
+                    timestamps.append(timestamp - base_ts)
+                    channels.append(channel)
+                    arb_ids.append(int(msg.arbitration_id) & 0xFFFF_FFFF)
+                    dlcs.append(min(int(getattr(msg, "dlc", len(data))), 255))
+                    directions.append(0 if is_rx is True else 1 if is_rx is False else 2)
+                    flags.append(
+                        (1 if getattr(msg, "is_extended_id", False) else 0)
+                        | (2 if getattr(msg, "is_fd", False) else 0)
+                    )
+                    offset = slot * 64
+                    data_block[offset:offset + 64] = b'\x00' * 64
+                    data_len = min(len(data), 64)
+                    if data_len:
+                        data_block[offset:offset + data_len] = data[:data_len]
+
+                    if len(timestamps) == batch_size:
+                        yield (
+                            base_ts, timestamps, channels, arb_ids, dlcs,
+                            directions, flags, data_block,
+                        )
+                        timestamps = []
+                        channels = []
+                        arb_ids = []
+                        dlcs = []
+                        directions = []
+                        flags = []
+                        data_block = bytearray(batch_size * 64)
+
+            if timestamps:
+                yield (
+                    base_ts, timestamps, channels, arb_ids, dlcs,
+                    directions, flags, data_block,
+                )
+        except Exception as exc:
+            raise BLFReadError(f"Failed to read BLF file '{self.path}': {exc}") from exc
+
     @staticmethod
     def _direction(msg: can.Message) -> str:
         is_rx = getattr(msg, "is_rx", None)

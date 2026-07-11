@@ -1,11 +1,9 @@
 # Changelog
 
-All notable changes to CAN Scope are documented here.
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
-Version format: `vXX.YY.ZZ` — ZZ = patch, YY = feature, XX = breaking.
-
----
+## [v00.00.48] — 2026-07-11
+### MF4 buslogging file decoding changed from CANtool to ASMMDF, vectorize batch conversion implement
+### multi signal check/uncheck added
 
 ## [v00.00.47] — 2026-07-07
 

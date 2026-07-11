@@ -220,7 +220,7 @@ class MDFReader:
         return result
 
     @staticmethod
-    def _iter_arrays(mdf):
+    def _iter_arrays(mdf, include_group_index: bool = False):
         """
         Core vectorised channel iterator using ``mdf.select()`` for batch I/O.
 
@@ -351,7 +351,11 @@ class MDFReader:
                         num_arr   = np.arange(len(ts_arr), dtype=np.float64)
                         disp_list = _decode_str_arr(eng_arr)
 
-                yield (grp_name, ch_name, unit), ts_arr, num_arr, disp_list
+                item = ((grp_name, ch_name, unit), ts_arr, num_arr, disp_list)
+                if include_group_index:
+                    yield (group_idx, *item)
+                else:
+                    yield item
 
                 # Explicit delete so GC can reclaim before the next channel.
                 del ts_arr, num_arr, eng_arr, disp_list

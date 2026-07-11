@@ -69,6 +69,9 @@ class MainWindow(QMainWindow):
         self._pending_plot_groups:  dict[str, str]  = {}
         self._pending_plot_axis_visible: dict[str, bool] = {}
         self._pending_plot_own_axis: dict[str, bool] = {}
+        # Store keys plotted by the most recent plot_finding() call — cleared
+        # and replaced (not accumulated) on each subsequent finding click.
+        self._finding_plot_keys: set[str] = set()
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
 
@@ -248,7 +251,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ('Save Config',  self.save_configuration),
             ('Load Config',  self.load_configuration),
             ('Export',       self.export_selected),
-            ('Clear Plots',  self.plot_panel.clear_all),
+            ('Clear Plots',  self.clear_plot),
         ]:
             act = QAction(text, self)
             act.triggered.connect(slot)
@@ -442,7 +445,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
     def save_configuration(self) -> None:
         config = {
             'version': self.version,
-            'blf_path': self.measurement_path or self.blf_path,
+            'measurement_path': self.measurement_path or self.blf_path,  # canonical key
+            'blf_path': self.measurement_path or self.blf_path,  # legacy alias, read by older CANScope versions
             'dbc_path': self.dbc_path,  # legacy single-DBC
             'channel_config': {
                 'name': self.channel_config.name,
@@ -475,7 +479,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         try:
             Path(path).write_text(json.dumps(config, indent=2), encoding='utf-8')
             self._log(f'Saved configuration: {path}')
-            self._update_status('Configuration saved', 'Load it later to reopen BLF, DBC, and plotted signals')
+            self._update_status('Configuration saved', 'Load it later to reopen the measurement file, database, and plotted signals')
         except Exception as exc:
             QMessageBox.critical(self, 'Save configuration failed', str(exc))
             self._update_status('Save failed', 'Check path permissions and try again')
@@ -490,8 +494,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
             QMessageBox.critical(self, 'Load configuration failed', str(exc))
             return
 
-        cfg_blf = data.get('blf_path')
-        # measurement_path is the canonical name; blf_path kept for config backward-compat
+        # measurement_path is the canonical key; blf_path is read as a fallback
+        # for configs saved by older CANScope versions.
+        cfg_mpath = data.get('measurement_path') or data.get('blf_path')
         cfg_dbc = data.get('dbc_path')
         # Restore channel_config (new format) or fall back to single-DBC compat
         cfg_ch = data.get('channel_config')
@@ -532,10 +537,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             reply = QMessageBox.question(
                 self,
                 'Data already loaded',
-                'A BLF/DBC is already decoded in memory.\n\n'
+                'A measurement file is already decoded in memory.\n\n'
                 'What would you like to do?\n\n'
                 '  Yes — keep current data, plot signals from config\n'
-                '  No  — reload BLF/DBC paths from configuration file',
+                '  No  — reload the measurement file (and database) from the configuration file',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -583,9 +588,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             return
 
-        # Reload from config BLF/DBC paths
-        self.measurement_path = cfg_blf
-        self.blf_path = cfg_blf   # alias
+        # Reload from config measurement path (+ database, if the format needs one)
+        self.measurement_path = cfg_mpath
+        self.blf_path = cfg_mpath   # alias
         self.dbc_path = cfg_dbc
         self._pending_plot_keys         = pending_keys
         self._pending_plot_colors       = pending_colors
@@ -594,9 +599,29 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._pending_plot_axis_visible = pending_axis_visible
         self._pending_plot_own_axis     = pending_own_axis
         self._update_measurement_tab()
-        if not self.blf_path or not self.dbc_path:
-            QMessageBox.warning(self, 'Incomplete configuration', 'The configuration file does not contain both BLF and DBC paths.')
+
+        if not cfg_mpath:
+            QMessageBox.warning(
+                self, 'Incomplete configuration',
+                'The configuration file contains no measurement file path.'
+            )
             return
+        if not Path(cfg_mpath).exists():
+            QMessageBox.warning(
+                self, 'Measurement file not found',
+                f'The measurement file referenced by this configuration could not be found:\n\n'
+                f'{cfg_mpath}\n\n'
+                'Use "Open File" to locate it, then try again.'
+            )
+            return
+        if dbc_required_for(cfg_mpath) and self.channel_config.is_empty():
+            QMessageBox.warning(
+                self, 'Incomplete configuration',
+                'This measurement file requires a database (DBC or ARXML), '
+                'but the configuration file does not contain one.'
+            )
+            return
+
         self._log(f'Configuration loaded: {path}')
         self.load_data(pending_plot_keys=self._pending_plot_keys)
 
@@ -623,6 +648,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 return
         self._pending_plot_keys = list(pending_plot_keys or [])
         self.plot_panel.clear_all()
+        self._finding_plot_keys = set()
         self.signal_tree.set_payload({})
         self.diagnostics_box.clear()
         self.store = None
@@ -691,16 +717,54 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self.plot_panel.fit_to_window()
         return True
 
+    def _store_time_bounds(self) -> tuple[float | None, float | None]:
+        """Full measurement time span across every decoded signal (not just
+        what's currently plotted) — used to clamp plot_finding's centered
+        zoom window."""
+        if not self.store:
+            return None, None
+        lo = hi = None
+        for key in self.store.all_keys():
+            series = self.store.get_series(key)
+            if series is None or len(series.timestamps) == 0:
+                continue
+            ts_min, ts_max = float(min(series.timestamps)), float(max(series.timestamps))
+            lo = ts_min if lo is None else min(lo, ts_min)
+            hi = ts_max if hi is None else max(hi, ts_max)
+        return lo, hi
+
+    def clear_plot(self) -> None:
+        self.plot_panel.clear_all()
+        self._finding_plot_keys.clear()
+
     def plot_finding(self, finding) -> None:
         """Plot a diagnostic finding's signals and zoom to its time window."""
         if not self.store:
             return
+
+        # Replace, don't accumulate: drop the previous finding's auto-plotted
+        # signals before adding the new ones. Manually-added signals (outside
+        # the tracked set) are untouched.
+        if self._finding_plot_keys:
+            self.plot_panel.remove_series_many(self._finding_plot_keys)
+            self._finding_plot_keys.clear()
+
         keys = finding.plot_signals or finding.signals
         if keys:
             self.add_signals_to_plot(keys)
+            self._finding_plot_keys.update(keys)
+
         t0, t1 = finding.time_window
         if t0 or t1:
-            self.plot_panel.zoom_to_time(t0, t1)
+            half = finding.context_window_s
+            if not half:
+                diag = getattr(self, '_diagnostics_window', None)
+                engine = getattr(diag, 'engine', None)
+                half = getattr(getattr(engine, 'domain_profile', None), 'context_window_s_default', None)
+            if not half:
+                half = 1.0
+            dmin, dmax = self._store_time_bounds()
+            self.plot_panel.center_on_time(t0, half, data_min=dmin, data_max=dmax)
 
     # Export formats, in the order shown in the picker. Add a new format by
     # appending one (label, file_filter, default_ext, handler) entry — the
@@ -795,6 +859,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         ('F',               'Fit to Window — rescale X and Y to all data'),
         ('V',               'Fit Vertical — rescale Y only (keep current X)'),
         ('Space',           'Plot selected signal(s) from the signal tree'),
+        ('C',               'Change color of the selected signal'),
+        ('R',               'Toggle Cursor 1 and Cursor 2 on/off together'),
         ('Delete',          'Remove selected signal from plot'),
         ('Ctrl + Z',        'Undo last plot action (up to 3 levels)'),
         ('Ctrl + S',        'Save current configuration to JSON'),

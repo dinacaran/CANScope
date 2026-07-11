@@ -17,6 +17,7 @@ _CAN_PLOT_INTERVAL     = 25_000   # was 5 000 — partial_ready triggers main-th
 _CAN_PROGRESS_INTERVAL = 10_000
 _BULK_PLOT_INTERVAL    = 10
 _BULK_PROGRESS_INTERVAL = 50
+_RAW_BATCH_SIZE         = 16_384
 
 
 def _bulk_compute_store_stats(store, rfs) -> None:
@@ -125,7 +126,9 @@ class LoadWorker(QObject):
             store = SignalStore()
             self._live_store = store
 
-            if reader.has_raw_frames and hasattr(reader, "iter_frames_only"):
+            if hasattr(reader, "iter_decoded_channel_arrays"):
+                self._run_mdf_bus_arrays(reader, store)
+            elif reader.has_raw_frames and hasattr(reader, "iter_frames_only"):
                 # Two-pass vectorised decode: ~50× faster on cantools-heavy
                 # files because the per-frame Python decode call is replaced
                 # by numpy bit ops applied to entire arb-id groups at once.
@@ -203,26 +206,84 @@ class LoadWorker(QObject):
 
         # ── Pass 1: drain frames into raw_frame_store ────────────────────
         self.progress.emit("Reading frames (pass 1/2)...")
+        read_started = time.perf_counter()
         base_ts: float | None = None
         index   = 0
+        _batched = hasattr(reader, 'iter_raw_batches')
         _fast   = hasattr(reader, 'iter_raw_tuples')
 
-        if _fast:
+        if _batched:
+            batch_number = 0
+            for (
+                batch_base_ts, batch_ts, batch_ch, batch_ids, batch_dlcs,
+                batch_dirs, batch_flags, batch_data,
+            ) in reader.iter_raw_batches(_RAW_BATCH_SIZE):
+                batch_number += 1
+                if base_ts is None:
+                    base_ts = float(batch_base_ts)
+                    store.base_ts = base_ts
+                rfs.append_raw_batch(
+                    batch_ts, batch_ch, batch_ids, batch_dlcs,
+                    batch_dirs, batch_flags, batch_data,
+                )
+                index += len(batch_ts)
+                if batch_number == 1 or batch_number % 8 == 0 \
+                        or len(batch_ts) < _RAW_BATCH_SIZE:
+                    self.progress.emit(f"Reading frames: {index:,}...")
+
+        elif _fast:
             # Zero-object fast path (Bottlenecks 1, 3, 4):
             #   • yields tuples instead of RawFrame dataclasses
             #   • append_raw() skips name-table lookup and string direction
             #   • note_frame() removed; stats computed in bulk after seal()
-            rfs_append_raw = rfs.append_raw
+            # Batch metadata conversion and raw-data writes.  A 16K-frame
+            # batch turns ~12 million Python append/write calls for a 1.5M
+            # frame file into fewer than 100 C-level bulk operations.
+            batch_ts: list[float] = []
+            batch_ch: list[int] = []
+            batch_ids: list[int] = []
+            batch_dlcs: list[int] = []
+            batch_dirs: list[int] = []
+            batch_flags: list[int] = []
+            batch_data = bytearray(_RAW_BATCH_SIZE * 64)
+
+            def flush_batch() -> None:
+                if not batch_ts:
+                    return
+                rfs.append_raw_batch(
+                    batch_ts, batch_ch, batch_ids, batch_dlcs,
+                    batch_dirs, batch_flags, batch_data,
+                )
+                batch_ts.clear()
+                batch_ch.clear()
+                batch_ids.clear()
+                batch_dlcs.clear()
+                batch_dirs.clear()
+                batch_flags.clear()
+
             for ts, ch_byte, arb_id, dlc, dir_int, is_ext, is_fd, data in \
                     reader.iter_raw_tuples():
                 index += 1
                 if base_ts is None:
                     base_ts = ts
                     store.base_ts = base_ts
-                rfs_append_raw(ts - base_ts, ch_byte, arb_id, dlc,
-                               dir_int, is_ext, is_fd, data)
+                slot = len(batch_ts)
+                batch_ts.append(ts - base_ts)
+                batch_ch.append(ch_byte)
+                batch_ids.append(arb_id & 0xFFFF_FFFF)
+                batch_dlcs.append(min(dlc, 255))
+                batch_dirs.append(dir_int)
+                batch_flags.append((1 if is_ext else 0) | (2 if is_fd else 0))
+                offset = slot * 64
+                batch_data[offset:offset + 64] = b'\x00' * 64
+                data_len = min(len(data), 64)
+                if data_len:
+                    batch_data[offset:offset + data_len] = data[:data_len]
+                if len(batch_ts) == _RAW_BATCH_SIZE:
+                    flush_batch()
                 if index == 1 or index % _CAN_PROGRESS_INTERVAL == 0:
                     self.progress.emit(f"Reading frames: {index:,}...")
+            flush_batch()
         else:
             # Legacy path: RawFrame objects with per-frame note_frame()
             rfs_append = rfs.append
@@ -250,8 +311,12 @@ class LoadWorker(QObject):
                     self.progress.emit(f"Reading frames: {index:,}...")
 
         rfs.seal()
+        read_elapsed = time.perf_counter() - read_started
+        self.progress.emit(
+            f"Frame read/store complete: {index:,} frames in {read_elapsed:.1f} s"
+        )
 
-        if _fast:
+        if _batched or _fast:
             # Bulk-compute what per-frame note_frame() would have done.
             _bulk_compute_store_stats(store, rfs)
         n = len(rfs)
@@ -274,6 +339,7 @@ class LoadWorker(QObject):
         self.progress.emit(
             f"Read {n:,} frames. Decoding signals (pass 2/2)..."
         )
+        decode_started = time.perf_counter()
 
         timestamps_np = np.frombuffer(rfs.timestamps, dtype=np.float64)
         channels_np   = np.frombuffer(rfs.channels,   dtype=np.uint8)
@@ -341,6 +407,19 @@ class LoadWorker(QObject):
             ts_arr = timestamps_np[group_idx]
 
             for sig_name, (ext, numeric_arr) in sig_results.items():
+                # Slow-path decode and vectorized multiplexing represent
+                # inactive/failed rows as NaN.  Do not materialize those rows
+                # in SignalStore; asammdf and cantools expose sparse branch
+                # series containing only timestamps where the signal exists.
+                valid_mask = ~np.isnan(numeric_arr)
+                if not valid_mask.any():
+                    continue
+                if valid_mask.all():
+                    signal_ts = ts_arr
+                else:
+                    signal_ts = ts_arr[valid_mask]
+                    numeric_arr = numeric_arr[valid_mask]
+
                 choices = ext.choices
                 if choices:
                     # Vectorised choices lookup (Bottleneck 5).
@@ -400,7 +479,7 @@ class LoadWorker(QObject):
                     message_id   = msg_id,
                     signal_name  = sig_name,
                     unit         = ext.unit,
-                    timestamps   = ts_arr,
+                    timestamps   = signal_ts,
                     values       = numeric_arr,
                     raw_values   = raw_values,
                     has_labels   = has_labels,
@@ -455,6 +534,10 @@ class LoadWorker(QObject):
         # for every frame in pass 1 because it doesn't know yet).
         store.decoded_frames   = decoded_total
         store.unmatched_frames = n - decoded_total
+        decode_elapsed = time.perf_counter() - decode_started
+        self.progress.emit(
+            f"Vectorized decode/import complete in {decode_elapsed:.1f} s"
+        )
 
         # Trace tab: needs decoder + config for on-demand signal expansion.
         if cfg:
@@ -650,7 +733,90 @@ class LoadWorker(QObject):
         store.normalize_timestamps(already_normalized=True)
         store.diagnostics_text = "\n".join(diag_parts)
 
-    # ── Bulk array path (MF4 / MDF / CSV) ────────────────────────────────
+    # ── Native asammdf bus decode path ───────────────────────────────────
+
+    def _run_mdf_bus_arrays(self, reader, store: SignalStore) -> None:
+        """One-pass asammdf bus decode followed by bulk signal-array import."""
+        stage_start = time.perf_counter()
+        self.progress.emit("Decoding MF4 bus log with asammdf (one pass)...")
+        cfg = self._channel_config
+
+        last_progress = [-1]
+
+        def on_extract_progress(current, total):
+            if total:
+                pct = int(current * 100 / total)
+                if pct >= last_progress[0] + 5 or current == total:
+                    last_progress[0] = pct
+                    self.progress.emit(f"asammdf bus decode: {pct}%")
+
+        # Retain each array until extraction closes, and find the global first
+        # timestamp before bulk insertion so every signal shares the same t=0.
+        arrays = []
+        base_ts: float | None = None
+        try:
+            for meta, ts_arr, num_arr, disp_list in reader.iter_decoded_channel_arrays(
+                    cfg, progress=on_extract_progress):
+                if len(ts_arr) == 0:
+                    continue
+                arrays.append((meta, ts_arr, num_arr, disp_list))
+                first = float(ts_arr[0])
+                base_ts = first if base_ts is None else min(base_ts, first)
+        except Exception as exc:
+            self.progress.emit(
+                "WARNING: asammdf native extraction was unavailable; "
+                f"using CANScope's two-pass fallback ({exc})"
+            )
+            self._run_can_raw_vectorized(reader, store)
+            return
+
+        extraction_elapsed = time.perf_counter() - stage_start
+        self.progress.emit(
+            f"asammdf extraction complete: {len(arrays):,} signals in "
+            f"{extraction_elapsed:.1f} s"
+        )
+
+        if base_ts is None:
+            base_ts = 0.0
+        store.base_ts = base_ts
+
+        total = len(arrays)
+        import_start = time.perf_counter()
+        for index, (meta, ts_arr, num_arr, disp_list) in enumerate(arrays, 1):
+            channel, message_name, message_id, signal_name, unit = meta
+            store.add_series_bulk(
+                channel=channel,
+                message_name=message_name,
+                message_id=message_id,
+                signal_name=signal_name,
+                unit=unit,
+                timestamps=ts_arr - base_ts,
+                values=num_arr,
+                raw_values=disp_list,
+                has_labels=bool(disp_list),
+            )
+            if index == 1 or index % 250 == 0 or index == total:
+                self.progress.emit(
+                    f"Imported {index:,}/{total:,} decoded signals | "
+                    f"samples: {store.total_samples:,}"
+                )
+
+        import_elapsed = time.perf_counter() - import_start
+        self.progress.emit(f"Signal-array import complete in {import_elapsed:.1f} s")
+
+        if store.is_tree_dirty():
+            self.tree_update.emit(store.build_tree_payload())
+        self.partial_ready.emit()
+        store.normalize_timestamps(already_normalized=True)
+        store.diagnostics_text = (
+            store.channel_summary_text()
+            + f"\n\nSource: {reader.source_description}"
+            + f"\n\nDecoded signals: {total:,}"
+            + "\n\nMF4 decoded directly by asammdf in one pass."
+            + "\nRaw CAN Trace is not materialized during fast signal loading."
+        )
+
+    # ── Bulk array path (pre-decoded MF4 / MDF / CSV) ────────────────────
 
     def _run_bulk_array(self, reader, store: SignalStore) -> None:
         import numpy as np

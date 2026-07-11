@@ -6,7 +6,10 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QSize, QByteArray, QMimeData
+from PySide6.QtCore import (
+    Qt, QTimer, Signal, QRectF, QPointF, QSize, QByteArray, QMimeData,
+    QItemSelectionModel,
+)
 from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QDragEnterEvent, QDropEvent, QPen, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -311,6 +314,27 @@ class _ReorderTable(QTableWidget):
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.MoveAction)
 
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        """Snapshot multi-selection before a checkbox click collapses it.
+
+        QTableWidget normally makes the clicked row the sole selection before
+        itemChanged is delivered.  The panel needs the pre-click selection so
+        one checkbox can apply to every Shift/Ctrl-selected signal row.
+        """
+        panel = self._panel
+        if panel is not None:
+            panel._checkbox_target_keys = []
+            index = self.indexAt(event.position().toPoint())
+            if index.isValid() and index.column() in (0, 6):
+                selected = panel.selected_keys()
+                item = self.item(index.row(), 1)
+                clicked_key = (
+                    str(item.data(Qt.ItemDataRole.UserRole)) if item else ''
+                )
+                if len(selected) > 1 and clicked_key in selected:
+                    panel._checkbox_target_keys = selected
+        super().mousePressEvent(event)
+
 
 class PlotPanel(QWidget):
     selectionChanged = Signal(str)
@@ -369,6 +393,7 @@ class PlotPanel(QWidget):
         self._collapsed_groups: dict[str, bool] = {}
         self._cursor2_enabled: bool = False
         self._group_vis_changed: bool = False  # True when itemChanged fired before cellClicked
+        self._checkbox_target_keys: list[str] = []  # pre-click multi-row snapshot
         self._batch_mode: bool = False          # True while batch-adding signals; suppresses per-add rebuilds
         self._rebuild_seq: int = 0              # bumped each rebuild and by fit_to_window(); lets deferred restores detect staleness
         self.setAcceptDrops(True)
@@ -1028,7 +1053,7 @@ class PlotPanel(QWidget):
             QTimer.singleShot(0, _restore_overlay)
 
         self._set_axis_label(self._current_key)
-        self._refresh_table()
+        self._refresh_table_and_cursors()
         self._update_empty_state_ui()
         if selected:
             self._restore_selection(selected)
@@ -1042,10 +1067,6 @@ class PlotPanel(QWidget):
         if self._show_points:
             self._ensure_scatters()
             QTimer.singleShot(0, self._update_adaptive_points)
-        # Repopulate cursor value columns — _refresh_table wipes them to ''
-        self._update_table_values(self.v_line.value(), col=2)
-        if self._cursor2_enabled:
-            self._update_table_values(self.v_line2.value(), col=3)
 
     def _rebuild_overlay(self) -> None:
         """Normal or multi-axis: all signals on one PlotWidget, extra axes to the left."""
@@ -1741,19 +1762,56 @@ class PlotPanel(QWidget):
 
     def zoom_to_time(self, t_start: float, t_end: float, margin: float = 0.5) -> None:
         """Zoom X to [t_start - margin, t_end + margin] and rescale Y to match."""
+        # Cancel any deferred range-restore queued by _rebuild_curves (e.g. from
+        # an add/remove just before this call) so it can't silently overwrite
+        # this explicit zoom on the next event-loop tick.
+        self._rebuild_seq += 1
         x0 = t_start - margin
         x1 = t_end + margin
         if x0 >= x1:
             x1 = x0 + 1.0
         if self._stacked_mode:
-            for p in self._stacked_plots:
-                p.setXRange(x0, x1, padding=0)
+            if self._stacked_plots:
+                # Rows 1+ are X-linked to row 0 (see _rebuild_stacked) — set it
+                # once and let the link propagate. Looping setXRange across all
+                # linked views causes feedback drift in the settled range.
+                self._stacked_plots[0].setXRange(x0, x1, padding=0)
         elif self._multi_axis:
             self.plot.setXRange(x0, x1, padding=0)
             self._update_multi_axis_views()
         else:
             self.plot.setXRange(x0, x1, padding=0)
         self.fit_vertical()
+
+    def center_on_time(
+        self,
+        center: float,
+        half_width: float,
+        data_min: float | None = None,
+        data_max: float | None = None,
+    ) -> None:
+        """
+        Center X on *center* with a fixed +/-half_width span, clamped to
+        [data_min, data_max] (shifts rather than shrinks the window, unless
+        the data span itself is narrower than 2*half_width). Falls back to
+        bounds derived from currently-plotted signals if data_min/data_max
+        are not supplied.
+        """
+        if data_min is None or data_max is None:
+            all_ts = [ts for p in self._items.values() for ts in p.series.timestamps]
+            data_min, data_max = (min(all_ts), max(all_ts)) if all_ts else (None, None)
+
+        x0, x1 = center - half_width, center + half_width
+        if data_min is not None and data_max is not None and data_max > data_min:
+            span = x1 - x0
+            if span >= (data_max - data_min):
+                x0, x1 = data_min, data_max
+            elif x0 < data_min:
+                x0, x1 = data_min, data_min + span
+            elif x1 > data_max:
+                x0, x1 = data_max - span, data_max
+
+        self.zoom_to_time(x0, x1, margin=0)
 
     def fit_vertical(self) -> None:
         """
@@ -1855,7 +1913,7 @@ class PlotPanel(QWidget):
         # Recolor the point scatter too (cheap: restyles existing spots only).
         if plotted.scatter is not None:
             plotted.scatter.setBrush(pg.mkBrush(color))
-        self._refresh_table()
+        self._refresh_table_and_cursors()
         self._set_axis_label(self._current_key)
         self.signalColorChanged.emit(key, color)
 
@@ -2065,6 +2123,14 @@ class PlotPanel(QWidget):
                     self._row_lookup[key] = row
         # widths are user-controlled — no resizeColumnsToContents
 
+    def _refresh_table_and_cursors(self) -> None:
+        """_refresh_table() blanks the Cursor 1/2 columns for every row —
+        repopulate them from the current cursor positions afterward."""
+        self._refresh_table()
+        self._update_table_values(self.v_line.value(), col=2)
+        if self._cursor2_enabled:
+            self._update_table_values(self.v_line2.value(), col=3)
+
     def _emit_selection(self) -> None:
         row = self.table.currentRow()
         if row < 0:
@@ -2132,6 +2198,23 @@ class PlotPanel(QWidget):
         self._push_undo()
         self._items.pop(key)
         if self._current_key == key:
+            self._current_key = next(iter(self._items), None)
+        self._rebuild_curves(preserve_selection=False)
+        self._set_axis_label(self._current_key)
+        self._update_empty_state_ui()
+
+    def remove_series_many(self, keys) -> None:
+        """Remove multiple keys in one undo step / one rebuild. No-ops for
+        keys not currently plotted."""
+        present = [k for k in keys if k in self._items]
+        if not present:
+            return
+        self._push_undo()
+        for key in present:
+            self._items.pop(key, None)
+            if self._current_key == key:
+                self._current_key = None
+        if self._current_key is None:
             self._current_key = next(iter(self._items), None)
         self._rebuild_curves(preserve_selection=False)
         self._set_axis_label(self._current_key)
@@ -2433,10 +2516,15 @@ class PlotPanel(QWidget):
     def _restore_selection(self, keys: list[str]) -> None:
         self.table.clearSelection()
         key_set = set(keys)
+        selection_model = self.table.selectionModel()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item and item.data(Qt.ItemDataRole.UserRole) in key_set:
-                self.table.selectRow(row)
+                selection_model.select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
 
     # ── Context menus ─────────────────────────────────────────────────────
 
@@ -2545,6 +2633,17 @@ class PlotPanel(QWidget):
 
     # ── Visibility toggle ─────────────────────────────────────────────────
 
+    def _checkbox_targets(self, clicked_key: str) -> list[str]:
+        """Return selected signal keys affected by a checkbox toggle."""
+        snapshot = self._checkbox_target_keys
+        self._checkbox_target_keys = []
+        if clicked_key in snapshot and len(snapshot) > 1:
+            return [key for key in snapshot if key in self._items]
+        selected = self.selected_keys()
+        if clicked_key in selected and len(selected) > 1:
+            return [key for key in selected if key in self._items]
+        return [clicked_key] if clicked_key in self._items else []
+
     def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
         """Handle checkbox changes in the signal table."""
         if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
@@ -2557,8 +2656,9 @@ class PlotPanel(QWidget):
         if key.startswith('__axis__'):
             sig_key = key[len('__axis__'):]
             if sig_key in self._items:
-                self._toggle_axis_visibility(
-                    sig_key, item.checkState() == Qt.CheckState.Checked
+                self._toggle_axis_visibility_many(
+                    self._checkbox_targets(sig_key),
+                    item.checkState() == Qt.CheckState.Checked,
                 )
             return
 
@@ -2588,10 +2688,17 @@ class PlotPanel(QWidget):
         elif key in self._items:
             # Individual signal checkbox
             checked = item.checkState() == Qt.CheckState.Checked
-            if self._items[key].visible != checked:
+            target_keys = self._checkbox_targets(key)
+            changed = [
+                target_key for target_key in target_keys
+                if self._items[target_key].visible != checked
+            ]
+            if changed:
                 self._push_undo()
-                self._items[key].visible = checked
+                for target_key in changed:
+                    self._items[target_key].visible = checked
                 self._apply_visibility()
+                self._restore_selection(target_keys)
 
     def _apply_visibility(self) -> None:
         """
@@ -2601,6 +2708,7 @@ class PlotPanel(QWidget):
         For stacked mode: full rebuild is required (rows must be added/removed).
         The cursor lines are NOT touched — they persist regardless of signal visibility.
         """
+        selected = self.selected_keys()
         # Newly-enabled signals have no curve yet — _rebuild_overlay skipped them
         # last pass. The lightweight setVisible toggle can't materialise a curve,
         # so fall through to a full rebuild.
@@ -2618,49 +2726,72 @@ class PlotPanel(QWidget):
             if plotted.curve is not None:
                 plotted.curve.setVisible(plotted.visible)
         # Refresh table to update checkbox states and row colours
-        self._refresh_table()
+        self._refresh_table_and_cursors()
+        self._restore_selection(selected)
         self._refresh_highlight()
-        # Repopulate cursor value columns — _refresh_table wipes them to ''
-        self._update_table_values(self.v_line.value(), col=2)
-        if self._cursor2_enabled:
-            self._update_table_values(self.v_line2.value(), col=3)
 
     def _toggle_axis_visibility(self, key: str, visible: bool) -> None:
+        """Compatibility wrapper for a one-signal axis visibility change."""
+        self._toggle_axis_visibility_many([key], visible)
+
+    def _toggle_axis_visibility_many(self, keys: list[str], visible: bool) -> None:
         """Show or hide the Y axis for the unit group of the given signal.
 
-        All signals sharing the same unit group get their axis_visible synced.
+        All selected signals and all signals sharing their unit groups get
+        their axis_visible state synchronized.
         Hiding an axis frees its layout slot so the plot area expands to fill
         the gap.  Showing it re-inserts it at the next available slot.
         """
-        plotted = self._items.get(key)
-        if plotted is None:
+        keys = [key for key in keys if key in self._items]
+        if not keys:
             return
-        # Determine this signal's unit group and sync axis_visible for the whole group.
-        target_ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
-        group_keys = [k for k, p in self._items.items()
-                      if self._unit_key(p.series.unit, k, p.own_axis) == target_ukey]
-        for k, p in self._items.items():
-            if self._unit_key(p.series.unit, k, p.own_axis) == target_ukey:
-                p.axis_visible = visible
-        # Apply to the shared axis object (only needs to happen once).
-        if plotted.axis is not None:
-            if plotted.view_box is None:
-                # Main left axis: setVisible(False) collapses the entire left
-                # margin, destroying the layout space that floating extra axes
-                # depend on.  Fake "hidden" by blanking the visual content instead.
+
+        target_ukeys = {
+            self._unit_key(
+                self._items[key].series.unit, key, self._items[key].own_axis
+            )
+            for key in keys
+        }
+        for key, plotted in self._items.items():
+            ukey = self._unit_key(plotted.series.unit, key, plotted.own_axis)
+            if ukey in target_ukeys:
+                plotted.axis_visible = visible
+
+        # Apply each affected shared axis once.
+        for target_ukey in target_ukeys:
+            group_keys = [
+                key for key, plotted in self._items.items()
+                if self._unit_key(
+                    plotted.series.unit, key, plotted.own_axis
+                ) == target_ukey
+            ]
+            if not group_keys:
+                continue
+            representative = next(
+                (self._items[key] for key in group_keys
+                 if self._items[key].axis is not None),
+                self._items[group_keys[0]],
+            )
+            axis = representative.axis
+            if axis is None:
+                continue
+            if representative.view_box is None:
+                # Keep the main left-axis layout slot; hide only its content.
                 if visible:
-                    lbl = self._axis_group_label(group_keys)
-                    plotted.axis.setLabel(lbl, color=plotted.color)
-                    plotted.axis.setTextPen(pg.mkPen(plotted.color))
-                    plotted.axis.setStyle(showValues=True)
+                    axis.setLabel(
+                        self._axis_group_label(group_keys),
+                        color=representative.color,
+                    )
+                    axis.setTextPen(pg.mkPen(representative.color))
+                    axis.setStyle(showValues=True)
                 else:
-                    plotted.axis.setLabel('')
-                    plotted.axis.setTextPen(pg.mkPen(None))
-                    plotted.axis.setStyle(showValues=False)
+                    axis.setLabel('')
+                    axis.setTextPen(pg.mkPen(None))
+                    axis.setStyle(showValues=False)
             else:
-                plotted.axis.setVisible(visible)
+                axis.setVisible(visible)
+
         if self._multi_axis and self._extra_axes:
-            # Resize the left margin to match the number of now-visible extra axes.
             n_vis = sum(1 for axis, _ in self._extra_axes if axis.isVisible())
             new_w = self._compute_main_axis_width(n_vis)
             main_axis = self.plot.getAxis('left')
@@ -2669,8 +2800,9 @@ class PlotPanel(QWidget):
                 main_axis._title_x = new_w - self._MAIN_AXIS_W - 5
                 QTimer.singleShot(0, main_axis._apply_title_pos)
             QTimer.singleShot(15, self._update_multi_axis_views)
-        # Refresh table so all rows in the group show the updated checkbox state.
-        self._refresh_table()
+
+        self._refresh_table_and_cursors()
+        self._restore_selection(keys)
 
     def _set_own_axis(self, keys: list[str], enabled: bool) -> None:
         """Detach or rejoin signals onto their own individual Y axis in multi-axis mode."""
@@ -2845,11 +2977,11 @@ class PlotPanel(QWidget):
 
     def _toggle_name_channel(self, checked: bool) -> None:
         self._name_show_channel = bool(checked)
-        self._refresh_table()
+        self._refresh_table_and_cursors()
 
     def _toggle_name_message(self, checked: bool) -> None:
         self._name_show_message = bool(checked)
-        self._refresh_table()
+        self._refresh_table_and_cursors()
 
     def _on_stacked_scene_click(self, event) -> None:
         """Left-click → clear selection. Right-click → signal context menu."""

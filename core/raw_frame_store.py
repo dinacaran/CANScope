@@ -185,6 +185,41 @@ class RawFrameStore:
             buf[:n] = data[:n]    # C-level memcopy of payload
         self._data_file.write(buf)
 
+    def append_raw_batch(
+        self,
+        timestamps: list[float],
+        channels: list[int],
+        arb_ids: list[int],
+        dlcs: list[int],
+        directions: list[int],
+        flags: list[int],
+        data_block,
+    ) -> None:
+        """Append a packed batch from the BLF/ASC hot path.
+
+        Converting Python lists to ``array.array`` is performed by C loops and
+        the complete payload block is written with one buffered file call.
+        This replaces seven ``array.append`` calls plus one ``write`` call per
+        CAN frame.
+        """
+        count = len(timestamps)
+        if count == 0:
+            return
+        if not (
+            len(channels) == len(arb_ids) == len(dlcs)
+            == len(directions) == len(flags) == count
+        ):
+            raise ValueError("Raw frame batch columns have different lengths")
+
+        self.timestamps.fromlist(timestamps)
+        self.channels.fromlist(channels)
+        self.arb_ids.fromlist(arb_ids)
+        self.dlcs.fromlist(dlcs)
+        self.directions.fromlist(directions)
+        self.flags.fromlist(flags)
+        self.name_ids.frombytes(bytes(count * self.name_ids.itemsize))
+        self._data_file.write(memoryview(data_block)[:count * _DATA_BYTES])
+
     def seal(self) -> None:
         """
         Called once after all frames have been appended.
