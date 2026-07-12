@@ -1,6 +1,6 @@
 # Changelog
 
-
+## [v00.00.49] — 2026-07-12: build check
 ## [v00.00.48] — 2026-07-11
 ### MF4 buslogging file decoding changed from CANtool to ASMMDF, vectorize batch conversion implement
 ### multi signal check/uncheck added
