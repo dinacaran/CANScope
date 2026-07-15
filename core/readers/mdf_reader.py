@@ -38,6 +38,44 @@ def _decode_str_arr(arr) -> list[str]:
     ]
 
 
+class LazyTextValues:
+    """Sequence view that decodes MDF byte labels only when they are displayed.
+
+    Native bus extraction can produce millions of fixed-width byte labels.
+    Turning all of them into Python strings during load is both slow and
+    memory-heavy; keeping the NumPy array and decoding indexed values preserves
+    the same UI/export text without delaying signal discovery.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values) -> None:
+        self._values = values
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __bool__(self) -> bool:
+        return len(self._values) > 0
+
+    @staticmethod
+    def _decode(value) -> str:
+        if isinstance(value, (bytes, bytearray, np.bytes_)):
+            return value.decode("utf-8", errors="replace").strip()
+        if isinstance(value, str):
+            return value.strip()
+        return str(value)
+
+    def __getitem__(self, index):
+        value = self._values[index]
+        if isinstance(index, slice):
+            return [self._decode(item) for item in value]
+        return self._decode(value)
+
+    def __iter__(self):
+        return (self._decode(value) for value in self._values)
+
+
 class MDFReader:
     """
     Reads ASAM MDF version 3 (.mdf) and version 4 (.mf4) measurement files.
@@ -99,6 +137,13 @@ class MDFReader:
 
     has_raw_frames:    bool = False
     has_channel_arrays: bool = True
+    metadata_first_arrays: bool = True
+    raw_trace_unavailable_reason: str = (
+        "This is a pre-decoded MDF file. It contains signal channels but no "
+        "CAN_DataFrame records (CAN ID, DLC, direction, and payload bytes), so "
+        "an authentic CAN Trace cannot be reconstructed. Load the original "
+        "bus-logged MF4/MDF, BLF, or ASC file to view CAN Trace."
+    )
 
     # Cached results of is_bus_logging() keyed by resolved absolute path.
     # Eliminates repeated header opens when dbc_required_for / reader_factory /
@@ -123,7 +168,7 @@ class MDFReader:
         self.load_messages: list[str] = [
             f"asammdf: opening {fmt} file…",
             "No database required — signals are pre-decoded.",
-            "Using vectorised channel-array fast path (select-batched).",
+            "Using metadata-first global channel-array fast path.",
         ]
 
     # ── Protocol iterator (fallback, not used by LoadWorker fast path) ────
@@ -143,7 +188,11 @@ class MDFReader:
 
     # ── Fast path: one tuple per channel, vectorised ──────────────────────
 
-    def iter_channel_arrays(self):
+    def iter_channel_arrays(
+        self,
+        metadata_ready=None,
+        batch_all_groups: bool = False,
+    ):
         """
         Yield ``((grp_name, ch_name, unit), ts_arr, num_arr, disp_list)``
         one entry per channel.
@@ -152,8 +201,8 @@ class MDFReader:
         display values (strings for enum channels, empty list for numeric).
         Timestamps are **not** yet normalised — LoadWorker subtracts base_ts.
 
-        Uses ``mdf.select()`` to batch-fetch all channels within a channel
-        group in one file pass (instead of one ``mdf.get()`` per channel).
+        LoadWorker requests one global ``mdf.select()`` across all channel
+        groups. Other callers default to the bounded per-group path.
         """
         try:
             import asammdf
@@ -168,12 +217,33 @@ class MDFReader:
             ) from exc
 
         try:
-            yield from self._iter_arrays(mdf)
+            if metadata_ready is not None:
+                metadata_ready(self._channel_metadata(mdf))
+            yield from self._iter_arrays(
+                mdf,
+                batch_all_groups=batch_all_groups,
+            )
         finally:
             try:
                 mdf.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _channel_metadata(mdf):
+        """Return the complete pre-decoded hierarchy without reading samples."""
+        rows = []
+        for group_idx, group in enumerate(mdf.groups):
+            group_name = MDFReader._group_name(mdf, group_idx)
+            for ch_idx, channel in enumerate(group.channels):
+                channel_name = getattr(channel, "name", None) or f"Ch{ch_idx}"
+                if getattr(channel, "channel_type", -1) == 1:
+                    continue
+                if channel_name.lower() in ("time", "t", "timestamps"):
+                    continue
+                unit = str(getattr(channel, "unit", "") or "")
+                rows.append((group_name, channel_name, unit))
+        return rows
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -220,7 +290,11 @@ class MDFReader:
         return result
 
     @staticmethod
-    def _iter_arrays(mdf, include_group_index: bool = False):
+    def _iter_arrays(
+        mdf,
+        include_group_index: bool = False,
+        batch_all_groups: bool = False,
+    ):
         """
         Core vectorised channel iterator using ``mdf.select()`` for batch I/O.
 
@@ -251,6 +325,16 @@ class MDFReader:
                 ch_list.append((ch_idx, ch_name))
             if ch_list:
                 groups_channels[group_idx] = ch_list
+
+        # extract_bus_logging() returns an in-memory decoded MDF and the caller
+        # retains every yielded array. In that specific case, selecting all
+        # groups together avoids hundreds of select() dispatches and lets enum
+        # labels remain lazy. Pre-decoded MDF keeps the bounded per-group path.
+        if batch_all_groups:
+            yield from MDFReader._iter_arrays_all_groups(
+                mdf, groups_channels, include_group_index
+            )
+            return
 
         # ── Phase 2: batch-fetch one group at a time ──────────────────────
         for group_idx, ch_list in groups_channels.items():
@@ -362,6 +446,102 @@ class MDFReader:
 
             # Release the batch of Signal objects before the next group.
             del sigs
+
+    @staticmethod
+    def _iter_arrays_all_groups(mdf, groups_channels, include_group_index):
+        """Read an already-extracted bus-log MDF with two global selects."""
+        flat_channels = [
+            (group_idx, ch_idx, ch_name)
+            for group_idx, ch_list in groups_channels.items()
+            for ch_idx, ch_name in ch_list
+        ]
+        select_specs = [
+            (ch_name, group_idx, ch_idx)
+            for group_idx, ch_idx, ch_name in flat_channels
+        ]
+
+        try:
+            sigs = mdf.select(select_specs, raw=False)
+        except Exception:
+            # Retain the established per-group/get fallback for unusual MDFs.
+            yield from MDFReader._iter_arrays(
+                mdf,
+                include_group_index=include_group_index,
+                batch_all_groups=False,
+            )
+            return
+
+        enum_mask = [
+            False if sig is None else _is_text(sig.samples)
+            for sig in sigs
+        ]
+        enum_positions = [i for i, is_enum in enumerate(enum_mask) if is_enum]
+        raw_map: dict[int, object] = {}
+        if enum_positions:
+            raw_specs = [select_specs[i] for i in enum_positions]
+            try:
+                raw_sigs = mdf.select(raw_specs, raw=True)
+                raw_map.update(zip(enum_positions, raw_sigs))
+            except Exception:
+                for i in enum_positions:
+                    ch_name, group_idx, ch_idx = select_specs[i]
+                    try:
+                        raw_map[i] = mdf.get(
+                            ch_name, group=group_idx, index=ch_idx, raw=True
+                        )
+                    except Exception:
+                        pass
+
+        group_names = {
+            group_idx: MDFReader._group_name(mdf, group_idx)
+            for group_idx in groups_channels
+        }
+        for i, (sig, (group_idx, _ch_idx, ch_name)) in enumerate(
+            zip(sigs, flat_channels)
+        ):
+            if sig is None:
+                continue
+            ts_arr = sig.timestamps
+            eng_arr = sig.samples
+            if (
+                ts_arr is None
+                or eng_arr is None
+                or len(ts_arr) == 0
+                or len(ts_arr) != len(eng_arr)
+            ):
+                continue
+
+            ts_arr = np.asarray(ts_arr, dtype=np.float64)
+            unit = str(getattr(sig, "unit", "") or "")
+            if enum_mask[i]:
+                raw_sig = raw_map.get(i)
+                raw_int = getattr(raw_sig, "samples", None)
+                if raw_int is not None and len(raw_int) == len(ts_arr):
+                    try:
+                        num_arr = np.asarray(raw_int, dtype=np.float64)
+                    except (TypeError, ValueError):
+                        num_arr = np.arange(len(ts_arr), dtype=np.float64)
+                else:
+                    num_arr = np.zeros(len(ts_arr), dtype=np.float64)
+                disp_values = LazyTextValues(eng_arr)
+            else:
+                try:
+                    num_arr = np.asarray(eng_arr, dtype=np.float64)
+                    disp_values = []
+                except (TypeError, ValueError):
+                    num_arr = np.arange(len(ts_arr), dtype=np.float64)
+                    disp_values = LazyTextValues(eng_arr)
+
+            item = (
+                (group_names[group_idx], ch_name, unit),
+                ts_arr,
+                num_arr,
+                disp_values,
+            )
+            if include_group_index:
+                yield (group_idx, *item)
+            else:
+                yield item
 
     @staticmethod
     def _group_name(mdf, group_idx: int) -> str:

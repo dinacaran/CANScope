@@ -22,11 +22,13 @@ as stored in the MDF file (Vector / ASAM convention is 1-based).
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 import re
 
 import can
+import numpy as np
 
 from core.models import RawFrame, DecodedSignalSample
 from core.dbc_decoder import DBCDecoder
@@ -52,6 +54,7 @@ class MDFCANReader:
     """
 
     has_raw_frames: bool = True
+    supports_raw_frame_arrays: bool = True
 
     def __init__(self, mdf_path: str | Path, decoder: DBCDecoder | str | Path) -> None:
         self._path = Path(mdf_path)
@@ -148,8 +151,14 @@ class MDFCANReader:
                 direction=("Rx", "Tx", "Unknown")[direction],
             )
 
-    def iter_decoded_channel_arrays(self, channel_config, progress=None):
-        """Decode the complete MF4 bus log with asammdf in one native pass."""
+    def iter_decoded_channel_arrays(
+        self,
+        channel_config,
+        progress=None,
+        metadata_ready=None,
+        raw_frame_batch=None,
+    ):
+        """Decode signals and expose raw CAN records through bulk arrays."""
         try:
             import asammdf
         except ImportError as exc:
@@ -165,8 +174,25 @@ class MDFCANReader:
             databases = [(str(self._dbc_path), 0)]
 
         source = extracted = None
+        raw_executor = None
+        raw_future = None
+        self.raw_trace_error = ""
         try:
             source = asammdf.MDF(str(self._path), use_display_names=False)
+            if raw_frame_batch is not None:
+                # Raw CAN arrays are independent from the extracted decoded
+                # MDF. Read them through a second lazy MDF handle so payload
+                # materialisation overlaps native DBC extraction instead of
+                # becoming another sequential loading phase.
+                raw_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="canscope-mf4-trace",
+                )
+                raw_future = raw_executor.submit(
+                    self._load_raw_frame_arrays,
+                    asammdf,
+                    raw_frame_batch,
+                )
             # Expand CANScope's "All Channels" fallback to the concrete bus
             # channels discovered by asammdf.  This prevents a channel-specific
             # database and the fallback database from both decoding the same bus.
@@ -188,19 +214,68 @@ class MDFCANReader:
                 progress=progress,
             )
 
+            # The hierarchy is available from decoded MDF metadata before any
+            # sample arrays are selected. Hand it to the GUI immediately so
+            # signal discovery tracks native asammdf extraction time.
+            metadata_by_key = {}
+            metadata_rows = []
+            for group_idx, group in enumerate(extracted.groups):
+                for ch_idx, decoded_channel in enumerate(group.channels):
+                    signal_name = (
+                        getattr(decoded_channel, "name", None) or f"Ch{ch_idx}"
+                    )
+                    if getattr(decoded_channel, "channel_type", -1) == 1:
+                        continue
+                    if signal_name.lower() in ("time", "t", "timestamps"):
+                        continue
+                    unit = str(getattr(decoded_channel, "unit", "") or "")
+                    channel, message_name, message_id = self._decoded_group_metadata(
+                        extracted, group_idx, signal_name, channel_config
+                    )
+                    meta = (
+                        channel,
+                        message_name,
+                        message_id,
+                        signal_name,
+                        unit,
+                    )
+                    metadata_by_key[(group_idx, signal_name)] = meta
+                    metadata_rows.append(meta)
+
+            if metadata_ready is not None:
+                metadata_ready(metadata_rows)
+
             for group_idx, old_meta, ts_arr, num_arr, disp_list in \
-                    MDFReader._iter_arrays(extracted, include_group_index=True):
+                    MDFReader._iter_arrays(
+                        extracted,
+                        include_group_index=True,
+                        batch_all_groups=True,
+                    ):
                 signal_name = old_meta[1]
                 unit = old_meta[2]
-                channel, message_name, message_id = self._decoded_group_metadata(
-                    extracted, group_idx, signal_name, channel_config
-                )
+                meta = metadata_by_key.get((group_idx, signal_name))
+                if meta is None:
+                    channel, message_name, message_id = self._decoded_group_metadata(
+                        extracted, group_idx, signal_name, channel_config
+                    )
+                else:
+                    channel, message_name, message_id, _name, metadata_unit = meta
+                    if not unit:
+                        unit = metadata_unit
                 yield (
                     (channel, message_name, message_id, signal_name, unit),
                     ts_arr,
                     num_arr,
                     disp_list,
                 )
+
+            if raw_future is not None:
+                try:
+                    raw_future.result()
+                except Exception as exc:
+                    # A trace-only failure must not discard a successful native
+                    # signal decode or force the much slower compatibility path.
+                    self.raw_trace_error = str(exc)
         except MDFCANReadError:
             raise
         except Exception as exc:
@@ -208,12 +283,94 @@ class MDFCANReader:
                 f"asammdf bus extraction failed for '{self._path}': {exc}"
             ) from exc
         finally:
+            if raw_executor is not None:
+                raw_executor.shutdown(wait=True, cancel_futures=False)
             for mdf in (extracted, source):
                 if mdf is not None:
                     try:
                         mdf.close()
                     except Exception:
                         pass
+
+    def _load_raw_frame_arrays(self, asammdf, callback) -> int:
+        raw_source = None
+        try:
+            raw_source = asammdf.MDF(str(self._path), use_display_names=False)
+            return self._emit_raw_frame_arrays(raw_source, callback)
+        finally:
+            if raw_source is not None:
+                try:
+                    raw_source.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _emit_raw_frame_arrays(source, callback) -> int:
+        """Read each MDF ``CAN_DataFrame`` group as one structured array."""
+        total = 0
+        for group_idx, group in enumerate(source.groups):
+            parent_idx = None
+            for channel_idx, channel in enumerate(group.channels):
+                if (getattr(channel, "name", "") or "") == "CAN_DataFrame":
+                    parent_idx = channel_idx
+                    break
+            if parent_idx is None:
+                continue
+
+            signal = source.get(
+                group=group_idx,
+                index=parent_idx,
+                raw=True,
+            )
+            samples = np.asarray(signal.samples)
+            field_names = samples.dtype.names or ()
+
+            def field(suffix, required=True):
+                exact = f"CAN_DataFrame.{suffix}"
+                name = exact if exact in field_names else next(
+                    (item for item in field_names if item.endswith(f".{suffix}")),
+                    None,
+                )
+                if name is None:
+                    if required:
+                        raise MDFCANReadError(
+                            f"Raw CAN channel '{exact}' is missing from group {group_idx}."
+                        )
+                    return None
+                return samples[name]
+
+            timestamps = np.asarray(signal.timestamps, dtype=np.float64)
+            channels = field("BusChannel")
+            arb_ids = field("ID")
+            data_rows = field("DataBytes")
+            data_lengths = field("DataLength", required=False)
+            if data_lengths is None:
+                data_lengths = field("DLC")
+            directions = field("Dir", required=False)
+            if directions is None:
+                directions = np.full(len(samples), 2, dtype=np.uint8)
+            ide = field("IDE", required=False)
+            if ide is None:
+                ide = np.asarray(arb_ids, dtype=np.uint32) > 0x7FF
+            edl = field("EDL", required=False)
+            if edl is None:
+                edl = np.zeros(len(samples), dtype=np.uint8)
+            flags = (
+                (np.asarray(ide, dtype=np.uint8) & np.uint8(1))
+                | ((np.asarray(edl, dtype=np.uint8) & np.uint8(1)) << np.uint8(1))
+            )
+
+            callback(
+                timestamps,
+                channels,
+                arb_ids,
+                data_lengths,
+                directions,
+                flags,
+                data_rows,
+            )
+            total += len(timestamps)
+        return total
 
     @staticmethod
     def _decoded_group_metadata(extracted, group_idx, signal_name, channel_config):

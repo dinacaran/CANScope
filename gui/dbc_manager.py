@@ -18,6 +18,7 @@ Layout:
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -29,6 +30,36 @@ from PySide6.QtWidgets import (
 )
 
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
+
+
+def _j1939_pgn(frame_id: int) -> int | None:
+    """Return the PDU2 PGN used by the Database Manager match display."""
+    pf = (frame_id >> 16) & 0xFF
+    if frame_id > 0x7FF and pf >= 0xF0:
+        return (frame_id >> 8) & 0xFFFF
+    return None
+
+
+@lru_cache(maxsize=32)
+def _load_database_match_data(
+    resolved_path: str,
+    mtime_ns: int,
+    file_size: int,
+) -> tuple[frozenset[int], dict[int, int]]:
+    """Parse match-only DBC metadata once per unchanged database file."""
+    # mtime_ns and file_size intentionally participate in the cache key.
+    del mtime_ns, file_size
+    import cantools
+
+    db = cantools.database.load_file(resolved_path, strict=False)
+    dbc_ids = frozenset(
+        int(message.frame_id) & 0x1FFFFFFF for message in db.messages
+    )
+    dbc_pgn_by_id = {
+        frame_id: pgn for frame_id in dbc_ids
+        if (pgn := _j1939_pgn(frame_id)) is not None
+    }
+    return dbc_ids, dbc_pgn_by_id
 
 
 class _DBCRow(QWidget):
@@ -160,6 +191,7 @@ class DBCManagerDialog(QDialog):
         self._ids_per_channel  = ids_per_channel
         self._data_provider    = data_provider  # callable for refresh
         self._rows: list[_DBCRow] = []
+        self._file_match_data = self._normalise_file_match_data(ids_per_channel)
 
         # ── Config name ───────────────────────────────────────────────────
         name_row = QHBoxLayout()
@@ -197,9 +229,6 @@ class DBCManagerDialog(QDialog):
         # Populate existing rows
         for ch, path in channel_config.channels.items():
             self._add_row(path, preferred_channel=ch)
-        # If we have measurement data, immediately show real match quality
-        if ids_per_channel:
-            self._refresh_all_matches()
 
         # ── Add DBC button ────────────────────────────────────────────────
         add_btn = QPushButton("+ Add Database…")
@@ -317,6 +346,9 @@ class DBCManagerDialog(QDialog):
                 fresh_channels, fresh_ids = self._data_provider()
                 if fresh_channels:
                     self._ids_per_channel = fresh_ids
+                    self._file_match_data = self._normalise_file_match_data(
+                        fresh_ids
+                    )
                     # Update channel dropdowns to include any newly seen channels
                     new_chs = sorted(set(fresh_channels) - set(self._channels_in_file))
                     if new_chs:
@@ -363,9 +395,11 @@ class DBCManagerDialog(QDialog):
         broadcast on different source addresses than the DBC template value.
         """
         try:
-            import cantools
-            db = cantools.database.load_file(dbc_path, strict=False)
-            dbc_ids = {int(m.frame_id) & 0x1FFFFFFF for m in db.messages}
+            path = Path(dbc_path).resolve()
+            stat = path.stat()
+            dbc_ids, dbc_pgn_by_id = _load_database_match_data(
+                str(path), stat.st_mtime_ns, stat.st_size
+            )
         except Exception:
             return 0.0, "can't read database", ALL_CHANNELS_KEY
 
@@ -376,27 +410,15 @@ class DBCManagerDialog(QDialog):
         best_count = 0
         best_total = len(dbc_ids)
 
-        # Pre-compute PGN sets for DBC (J1939 extended frames only)
-        # PGN for PDU2 (PF >= 0xF0): bits 8-23 of the 29-bit ID
-        def _pgn(fid: int) -> int | None:
-            pf = (fid >> 16) & 0xFF
-            if fid > 0x7FF and pf >= 0xF0:
-                return (fid >> 8) & 0xFFFF
-            return None
-
-        dbc_pgns = {_pgn(fid) for fid in dbc_ids} - {None}
-
-        for ch, file_ids in self._ids_per_channel.items():
-            file_ids_norm = {fid & 0x1FFFFFFF for fid in file_ids}
-            file_pgns     = {_pgn(fid) for fid in file_ids_norm} - {None}
+        for ch, (file_ids_norm, file_pgns) in self._file_match_data.items():
 
             # Pass 1: exact ID match
             exact_hits = len(dbc_ids & file_ids_norm)
 
             # Pass 2: PGN fallback for IDs that didn't match exactly
             unmatched_dbc_pgns = {
-                _pgn(fid) for fid in (dbc_ids - file_ids_norm)
-                if _pgn(fid) is not None
+                dbc_pgn_by_id[fid] for fid in (dbc_ids - file_ids_norm)
+                if fid in dbc_pgn_by_id
             }
             pgn_hits = len(unmatched_dbc_pgns & file_pgns)
 
@@ -408,6 +430,21 @@ class DBCManagerDialog(QDialog):
         pct  = best_count / best_total if best_total else 0.0
         text = f"{best_count} / {best_total} IDs"
         return pct, text, best_ch
+
+    @staticmethod
+    def _normalise_file_match_data(
+        ids_per_channel: dict[int, set[int]],
+    ) -> dict[int, tuple[frozenset[int], frozenset[int]]]:
+        """Prepare measurement ID/PGN sets once for all configured DBC rows."""
+        result: dict[int, tuple[frozenset[int], frozenset[int]]] = {}
+        for channel, file_ids in ids_per_channel.items():
+            normalised = frozenset(fid & 0x1FFFFFFF for fid in file_ids)
+            pgns = frozenset(
+                pgn for frame_id in normalised
+                if (pgn := _j1939_pgn(frame_id)) is not None
+            )
+            result[channel] = (normalised, pgns)
+        return result
 
     # ── Slots ─────────────────────────────────────────────────────────────
 

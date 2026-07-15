@@ -3,7 +3,7 @@ from __future__ import annotations
 import array as _array
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 
@@ -24,7 +24,7 @@ class SignalSeries:
     # raw_values is populated only for signals that carry display labels
     # (DBC enum/choice signals, MDF text channels). For ordinary numeric
     # signals it stays empty — consumers fall back to values[idx].
-    raw_values: list[object] = field(default_factory=list)
+    raw_values: Sequence[object] = field(default_factory=list)
     has_labels: bool = False
 
     @property
@@ -245,7 +245,7 @@ class SignalStore:
         unit: str,
         timestamps: "np.ndarray",
         values: "np.ndarray",
-        raw_values: list,
+        raw_values: Sequence[object],
         has_labels: bool = True,
     ) -> None:
         """
@@ -294,7 +294,14 @@ class SignalStore:
         series.timestamps.frombytes(ts_bytes)
         series.values.frombytes(val_bytes)
         if has_labels and raw_values:
-            series.raw_values.extend(raw_values)
+            if not series.raw_values and not isinstance(raw_values, list):
+                # MDF native extraction supplies a lazy text sequence so the
+                # signal list is not blocked by millions of byte->str decodes.
+                series.raw_values = raw_values
+            else:
+                if not hasattr(series.raw_values, "extend"):
+                    series.raw_values = list(series.raw_values)
+                series.raw_values.extend(raw_values)
 
         n = len(timestamps)
         self.total_samples  += n

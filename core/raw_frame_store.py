@@ -220,6 +220,67 @@ class RawFrameStore:
         self.name_ids.frombytes(bytes(count * self.name_ids.itemsize))
         self._data_file.write(memoryview(data_block)[:count * _DATA_BYTES])
 
+    def append_numpy_batch(
+        self,
+        timestamps,
+        channels,
+        arb_ids,
+        dlcs,
+        directions,
+        flags,
+        data_rows,
+    ) -> None:
+        """Append column arrays without converting millions of rows to lists.
+
+        This is the MDF bus-logging counterpart of :meth:`append_raw_batch`.
+        asammdf exposes a complete ``CAN_DataFrame`` channel group as NumPy
+        arrays; copying those arrays directly keeps CAN Trace construction on
+        the bulk path and avoids creating a Python object per CAN frame.
+
+        ``data_rows`` may contain 0..64 payload columns.  RawFrameStore keeps
+        fixed 64-byte records on disk, so narrower classic-CAN rows are padded
+        in bounded chunks rather than allocating one large expanded array.
+        """
+        count = len(timestamps)
+        if count == 0:
+            return
+        if not (
+            len(channels) == len(arb_ids) == len(dlcs)
+            == len(directions) == len(flags) == count
+        ):
+            raise ValueError("Raw frame NumPy columns have different lengths")
+
+        def extend_column(target, values, dtype) -> None:
+            column = np.ascontiguousarray(values, dtype=dtype).reshape(-1)
+            if len(column) != count:
+                raise ValueError("Raw frame NumPy column has an invalid shape")
+            target.frombytes(column.tobytes())
+
+        extend_column(self.timestamps, timestamps, np.float64)
+        extend_column(self.channels, channels, np.uint8)
+        extend_column(self.arb_ids, arb_ids, np.uint32)
+        extend_column(self.dlcs, dlcs, np.uint8)
+        extend_column(self.directions, directions, np.uint8)
+        extend_column(self.flags, flags, np.uint8)
+        self.name_ids.frombytes(bytes(count * self.name_ids.itemsize))
+
+        payload = np.asarray(data_rows, dtype=np.uint8)
+        if payload.ndim == 1:
+            if len(payload) % count:
+                raise ValueError("Raw frame payload array has an invalid shape")
+            payload = payload.reshape(count, -1)
+        if payload.ndim != 2 or payload.shape[0] != count:
+            raise ValueError("Raw frame payload array has an invalid shape")
+
+        width = min(int(payload.shape[1]), _DATA_BYTES)
+        chunk_size = 16_384
+        for start in range(0, count, chunk_size):
+            end = min(start + chunk_size, count)
+            block = np.zeros((end - start, _DATA_BYTES), dtype=np.uint8)
+            if width:
+                block[:, :width] = payload[start:end, :width]
+            self._data_file.write(memoryview(block))
+
     def seal(self) -> None:
         """
         Called once after all frames have been appended.

@@ -61,6 +61,13 @@ class MainWindow(QMainWindow):
         self.store: SignalStore | None = None
         # Pre-scan cache: (path, channels, ids_per_channel)
         self._prescan_cache: tuple[str, list[int], dict[int, set[int]]] | None = None
+        # Full RawFrameStore channel/ID summaries are built only on an explicit
+        # Database Manager refresh, then reused while this decoded store lives.
+        self._channel_data_cache: tuple[
+            tuple[str | None, int, int, int],
+            list[int],
+            dict[int, set[int]],
+        ] | None = None
         self._thread: QThread | None = None
         self._worker: LoadWorker | None = None
         self._pending_plot_keys: list[str] = []
@@ -307,6 +314,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         # Lightweight pre-scan: extract channel numbers + arb IDs
         # so the DBC Manager can show real channels before Load+Decode
         self._prescan_cache = None
+        self._channel_data_cache = None
         if needs_dbc:
             self._update_status('Scanning channels…', 'Reading measurement file header')
             QApplication.processEvents()
@@ -325,47 +333,105 @@ QToolButton:pressed { background-color: #1a2a3a; }
             'Measurement file selected', self._next_step_message()
         )
 
-    def _collect_channel_data(self) -> tuple[list[int], dict[int, set[int]]]:
+    def _collect_channel_data(
+        self,
+        *,
+        full_scan: bool = False,
+    ) -> tuple[list[int], dict[int, set[int]]]:
         """
         Collect CAN channel numbers and per-channel arbitration ID sets
-        from all available sources.  Used by the DBC Manager on open and
-        on Refresh Match.
+        for the Database Manager.
 
-        Priority:
-        1. RawFrameStore (post-decode, full coverage)
-        2. SignalStore channels (post-decode fallback)
-        3. Pre-scan cache (pre-decode, from lightweight header scan)
+        Normal dialog opening reuses the lightweight pre-scan cache so a large
+        decoded BLF/ASC is never walked merely to display the dialog. An
+        explicit Refresh Match requests ``full_scan=True``; that full summary
+        is computed in bounded NumPy chunks and cached for later refreshes.
         """
-        ids_per_channel: dict[int, set[int]] = {}
-        channels_in_file: list[int] = []
+        cached_path = None
+        cached_chs: list[int] = []
+        cached_ids: dict[int, set[int]] = {}
+        if self._prescan_cache is not None:
+            cached_path, cached_chs, cached_ids = self._prescan_cache
 
-        # Source 1: RawFrameStore (most complete, available after decode)
         rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
-        if rfs is not None and len(rfs) > 0:
+        raw_count = len(rfs) if rfs is not None else 0
+        cache_key = None
+        if raw_count > 0:
+            cache_key = (
+                self.measurement_path,
+                id(self.store),
+                id(rfs),
+                raw_count,
+            )
+            if (
+                self._channel_data_cache is not None
+                and self._channel_data_cache[0] == cache_key
+            ):
+                _, channels_in_file, ids_per_channel = self._channel_data_cache
+                return (
+                    list(channels_in_file),
+                    {ch: set(ids) for ch, ids in ids_per_channel.items()},
+                )
+
+        if cached_path == self.measurement_path and not full_scan:
+            return (
+                list(cached_chs),
+                {ch: set(ids) for ch, ids in cached_ids.items()},
+            )
+
+        # Config-driven loads may not have a pre-scan cache. Opening the
+        # dialog must still remain O(number of channels), never O(frames).
+        # The user can request complete ID coverage with Refresh Match.
+        if not full_scan:
+            channels = (
+                {int(ch) for ch in self.store.channels if ch is not None}
+                if self.store is not None else set()
+            )
+            return sorted(channels), {}
+
+        if raw_count > 0:
             import numpy as np
             chs  = np.frombuffer(rfs.channels, dtype=np.uint8)
             aids = np.frombuffer(rfs.arb_ids,  dtype=np.uint32)
-            for ch_val in np.unique(chs):
-                if ch_val == 255:
-                    continue
-                ch_int = int(ch_val)
-                channels_in_file.append(ch_int)
-                ids_per_channel[ch_int] = set(int(x) for x in aids[chs == ch_val])
+            ids_per_channel: dict[int, set[int]] = {}
 
-        # Source 2: SignalStore (post-decode fallback)
-        if not channels_in_file and self.store is not None:
-            for ch in sorted(self.store.channels):
-                if ch is not None:
-                    channels_in_file.append(int(ch))
+            # Packing (channel, arbitration ID) into uint64 lets np.unique do
+            # the per-frame reduction in C. Chunking bounds temporary memory
+            # even when the store contains tens of millions of frames.
+            chunk_size = 500_000
+            for start in range(0, len(chs), chunk_size):
+                stop = min(start + chunk_size, len(chs))
+                chunk_channels = chs[start:stop]
+                packed = aids[start:stop].astype(np.uint64, copy=True)
+                packed |= chunk_channels.astype(np.uint64) << np.uint64(32)
+                for packed_value in np.unique(packed):
+                    value = int(packed_value)
+                    channel = value >> 32
+                    if channel == 255:
+                        continue
+                    ids_per_channel.setdefault(channel, set()).add(
+                        value & 0xFFFF_FFFF
+                    )
 
-        # Source 3: Pre-scan cache (available before decode)
-        if not channels_in_file and self._prescan_cache is not None:
-            cached_path, cached_chs, cached_ids = self._prescan_cache
-            if cached_path == self.measurement_path:
-                channels_in_file = list(cached_chs)
-                ids_per_channel = {ch: set(ids) for ch, ids in cached_ids.items()}
+            channels_in_file = sorted(ids_per_channel)
+            assert cache_key is not None
+            self._channel_data_cache = (
+                cache_key,
+                list(channels_in_file),
+                {ch: set(ids) for ch, ids in ids_per_channel.items()},
+            )
+            return channels_in_file, ids_per_channel
 
-        return channels_in_file, ids_per_channel
+        # Native one-pass MDF has no RawFrameStore. Preserve the pre-scan IDs
+        # and merge in any channels discovered from decoded signals.
+        channels = set(cached_chs if cached_path == self.measurement_path else [])
+        ids_per_channel = (
+            {ch: set(ids) for ch, ids in cached_ids.items()}
+            if cached_path == self.measurement_path else {}
+        )
+        if self.store is not None:
+            channels.update(int(ch) for ch in self.store.channels if ch is not None)
+        return sorted(channels), ids_per_channel
 
     def choose_dbc(self) -> None:
         """Open the DBC Manager dialog to assign DBCs to channels."""
@@ -376,7 +442,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             channels_in_file = channels_in_file,
             ids_per_channel  = ids_per_channel,
             parent           = self,
-            data_provider    = self._collect_channel_data,
+            data_provider    = lambda: self._collect_channel_data(full_scan=True),
         )
         if dlg.exec() != DBCManagerDialog.DialogCode.Accepted:
             return
@@ -430,7 +496,12 @@ QToolButton:pressed { background-color: #1a2a3a; }
     def show_raw_frames(self) -> None:
         rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
         if not rfs or len(rfs) == 0:
-            QMessageBox.information(self, 'No raw frames', 'Load and decode a BLF/ASC file first.')
+            reason = getattr(
+                self.store,
+                'raw_trace_unavailable_reason',
+                'This measurement does not contain raw CAN frame records.',
+            ) if self.store else 'Load a measurement file first.'
+            QMessageBox.information(self, 'CAN Trace unavailable', reason)
             return
         self._raw_frame_dialog = RawFrameDialog(rfs, self)
         self._raw_frame_dialog.show()
@@ -1037,11 +1108,17 @@ QToolButton:pressed { background-color: #1a2a3a; }
             elif name in self._ACTS_NEEDS_FILE:
                 act.setEnabled(has_file)
             # else: Open File, Load Config — always enabled
-        # CAN Trace button requires raw frames (BLF/ASC with store)
+        # Keep CAN Trace discoverable after every load. For decoded-only MDF or
+        # CSV data the action explains why an authentic raw trace is unavailable.
         _rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None
         has_trace = has_store and _rfs is not None and len(_rfs) > 0
         if hasattr(self, '_act_can_trace'):
-            self._act_can_trace.setEnabled(has_trace)
+            self._act_can_trace.setEnabled(has_store)
+            self._act_can_trace.setToolTip(
+                'Open raw CAN Trace'
+                if has_trace
+                else 'Show CAN Trace availability information'
+            )
 
     def _next_step_message(self) -> str:
         mpath = self.measurement_path or self.blf_path

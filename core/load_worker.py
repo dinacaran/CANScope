@@ -82,7 +82,9 @@ class LoadWorker(QObject):
     progress      = Signal(str)
     finished      = Signal(object)
     failed        = Signal(str)
-    tree_update   = Signal(dict)
+    # Nested payload uses integer/None channel keys, which Qt's QVariantMap
+    # conversion cannot represent reliably. Keep it as an opaque Python object.
+    tree_update   = Signal(object)
     partial_ready = Signal()
 
     def __init__(
@@ -129,9 +131,9 @@ class LoadWorker(QObject):
             if hasattr(reader, "iter_decoded_channel_arrays"):
                 self._run_mdf_bus_arrays(reader, store)
             elif reader.has_raw_frames and hasattr(reader, "iter_frames_only"):
-                # Two-pass vectorised decode: ~50× faster on cantools-heavy
-                # files because the per-frame Python decode call is replaced
-                # by numpy bit ops applied to entire arb-id groups at once.
+                # Packed raw-frame read followed by one bulk vectorised decode.
+                # The GUI receives the completed signal hierarchy in one
+                # handoff instead of rebuilding it group by group.
                 self._run_can_raw_vectorized(reader, store)
             elif reader.has_raw_frames and hasattr(reader, "iter_with_frames"):
                 self._run_can_raw(reader, store)
@@ -161,20 +163,22 @@ class LoadWorker(QObject):
                 f"{exc}\n\n{traceback.format_exc()}\n\nFailed after {elapsed:.1f} s"
             )
 
-    # ── CAN-raw path: 2-pass vectorised (preferred) ──────────────────────
+    # ── CAN-raw path: packed read + bulk vectorised decode (preferred) ───
 
     def _run_can_raw_vectorized(self, reader, store: SignalStore) -> None:
         """
-        Two-pass loader for BLF/ASC streams.
+        Bulk loader for BLF/ASC streams.
 
-        Pass 1 — drain every raw frame into the on-disk RawFrameStore with no
-        decoding. python-can's BLF/ASC reader is the only Python work.
+        Drain every raw frame once into the packed on-disk RawFrameStore.  The
+        complete arrays are then grouped by ``(channel, arbitration_id)`` and
+        decoded with NumPy.  The raw store remains available for CAN Trace.
 
-        Pass 2 — group frames by ``(channel, arbitration_id)`` and apply the
-        vectorised DBC decoder once per group. Each group bulk-inserts via
+        Each group bulk-inserts via
         :meth:`SignalStore.add_series_bulk` (one C-level memcopy per signal).
         Compared to the old per-frame cantools decode, this skips ~50× of the
-        Python work for the common little-endian integer-signal case.
+        Python work for the common little-endian integer-signal case.  Signal
+        tree publication is deliberately deferred until every group is ready,
+        avoiding queued sequential tree rebuilds in the GUI.
         """
         import numpy as np
         from core.vectorized_decoder import VectorizedDBC
@@ -204,8 +208,8 @@ class LoadWorker(QObject):
         rfs = RawFrameStore()
         store.raw_frame_store = rfs
 
-        # ── Pass 1: drain frames into raw_frame_store ────────────────────
-        self.progress.emit("Reading frames (pass 1/2)...")
+        # ── Read once: drain packed frames into raw_frame_store ──────────
+        self.progress.emit("Reading and packing raw frames...")
         read_started = time.perf_counter()
         base_ts: float | None = None
         index   = 0
@@ -313,7 +317,7 @@ class LoadWorker(QObject):
         rfs.seal()
         read_elapsed = time.perf_counter() - read_started
         self.progress.emit(
-            f"Frame read/store complete: {index:,} frames in {read_elapsed:.1f} s"
+            f"Packed frame read/store complete: {index:,} frames in {read_elapsed:.1f} s"
         )
 
         if _batched or _fast:
@@ -335,10 +339,7 @@ class LoadWorker(QObject):
             self._decode_fallback_in_place(rfs, store, _decoder_map)
             return
 
-        # ── Pass 2: vectorised decode ───────────────────────────────────
-        self.progress.emit(
-            f"Read {n:,} frames. Decoding signals (pass 2/2)..."
-        )
+        # ── One global vectorised decode, followed by one GUI handoff ────
         decode_started = time.perf_counter()
 
         timestamps_np = np.frombuffer(rfs.timestamps, dtype=np.float64)
@@ -371,6 +372,9 @@ class LoadWorker(QObject):
         decoded_groups   = 0
         no_signals_total = 0
         total_groups     = len(boundaries) - 1
+        self.progress.emit(
+            f"Bulk decoding {n:,} frames across {total_groups:,} CAN ID groups..."
+        )
 
         for g in range(total_groups):
             start, end = int(boundaries[g]), int(boundaries[g + 1])
@@ -512,31 +516,23 @@ class LoadWorker(QObject):
 
             decoded_total  += len(group_idx)
             decoded_groups += 1
-            if decoded_groups % 50 == 0 or decoded_groups == total_groups:
-                n_sigs = len(store._series_by_key)
-                hint = (
-                    " (measurement contains only diagnostic / signal-less frames)"
-                    if n_sigs == 0 and no_signals_total > 0 else ""
-                )
-                self.progress.emit(
-                    f"Decoded {decoded_groups}/{total_groups} message groups | "
-                    f"signals: {n_sigs:,} | "
-                    f"frames: {decoded_total:,}{hint}"
-                )
-                # Refresh tree + plot every batch of groups so the GUI is
-                # responsive while pass 2 is running.
-                if store.is_tree_dirty():
-                    self.tree_update.emit(store.build_tree_payload())
-                self.partial_ready.emit()
 
         # Override per-frame counters (add_series_bulk is series-oriented and
-        # over-counts decoded_frames; note_frame increments unmatched_frames
-        # for every frame in pass 1 because it doesn't know yet).
+        # over-counts decoded_frames; bulk stats initially count every frame as
+        # unmatched because decoding has not happened yet).
         store.decoded_frames   = decoded_total
         store.unmatched_frames = n - decoded_total
         decode_elapsed = time.perf_counter() - decode_started
+        n_sigs = len(store._series_by_key)
+        hint = (
+            " (measurement contains only diagnostic / signal-less frames)"
+            if n_sigs == 0 and no_signals_total > 0 else ""
+        )
         self.progress.emit(
-            f"Vectorized decode/import complete in {decode_elapsed:.1f} s"
+            f"Bulk vectorized decode/import complete: "
+            f"{decoded_groups:,}/{total_groups:,} groups | "
+            f"signals: {n_sigs:,} | frames: {decoded_total:,}{hint} | "
+            f"elapsed: {decode_elapsed:.1f} s"
         )
 
         # Trace tab: needs decoder + config for on-demand signal expansion.
@@ -544,6 +540,8 @@ class LoadWorker(QObject):
             rfs.decoder        = cfg.decoder_for(None)
             rfs.channel_config = cfg
 
+        # Publish the completed hierarchy once.  Intermediate group updates
+        # queued multiple expensive Qt tree rebuilds after large BLF/ASC loads.
         if store.is_tree_dirty():
             self.tree_update.emit(store.build_tree_payload())
         self.partial_ready.emit()
@@ -736,10 +734,42 @@ class LoadWorker(QObject):
     # ── Native asammdf bus decode path ───────────────────────────────────
 
     def _run_mdf_bus_arrays(self, reader, store: SignalStore) -> None:
-        """One-pass asammdf bus decode followed by bulk signal-array import."""
+        """Native asammdf signal decode plus bulk raw-array CAN Trace import."""
+        import numpy as np
+
         stage_start = time.perf_counter()
         self.progress.emit("Decoding MF4 bus log with asammdf (one pass)...")
         cfg = self._channel_config
+        metadata_keys: set[tuple[int | None, str, str]] | None = None
+        trace_message_names: dict[tuple[int | None, int], str] = {}
+
+        trace_store = (
+            RawFrameStore()
+            if getattr(reader, "supports_raw_frame_arrays", False)
+            else None
+        )
+        trace_frames = 0
+
+        def on_raw_frame_batch(
+            timestamps,
+            channels,
+            arb_ids,
+            dlcs,
+            directions,
+            flags,
+            data_rows,
+        ):
+            nonlocal trace_frames
+            trace_store.append_numpy_batch(
+                timestamps,
+                channels,
+                arb_ids,
+                dlcs,
+                directions,
+                flags,
+                data_rows,
+            )
+            trace_frames += len(timestamps)
 
         last_progress = [-1]
 
@@ -750,19 +780,52 @@ class LoadWorker(QObject):
                     last_progress[0] = pct
                     self.progress.emit(f"asammdf bus decode: {pct}%")
 
+        def on_metadata_ready(metadata_rows):
+            nonlocal metadata_keys
+            payload = {}
+            metadata_keys = set()
+            for (
+                channel,
+                message_name,
+                _message_id,
+                signal_name,
+                _unit,
+            ) in metadata_rows:
+                messages = payload.setdefault(channel, {})
+                signals = messages.setdefault(message_name, [])
+                if signal_name not in signals:
+                    signals.append(signal_name)
+                metadata_keys.add((channel, message_name, signal_name))
+                trace_message_names.setdefault(
+                    (channel, int(_message_id)), message_name
+                )
+            self.tree_update.emit(payload)
+            self.progress.emit(
+                f"MF4 signal list ready: {len(metadata_rows):,} signals in "
+                f"{time.perf_counter() - stage_start:.1f} s"
+            )
+
         # Retain each array until extraction closes, and find the global first
         # timestamp before bulk insertion so every signal shares the same t=0.
         arrays = []
         base_ts: float | None = None
         try:
-            for meta, ts_arr, num_arr, disp_list in reader.iter_decoded_channel_arrays(
-                    cfg, progress=on_extract_progress):
+            iterator_kwargs = {
+                "progress": on_extract_progress,
+                "metadata_ready": on_metadata_ready,
+            }
+            if trace_store is not None:
+                iterator_kwargs["raw_frame_batch"] = on_raw_frame_batch
+            for meta, ts_arr, num_arr, disp_list in \
+                    reader.iter_decoded_channel_arrays(cfg, **iterator_kwargs):
                 if len(ts_arr) == 0:
                     continue
                 arrays.append((meta, ts_arr, num_arr, disp_list))
                 first = float(ts_arr[0])
                 base_ts = first if base_ts is None else min(base_ts, first)
         except Exception as exc:
+            if trace_store is not None:
+                trace_store.close()
             self.progress.emit(
                 "WARNING: asammdf native extraction was unavailable; "
                 f"using CANScope's two-pass fallback ({exc})"
@@ -772,9 +835,100 @@ class LoadWorker(QObject):
 
         extraction_elapsed = time.perf_counter() - stage_start
         self.progress.emit(
-            f"asammdf extraction complete: {len(arrays):,} signals in "
+            f"asammdf extraction and global array read complete: "
+            f"{len(arrays):,} signals in "
             f"{extraction_elapsed:.1f} s"
         )
+
+        trace_decoded_frames = 0
+        trace_warning = getattr(reader, "raw_trace_error", "")
+        if trace_store is not None and trace_warning:
+            trace_store.close()
+            trace_store = None
+            trace_frames = 0
+            self.progress.emit(
+                f"WARNING: CAN Trace could not be loaded ({trace_warning})"
+            )
+        if trace_store is not None and trace_frames:
+            timestamps_np = np.frombuffer(trace_store.timestamps, dtype=np.float64)
+            trace_base_ts = float(np.min(timestamps_np))
+            base_ts = (
+                trace_base_ts
+                if base_ts is None
+                else min(base_ts, trace_base_ts)
+            )
+            timestamps_np -= base_ts
+
+            # Mark raw rows decoded and attach their message names in one
+            # vectorised lookup. This keeps row expansion/search identical to
+            # BLF/ASC CAN Trace without walking individual frames in Python.
+            if trace_message_names:
+                channels_np = np.frombuffer(trace_store.channels, dtype=np.uint8)
+                arb_ids_np = np.frombuffer(trace_store.arb_ids, dtype=np.uint32)
+                flags_np = np.frombuffer(trace_store.flags, dtype=np.uint8)
+                name_ids_np = np.frombuffer(trace_store.name_ids, dtype=np.uint16)
+
+                encoded_to_name: dict[int, str] = {}
+                for (channel, message_id), message_name in trace_message_names.items():
+                    channel_byte = 255 if channel is None else int(channel) & 0xFF
+                    is_extended = 1 if int(message_id) > 0x7FF else 0
+                    encoded = (
+                        (channel_byte << 33)
+                        | (is_extended << 32)
+                        | (int(message_id) & 0xFFFF_FFFF)
+                    )
+                    encoded_to_name.setdefault(encoded, message_name)
+
+                if encoded_to_name:
+                    encoded_keys = np.asarray(
+                        sorted(encoded_to_name), dtype=np.uint64
+                    )
+                    key_name_ids = np.empty(len(encoded_keys), dtype=np.uint16)
+                    for idx, encoded in enumerate(encoded_keys):
+                        message_name = encoded_to_name[int(encoded)]
+                        name_id = trace_store._name_to_id.get(message_name)
+                        if name_id is None:
+                            if len(trace_store.name_table) <= 65535:
+                                name_id = len(trace_store.name_table)
+                                trace_store.name_table.append(message_name)
+                                trace_store._name_to_id[message_name] = name_id
+                            else:
+                                name_id = 0
+                        key_name_ids[idx] = name_id
+
+                    frame_keys = (
+                        channels_np.astype(np.uint64) << np.uint64(33)
+                    ) | (
+                        (flags_np.astype(np.uint64) & np.uint64(1))
+                        << np.uint64(32)
+                    ) | arb_ids_np.astype(np.uint64)
+                    positions = np.searchsorted(encoded_keys, frame_keys)
+                    safe_positions = np.minimum(positions, len(encoded_keys) - 1)
+                    decoded_mask = (
+                        (positions < len(encoded_keys))
+                        & (encoded_keys[safe_positions] == frame_keys)
+                    )
+                    flags_np[decoded_mask] |= np.uint8(4)
+                    name_ids_np[decoded_mask] = key_name_ids[
+                        safe_positions[decoded_mask]
+                    ]
+                    trace_decoded_frames = int(np.count_nonzero(decoded_mask))
+
+            trace_store.seal()
+            store.raw_frame_store = trace_store
+            _bulk_compute_store_stats(store, trace_store)
+            store.decoded_frames = trace_decoded_frames
+            store.unmatched_frames = trace_frames - trace_decoded_frames
+            if cfg:
+                trace_store.decoder = cfg.decoder_for(None)
+                trace_store.channel_config = cfg
+            self.progress.emit(
+                f"CAN Trace ready: {trace_frames:,} raw frames "
+                "(bulk MDF array extraction)."
+            )
+        elif trace_store is not None:
+            trace_store.close()
+            trace_store = None
 
         if base_ts is None:
             base_ts = 0.0
@@ -782,7 +936,10 @@ class LoadWorker(QObject):
 
         total = len(arrays)
         import_start = time.perf_counter()
-        for index, (meta, ts_arr, num_arr, disp_list) in enumerate(arrays, 1):
+        self.progress.emit(
+            f"Bulk importing {total:,} decoded signal arrays into memory..."
+        )
+        for meta, ts_arr, num_arr, disp_list in arrays:
             channel, message_name, message_id, signal_name, unit = meta
             store.add_series_bulk(
                 channel=channel,
@@ -795,17 +952,34 @@ class LoadWorker(QObject):
                 raw_values=disp_list,
                 has_labels=bool(disp_list),
             )
-            if index == 1 or index % 250 == 0 or index == total:
-                self.progress.emit(
-                    f"Imported {index:,}/{total:,} decoded signals | "
-                    f"samples: {store.total_samples:,}"
-                )
+
+        # add_series_bulk counts one logical insert per signal. When raw MDF
+        # frames are present, report actual decoded/unmatched CAN frame counts.
+        if trace_frames:
+            store.decoded_frames = trace_decoded_frames
+            store.unmatched_frames = trace_frames - trace_decoded_frames
 
         import_elapsed = time.perf_counter() - import_start
-        self.progress.emit(f"Signal-array import complete in {import_elapsed:.1f} s")
+        self.progress.emit(
+            f"Bulk import complete: {total:,} signals | samples: "
+            f"{store.total_samples:,} | elapsed: {import_elapsed:.1f} s"
+        )
 
+        # Verify the metadata-first hierarchy against the imported arrays.
         if store.is_tree_dirty():
-            self.tree_update.emit(store.build_tree_payload())
+            final_payload = store.build_tree_payload()
+            final_keys = {
+                (channel, message_name, signal_name)
+                for channel, messages in final_payload.items()
+                for message_name, signal_names in messages.items()
+                for signal_name in signal_names
+            }
+            # The metadata-first tree is normally identical to the completed
+            # store. Avoid queuing a second full Qt tree rebuild in that case.
+            # If asammdf advertised an empty/unreadable channel, publish the
+            # verified final tree so correctness is unchanged.
+            if metadata_keys is None or final_keys != metadata_keys:
+                self.tree_update.emit(final_payload)
         self.partial_ready.emit()
         store.normalize_timestamps(already_normalized=True)
         store.diagnostics_text = (
@@ -813,19 +987,45 @@ class LoadWorker(QObject):
             + f"\n\nSource: {reader.source_description}"
             + f"\n\nDecoded signals: {total:,}"
             + "\n\nMF4 decoded directly by asammdf in one pass."
-            + "\nRaw CAN Trace is not materialized during fast signal loading."
+            + (
+                f"\nCAN Trace: {trace_frames:,} raw frames loaded in bulk."
+                if trace_frames
+                else "\nCAN Trace was not available from the MDF raw groups."
+            )
         )
 
     # ── Bulk array path (pre-decoded MF4 / MDF / CSV) ────────────────────
 
     def _run_bulk_array(self, reader, store: SignalStore) -> None:
         import numpy as np
+        stage_start = time.perf_counter()
         self.progress.emit("Reading channels (vectorised fast path)...")
         base_ts: float | None = None
         ch_count = 0
+        metadata_first = bool(getattr(reader, "metadata_first_arrays", False))
+
+        def on_metadata_ready(metadata_rows):
+            messages = {}
+            for group_name, channel_name, _unit in metadata_rows:
+                signals = messages.setdefault(group_name, [])
+                if channel_name not in signals:
+                    signals.append(channel_name)
+            self.tree_update.emit({None: messages})
+            self.progress.emit(
+                f"MDF signal list ready: {len(metadata_rows):,} channels in "
+                f"{time.perf_counter() - stage_start:.1f} s"
+            )
+
+        if metadata_first:
+            array_iter = reader.iter_channel_arrays(
+                metadata_ready=on_metadata_ready,
+                batch_all_groups=True,
+            )
+        else:
+            array_iter = reader.iter_channel_arrays()
 
         for (grp_name, ch_name, unit), ts_arr, num_arr, disp_list in \
-                reader.iter_channel_arrays():
+                array_iter:
             ch_count += 1
             n = len(ts_arr)
             if n == 0:
@@ -843,18 +1043,31 @@ class LoadWorker(QObject):
             )
             # Gate tree rebuild on an interval + dirty flag — avoids a full
             # sort of all signals for every channel (Bottleneck 3).
-            if ch_count % _BULK_PLOT_INTERVAL == 0:
+            if not metadata_first and ch_count % _BULK_PLOT_INTERVAL == 0:
                 if store.is_tree_dirty():
                     self.tree_update.emit(store.build_tree_payload())
                 self.partial_ready.emit()
-            if ch_count == 1 or ch_count % _BULK_PROGRESS_INTERVAL == 0:
+            if (
+                not metadata_first
+                and (ch_count == 1 or ch_count % _BULK_PROGRESS_INTERVAL == 0)
+            ):
                 self.progress.emit(
                     f"Loaded {ch_count:,} channels | samples: {store.total_samples:,}"
                 )
 
         self.tree_update.emit(store.build_tree_payload())
         self.partial_ready.emit()
+        if metadata_first:
+            self.progress.emit(
+                f"Imported {ch_count:,} channels | samples: "
+                f"{store.total_samples:,}"
+            )
         store.normalize_timestamps(already_normalized=True)
+        store.raw_trace_unavailable_reason = getattr(
+            reader,
+            "raw_trace_unavailable_reason",
+            "This pre-decoded measurement does not contain raw CAN frame records.",
+        )
         store.diagnostics_text = (
             store.channel_summary_text()
             + f"\n\nSource: {reader.source_description}"
