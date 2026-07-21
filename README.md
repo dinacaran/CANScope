@@ -40,7 +40,8 @@ a CAN database is required.
 ## Screenshots
 
 Stacked plot:
-<img width="2299" height="1588" alt="Stacked plot" src="https://github.com/user-attachments/assets/00c1207f-30e0-414b-b43e-0bfbcb55aa62" />
+<img width="2299" height="1588" alt="Stacked plot" src="https://github.com/user-attachments/assets/57baedc2-0382-4f63-a7e9-cc786e18ded8" />
+
 
 Multiple Axis plot:
 <img width="2214" height="1590" alt="multi-axis plot" src="https://github.com/user-attachments/assets/7d3ef351-1b02-45e0-85f5-4dfd1217ad6e" />
