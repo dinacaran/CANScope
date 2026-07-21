@@ -24,14 +24,28 @@ def prescan_measurement(
     Lightweight pre-scan: read up to *_PRESCAN_LIMIT* raw CAN frames from
     *path* and return ``(channels, ids_per_channel)`` without decoding signals.
 
-    Works for BLF, ASC, and MDF bus-logging files.  CSV and pre-decoded MDF
-    return empty results (channels come from decoded signals, not raw frames).
+    Works for BLF, ASC, MDF bus logging, and raw CAN CSV exports. Pre-decoded
+    CSV/MDF files return empty results (channels come from decoded signals).
 
     Typically finishes in < 1 second even for 100 MB+ files.
     """
     suffix = Path(path).suffix.lower()
     channels: set[int] = set()
     ids_per_channel: dict[int, set[int]] = {}
+
+    if suffix == '.csv':
+        from core.readers.csv_reader import (
+            is_can_bus_logging_csv,
+            prescan_can_bus_logging_csv,
+        )
+        if not is_can_bus_logging_csv(path):
+            return [], {}
+        if progress:
+            progress("Scanning measurement for channels…")
+        try:
+            return prescan_can_bus_logging_csv(path, _PRESCAN_LIMIT)
+        except Exception:
+            return [], {}
 
     if suffix not in CAN_RAW_SUFFIXES and suffix not in ('.mf4', '.mdf'):
         return [], {}
@@ -98,7 +112,7 @@ def dbc_required_for(path: str) -> bool:
     For .mf4 / .mdf: True only when the file contains raw CAN bus frames
         (ASAM MDF bus logging format, detected by CAN_DataFrame.* channels).
         Pre-decoded MDF files return False.
-    For .csv: always False.
+    For .csv: True for raw CAN-frame exports; False for decoded signal CSV.
     """
     suffix = Path(path).suffix.lower()
     if suffix in CAN_RAW_SUFFIXES:
@@ -106,6 +120,9 @@ def dbc_required_for(path: str) -> bool:
     if suffix in ('.mf4', '.mdf'):
         from core.readers.mdf_reader import MDFReader
         return MDFReader.is_bus_logging(path)
+    if suffix == '.csv':
+        from core.readers.csv_reader import is_can_bus_logging_csv
+        return is_can_bus_logging_csv(path)
     return False
 
 
@@ -160,7 +177,22 @@ def reader_factory(
             return MDFReader(measurement_path)
 
     if suffix == '.csv':
-        from core.readers.csv_reader import CSVSignalReader
+        from core.readers.csv_reader import (
+            CSVRawCANReader,
+            CSVSignalReader,
+            is_can_bus_logging_csv,
+        )
+        if is_can_bus_logging_csv(measurement_path):
+            if not dbc_path:
+                raise ValueError(
+                    "This CSV file contains raw CAN bus frames.\n"
+                    "A DBC or ARXML file is required for signal decoding.\n"
+                    "Please configure channel → database mapping via 'Open Database'."
+                )
+            from core.dbc_decoder import DBCDecoder
+            return CSVRawCANReader(
+                measurement_path, DBCDecoder(dbc_path)
+            )
         return CSVSignalReader(measurement_path)
 
     raise UnsupportedFormatError(

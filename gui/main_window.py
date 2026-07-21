@@ -33,6 +33,13 @@ from PySide6.QtWidgets import (
 )
 
 from core.export import ExportService
+from core.calculated_signals import (
+    LARGE_OUTPUT_WARNING_POINTS,
+    CalculatedSignalDefinition,
+    CalculatedSignalError,
+    CalculatedSignalManager,
+    parse_formula,
+)
 from core.load_worker import LoadWorker
 from core.readers import dbc_required_for, prescan_measurement, ALL_SUFFIXES
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
@@ -40,6 +47,7 @@ from gui.dbc_manager import DBCManagerDialog
 from core.signal_store import SignalStore
 from gui.plot_widget import PlotPanel
 from gui.signal_tree import SignalTreeWidget
+from gui.calculated_signal_dialog import CalculatedSignalDialog, CalculationWorker
 from gui.raw_frame_dialog import RawFrameDialog
 
 
@@ -59,6 +67,14 @@ class MainWindow(QMainWindow):
         self.dbc_path: str | None = None
         self.blf_path: str | None = None  # deprecated alias
         self.store: SignalStore | None = None
+        self.calculated_signals = CalculatedSignalManager()
+        self._calc_thread: QThread | None = None
+        self._calc_worker: CalculationWorker | None = None
+        self._calc_active_request: tuple[CalculatedSignalDefinition, str, bool] | None = None
+        self._calc_queue: list[
+            tuple[CalculatedSignalDefinition, str, bool, dict]
+        ] = []
+        self._calc_source_store: SignalStore | None = None
         # Pre-scan cache: (path, channels, ids_per_channel)
         self._prescan_cache: tuple[str, list[int], dict[int, set[int]]] | None = None
         # Full RawFrameStore channel/ID summaries are built only on an explicit
@@ -115,6 +131,8 @@ class MainWindow(QMainWindow):
         self.measurement_box.setReadOnly(True)
 
         self.signal_tree.signalActivated.connect(self.add_signals_to_plot)
+        self.signal_tree.generatedEditRequested.connect(self.edit_generated_signal)
+        self.signal_tree.generatedDeleteRequested.connect(self.delete_generated_signal)
         self.plot_panel.selectionChanged.connect(self._on_plot_selection_changed)
         self.plot_panel.signalDropped.connect(self.add_signals_to_plot)
         self.plot_panel.backgroundColorChanged.connect(self._on_background_color_changed)
@@ -257,6 +275,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ('Load + Decode',self.load_data),
             ('Save Config',  self.save_configuration),
             ('Load Config',  self.load_configuration),
+            ('New Signal',   self.new_generated_signal),
             ('Export',       self.export_selected),
             ('Clear Plots',  self.clear_plot),
         ]:
@@ -513,6 +532,220 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.btn_points.setText('Hide Data Points' if checked else 'Show Data Points')
         self._update_status('Plot markers updated', 'Continue plotting, fit view, or save configuration')
 
+    def _refresh_generated_signal_tree(self) -> None:
+        rows = []
+        for definition in self.calculated_signals.definitions():
+            unit_text = f" [{definition.unit}]" if definition.unit else ""
+            rows.append((
+                definition.key,
+                definition.name,
+                f"{definition.name}{unit_text} = {definition.formula}\n"
+                "Double-click to plot; right-click to edit or delete.",
+            ))
+        self.signal_tree.set_generated_signals(rows)
+
+    def _apply_pending_generated_plot_state(self, key: str) -> None:
+        plotted = self.plot_panel._items.get(key)
+        if plotted is None:
+            return
+        changed = False
+        if key in self._pending_plot_colors:
+            plotted.color = self._pending_plot_colors.pop(key)
+            changed = True
+        if key in self._pending_plot_visible:
+            plotted.visible = self._pending_plot_visible.pop(key)
+            changed = True
+        if key in self._pending_plot_groups:
+            plotted.group = self._pending_plot_groups.pop(key)
+            changed = True
+        if key in self._pending_plot_axis_visible:
+            plotted.axis_visible = self._pending_plot_axis_visible.pop(key)
+            changed = True
+        if key in self._pending_plot_own_axis:
+            plotted.own_axis = self._pending_plot_own_axis.pop(key)
+            changed = True
+        if changed:
+            self.plot_panel._rebuild_curves(preserve_selection=False)
+
+    def new_generated_signal(self) -> None:
+        if self.store is None or self._calc_thread is not None:
+            return
+        dialog = CalculatedSignalDialog(
+            self.store.all_keys(),
+            name_validator=self.calculated_signals.assert_unique_name,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._queue_calculation(dialog.definition(), "create", plot_after=False)
+
+    def edit_generated_signal(self, key: str) -> None:
+        if self.store is None or self._calculation_is_pending(key):
+            return
+        existing = self.calculated_signals.definition(key)
+        if existing is None:
+            return
+        dialog = CalculatedSignalDialog(
+            self.store.all_keys(),
+            existing=existing,
+            name_validator=lambda name: self.calculated_signals.assert_unique_name(
+                name, except_key=key
+            ),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._queue_calculation(dialog.definition(), "edit", plot_after=False)
+
+    def delete_generated_signal(self, key: str) -> None:
+        definition = self.calculated_signals.definition(key)
+        if definition is None:
+            return
+        if self._calculation_is_pending(key):
+            QMessageBox.information(
+                self,
+                "Calculation in progress",
+                "Wait for this generated-signal calculation to finish before deleting it.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete generated signal",
+            f"Delete generated signal '{definition.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.plot_panel.forget_series(key)
+        self.calculated_signals.delete(key)
+        self._refresh_generated_signal_tree()
+        self._log(f"Deleted generated signal: {definition.name}")
+
+    def _calculation_is_pending(self, key: str) -> bool:
+        if self._calc_active_request and self._calc_active_request[0].key == key:
+            return True
+        return any(
+            definition.key == key
+            for definition, _operation, _plot, _sources in self._calc_queue
+        )
+
+    def _queue_calculation(
+        self,
+        definition: CalculatedSignalDefinition,
+        operation: str,
+        plot_after: bool,
+    ) -> None:
+        if self.store is None:
+            return
+        if self._calculation_is_pending(definition.key):
+            return
+        try:
+            if operation == "create":
+                self.calculated_signals.assert_unique_name(definition.name)
+            parsed = parse_formula(definition.formula, self.store.all_keys())
+            source_series = {}
+            for key in parsed.references:
+                series = self.store.get_series(key)
+                if series is None:
+                    raise CalculatedSignalError(f"Measurement signal not found: {key}")
+                source_series[key] = series
+            estimated_points = sum(len(series.timestamps) for series in source_series.values())
+        except CalculatedSignalError as exc:
+            QMessageBox.warning(self, "Invalid generated signal", str(exc))
+            return
+
+        if estimated_points > LARGE_OUTPUT_WARNING_POINTS:
+            answer = QMessageBox.warning(
+                self,
+                "Large generated signal",
+                f"This calculation may produce up to {estimated_points:,} samples and "
+                "may require substantial RAM.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        request = (definition, operation, plot_after)
+        if self._calc_thread is not None:
+            self._calc_queue.append((definition, operation, plot_after, source_series))
+            return
+        self._start_calculation(request, source_series)
+
+    def _start_calculation(
+        self,
+        request: tuple[CalculatedSignalDefinition, str, bool],
+        source_series: dict,
+    ) -> None:
+        definition, _operation, _plot_after = request
+        self._calc_active_request = request
+        self._calc_source_store = self.store
+        self._calc_thread = QThread(self)
+        self._calc_worker = CalculationWorker(definition, source_series)
+        self._calc_worker.moveToThread(self._calc_thread)
+        self._calc_thread.started.connect(self._calc_worker.run)
+        self._calc_worker.finished.connect(self._on_calculation_finished)
+        self._calc_worker.failed.connect(self._on_calculation_failed)
+        self._calc_worker.finished.connect(self._calc_worker.deleteLater)
+        self._calc_worker.failed.connect(self._calc_worker.deleteLater)
+        self._calc_worker.finished.connect(self._calc_thread.quit)
+        self._calc_worker.failed.connect(self._calc_thread.quit)
+        self._calc_thread.finished.connect(self._cleanup_calculation)
+        self._update_action_states()
+        self._update_status(
+            f"Calculating {definition.name}...",
+            "The calculation runs in the background; existing plots remain usable.",
+        )
+        self._calc_thread.start()
+
+    def _on_calculation_finished(self, series) -> None:
+        request = self._calc_active_request
+        if request is None:
+            return
+        definition, operation, plot_after = request
+        if self.store is not self._calc_source_store:
+            self._log(f"Discarded stale generated signal result: {definition.name}")
+            return
+        self.calculated_signals.commit(definition, series)
+        self._refresh_generated_signal_tree()
+        if key_is_plotted := definition.key in self.plot_panel._items:
+            self.plot_panel.replace_series(definition.key, series)
+        if plot_after and not key_is_plotted:
+            self.add_signal_to_plot(definition.key)
+        self._apply_pending_generated_plot_state(definition.key)
+        action = "Updated" if operation == "edit" else "Created"
+        if operation == "lazy":
+            action = "Calculated"
+        self._log(f"{action} generated signal: {definition.name}")
+        self._update_status(
+            f"{action} generated signal {definition.name}",
+            "Plot it from Generate Signals or save the configuration.",
+        )
+
+    def _on_calculation_failed(self, error_message: str) -> None:
+        definition = self._calc_active_request[0] if self._calc_active_request else None
+        name = definition.name if definition else "signal"
+        self._log(f"Generated signal calculation failed ({name}): {error_message}")
+        QMessageBox.warning(self, "Generated signal calculation failed", error_message)
+        self._update_status("Generated signal failed", "Correct the formula and try again.")
+
+    def _cleanup_calculation(self) -> None:
+        if self._calc_thread is not None:
+            self._calc_thread.deleteLater()
+        self._calc_worker = None
+        self._calc_thread = None
+        self._calc_active_request = None
+        self._calc_source_store = None
+        self._update_action_states()
+        if not self._calc_queue:
+            return
+        definition, operation, plot_after, source_series = self._calc_queue.pop(0)
+        self._start_calculation(
+            (definition, operation, plot_after),
+            source_series,
+        )
+
     def save_configuration(self) -> None:
         config = {
             'version': self.version,
@@ -533,6 +766,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 }
                 for k in self.plot_panel.plotted_keys()
             ],
+            'generated_signals': self.calculated_signals.to_config(),
             'show_data_points': self.btn_points.isChecked(),
             'plot_background_color': self.plot_panel.background_color(),
             'signal_colors': self.plot_panel.series_colors(),
@@ -556,6 +790,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._update_status('Save failed', 'Check path permissions and try again')
 
     def load_configuration(self) -> None:
+        if self._calc_thread is not None:
+            QMessageBox.information(
+                self,
+                'Calculation in progress',
+                'Wait for the generated-signal calculation to finish before loading a configuration.',
+            )
+            return
         path, _ = QFileDialog.getOpenFileName(self, 'Load configuration', '', 'JSON Files (*.json)')
         if not path:
             return
@@ -601,6 +842,30 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if 'own_axis' in s:
                         pending_own_axis[k] = bool(s['own_axis'])
         pending_colors = dict(data.get('signal_colors') or {})
+        generated_errors = self.calculated_signals.replace_definitions(
+            data.get('generated_signals') or []
+        )
+        for error in generated_errors:
+            self._log(f'Generated signal configuration skipped: {error}')
+        self._refresh_generated_signal_tree()
+        generated_pending = {
+            key for key in pending_keys if self.calculated_signals.contains_key(key)
+        }
+        self._pending_plot_colors = {
+            key: value for key, value in pending_colors.items() if key in generated_pending
+        }
+        self._pending_plot_visible = {
+            key: value for key, value in pending_visible.items() if key in generated_pending
+        }
+        self._pending_plot_groups = {
+            key: value for key, value in pending_groups.items() if key in generated_pending
+        }
+        self._pending_plot_axis_visible = {
+            key: value for key, value in pending_axis_visible.items() if key in generated_pending
+        }
+        self._pending_plot_own_axis = {
+            key: value for key, value in pending_own_axis.items() if key in generated_pending
+        }
 
         # Fix 6: if data is already decoded, ask the user what to do
         use_current_data = False
@@ -697,6 +962,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.load_data(pending_plot_keys=self._pending_plot_keys)
 
     def load_data(self, pending_plot_keys: list[str] | None = None) -> None:
+        if self._calc_thread is not None:
+            QMessageBox.information(
+                self,
+                'Calculation in progress',
+                'Wait for the generated-signal calculation to finish before loading another measurement.',
+            )
+            return
         mpath = self.measurement_path or self.blf_path
         if not mpath:
             QMessageBox.warning(self, 'Missing file', 'Please select a measurement file first.')
@@ -719,6 +991,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 return
         self._pending_plot_keys = list(pending_plot_keys or [])
         self.plot_panel.clear_all()
+        self.plot_panel.discard_undo_history()
+        self.calculated_signals.invalidate_cache()
+        self._calc_queue.clear()
         self._finding_plot_keys = set()
         self.signal_tree.set_payload({})
         self.diagnostics_box.clear()
@@ -770,13 +1045,25 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._update_status(f'Plotted {plotted} signal(s)', 'Use Fit to Window, reorder, or export selected CSV')
 
     def add_signal_to_plot(self, key: str, fit: bool = True) -> bool:
+        # Generated signals are calculated only from a completed measurement;
+        # ordinary measurement signals may still use the existing live store.
+        if self.calculated_signals.contains_key(key) and self.store is None:
+            return False
         # Allow plotting from partial store while decoding is in progress
         active_store = self.store
         if active_store is None and self._worker is not None:
             active_store = getattr(self._worker, '_live_store', None)
         if not active_store:
             return False
-        series = active_store.get_series(key)
+        if self.calculated_signals.contains_key(key):
+            series = self.calculated_signals.cached_series(key)
+            if series is None:
+                definition = self.calculated_signals.definition(key)
+                if definition is not None:
+                    self._queue_calculation(definition, "lazy", plot_after=True)
+                return False
+        else:
+            series = active_store.get_series(key)
         if not series:
             self._log(f'Signal not found: {key}')
             return False
@@ -980,6 +1267,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_action_states()
         # Expose store immediately so pending plots and post-decode plots work
         self.signal_tree.set_payload(store.build_tree_payload())
+        self._refresh_generated_signal_tree()
         self.diagnostics_box.setPlainText(store.diagnostics_text)
         self._update_measurement_tab(
             channels=store.channel_summary_text(),
@@ -1017,11 +1305,26 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
-            self._pending_plot_colors       = {}
-            self._pending_plot_visible      = {}
-            self._pending_plot_groups       = {}
-            self._pending_plot_axis_visible = {}
-            self._pending_plot_own_axis     = {}
+            waiting_generated = {
+                key for key in wanted
+                if self.calculated_signals.contains_key(key)
+                and key not in self.plot_panel._items
+            }
+            self._pending_plot_colors = {
+                key: value for key, value in colors.items() if key in waiting_generated
+            }
+            self._pending_plot_visible = {
+                key: value for key, value in visible.items() if key in waiting_generated
+            }
+            self._pending_plot_groups = {
+                key: value for key, value in groups.items() if key in waiting_generated
+            }
+            self._pending_plot_axis_visible = {
+                key: value for key, value in axis_visible.items() if key in waiting_generated
+            }
+            self._pending_plot_own_axis = {
+                key: value for key, value in own_axis.items() if key in waiting_generated
+            }
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:
@@ -1095,19 +1398,28 @@ QToolButton:pressed { background-color: #1a2a3a; }
     # Actions enabled/disabled per app state
     # needs_file  = requires measurement file to be selected
     # needs_store = requires decode to have completed
+    _ACTS_ALWAYS_ENABLED = {'Load Config'}
     _ACTS_NEEDS_FILE  = {'Load + Decode'}
-    _ACTS_NEEDS_STORE = {'Save Config', 'Export', 'Clear Plots'}
+    _ACTS_NEEDS_STORE = {'Save Config', 'New Signal', 'Export', 'Clear Plots'}
 
     def _update_action_states(self) -> None:
         """Grey out toolbar actions that are not yet usable."""
         has_file  = bool(self.measurement_path or self.blf_path)
         has_store = self.store is not None
         for name, act in self._toolbar_actions.items():
-            if name in self._ACTS_NEEDS_STORE:
+            if name in self._ACTS_ALWAYS_ENABLED:
+                act.setEnabled(True)
+            elif name in self._ACTS_NEEDS_STORE:
                 act.setEnabled(has_store)
             elif name in self._ACTS_NEEDS_FILE:
                 act.setEnabled(has_file)
-            # else: Open File, Load Config — always enabled
+        if self._calc_thread is not None and 'New Signal' in self._toolbar_actions:
+            for name in (
+                'New Signal', 'Load + Decode',
+                'Save Config', 'Export', 'Clear Plots',
+            ):
+                self._toolbar_actions[name].setEnabled(False)
+            # Open File and Load Config remain available while calculating.
         # Keep CAN Trace discoverable after every load. For decoded-only MDF or
         # CSV data the action explains why an authentic raw trace is unavailable.
         _rfs = getattr(self.store, 'raw_frame_store', None) if self.store else None

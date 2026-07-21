@@ -211,12 +211,18 @@ class RawFrameStore:
         ):
             raise ValueError("Raw frame batch columns have different lengths")
 
-        self.timestamps.fromlist(timestamps)
-        self.channels.fromlist(channels)
-        self.arb_ids.fromlist(arb_ids)
-        self.dlcs.fromlist(dlcs)
-        self.directions.fromlist(directions)
-        self.flags.fromlist(flags)
+        def extend_column(target, values) -> None:
+            if isinstance(values, (bytes, bytearray, memoryview)):
+                target.frombytes(values)
+            else:
+                target.fromlist(values)
+
+        extend_column(self.timestamps, timestamps)
+        extend_column(self.channels, channels)
+        extend_column(self.arb_ids, arb_ids)
+        extend_column(self.dlcs, dlcs)
+        extend_column(self.directions, directions)
+        extend_column(self.flags, flags)
         self.name_ids.frombytes(bytes(count * self.name_ids.itemsize))
         self._data_file.write(memoryview(data_block)[:count * _DATA_BYTES])
 

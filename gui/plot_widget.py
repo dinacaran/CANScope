@@ -593,11 +593,24 @@ class PlotPanel(QWidget):
                 self.glw.setUpdatesEnabled(True)
 
     def set_multi_axis(self, enabled: bool) -> None:
+        saved_x_range = self._visible_x_range()
         self._multi_axis = bool(enabled)
         self.table.setColumnHidden(5, not self._multi_axis)  # Ax swatch
         self.table.setColumnHidden(6, not self._multi_axis)  # Axis checkbox
-        self._rebuild_curves(preserve_selection=True)
-        self.fit_to_window()
+        self._rebuild_curves(
+            preserve_selection=True,
+            preserved_x_range=saved_x_range,
+            preserve_y_range=False,
+        )
+
+    def _visible_x_range(self) -> list[float] | None:
+        """Return the X range of the plot layout currently shown to the user."""
+        try:
+            if self.view_stack.currentIndex() == 1 and self._stacked_plots:
+                return list(self._stacked_plots[0].vb.viewRange()[0])
+            return list(self.plot.plotItem.vb.viewRange()[0])
+        except Exception:
+            return None
 
     def _unit_key(self, unit: str | None, signal_key: str, own_axis: bool = False) -> str:
         """Normalize a unit string to a group key.
@@ -705,9 +718,13 @@ class PlotPanel(QWidget):
 
     def set_stacked(self, enabled: bool) -> None:
         """Toggle INCA/CANdb-style stacked layout (one row per signal, shared X)."""
+        saved_x_range = self._visible_x_range()
         self._stacked_mode = bool(enabled)
-        self._rebuild_curves(preserve_selection=True)
-        self.fit_to_window()
+        self._rebuild_curves(
+            preserve_selection=True,
+            preserved_x_range=saved_x_range,
+            preserve_y_range=False,
+        )
 
     def add_series(self, key: str, series: SignalSeries, color: str | None = None) -> None:
         if key in self._items:
@@ -726,6 +743,34 @@ class PlotPanel(QWidget):
             # _rebuild_curves has already restored the saved view range.
             if was_empty:
                 self.fit_to_window()
+
+    def replace_series(self, key: str, series: SignalSeries) -> bool:
+        """Replace plotted data without changing its visual or viewport state."""
+        plotted = self._items.get(key)
+        if plotted is None:
+            return False
+        plotted.series = series
+        # Undo snapshots must not retain the previous calculated arrays.
+        for snapshot, _current_key in self._undo_stack:
+            if key in snapshot:
+                snapshot[key].series = series
+        self._rebuild_curves(preserve_selection=True, preserve_y_range=True)
+        self._set_axis_label(self._current_key)
+        self._refresh_table_and_cursors()
+        return True
+
+    def forget_series(self, key: str) -> None:
+        """Remove a series and purge it from undo history to release its data."""
+        self.remove_series(key)
+        cleaned = []
+        for snapshot, current_key in self._undo_stack:
+            snapshot.pop(key, None)
+            cleaned.append((snapshot, None if current_key == key else current_key))
+        self._undo_stack = cleaned
+
+    def discard_undo_history(self) -> None:
+        """Drop snapshots when the underlying measurement is being replaced."""
+        self._undo_stack.clear()
 
     def begin_batch_add(self) -> None:
         """Start a batch-add session. Suppresses per-signal rebuilds; call end_batch_add() when done."""
@@ -848,34 +893,42 @@ class PlotPanel(QWidget):
 
     # ── Internal: rebuild ─────────────────────────────────────────────────
 
-    def _rebuild_curves(self, preserve_selection: bool = False) -> None:
+    def _rebuild_curves(
+        self,
+        preserve_selection: bool = False,
+        preserved_x_range: list[float] | None = None,
+        preserve_y_range: bool = True,
+    ) -> None:
         selected = self.selected_keys() if preserve_selection else []
 
         # Save X and Y view ranges before destroying rendered items so that
         # add/remove operations don't snap the viewport back to full extent.
-        _saved_xr: list | None = None
+        _saved_xr: list | None = preserved_x_range
         _saved_yr: list | None = None           # standard overlay: one shared Y range
         _saved_yr_by_key: dict[str, list] = {}  # stacked: per-signal key
         _saved_yr_by_unit: dict[str, list] = {} # multi-axis: per-unit-group key
 
         if self._stacked_mode and self._stacked_plots:
-            try:
-                _saved_xr = list(self._stacked_plots[0].vb.viewRange()[0])
-            except Exception:
-                pass
-            order = [k for k, p in self._items.items() if p.visible]
-            for i, key in enumerate(order):
-                if i < len(self._stacked_plots):
-                    try:
-                        _saved_yr_by_key[key] = list(self._stacked_plots[i].vb.viewRange()[1])
-                    except Exception:
-                        pass
+            if _saved_xr is None:
+                try:
+                    _saved_xr = list(self._stacked_plots[0].vb.viewRange()[0])
+                except Exception:
+                    pass
+            if preserve_y_range:
+                order = [k for k, p in self._items.items() if p.visible]
+                for i, key in enumerate(order):
+                    if i < len(self._stacked_plots):
+                        try:
+                            _saved_yr_by_key[key] = list(self._stacked_plots[i].vb.viewRange()[1])
+                        except Exception:
+                            pass
         elif not self._stacked_mode:
-            try:
-                _saved_xr = list(self.plot.plotItem.vb.viewRange()[0])
-            except Exception:
-                pass
-            if self._multi_axis:
+            if _saved_xr is None:
+                try:
+                    _saved_xr = list(self.plot.plotItem.vb.viewRange()[0])
+                except Exception:
+                    pass
+            if preserve_y_range and self._multi_axis:
                 # Save one Y range per unit group (keyed by normalized unit).
                 # Multiple signals sharing a ViewBox get the same range entry.
                 _seen_ukeys: set[str] = set()
@@ -895,7 +948,7 @@ class PlotPanel(QWidget):
                                 plotted.view_box.viewRange()[1])
                     except Exception:
                         pass
-            else:
+            elif preserve_y_range:
                 try:
                     _saved_yr = list(self.plot.plotItem.vb.viewRange()[1])
                 except Exception:
@@ -2032,6 +2085,12 @@ class PlotPanel(QWidget):
             label = ch_part + '::' + label
         return label
 
+    @staticmethod
+    def _is_generated_signal_key(key: str) -> bool:
+        """Return whether *key* belongs to the calculated-signal tree group."""
+        parts = key.split('::', 2)
+        return len(parts) == 3 and parts[1] == 'Generate Signals'
+
     def _refresh_table(self) -> None:
         self.table.blockSignals(True)
 
@@ -2076,6 +2135,10 @@ class PlotPanel(QWidget):
                 chk_item.setData(Qt.ItemDataRole.UserRole, key)
                 sig_item = QTableWidgetItem(indent + self._format_signal_label(key))
                 sig_item.setData(Qt.ItemDataRole.UserRole, key)
+                if self._is_generated_signal_key(key):
+                    generated_font = sig_item.font()
+                    generated_font.setItalic(True)
+                    sig_item.setFont(generated_font)
                 c1_item  = QTableWidgetItem('')
                 c2_item  = QTableWidgetItem('')
                 un_item  = QTableWidgetItem(plotted.series.unit)

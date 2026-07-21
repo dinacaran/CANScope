@@ -39,7 +39,7 @@ class BLFCANReader:
         )
         # Expose decoder load messages for diagnostics
         self.load_messages: list[str] = list(decoder.load_messages) + [
-            "Fast path: batched BLF column extraction."
+            "Fast path: direct BLF object-to-array extraction."
         ]
 
     # ── Protocol-required iterator ────────────────────────────────────────

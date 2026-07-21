@@ -17,7 +17,7 @@ _CAN_PLOT_INTERVAL     = 25_000   # was 5 000 — partial_ready triggers main-th
 _CAN_PROGRESS_INTERVAL = 10_000
 _BULK_PLOT_INTERVAL    = 10
 _BULK_PROGRESS_INTERVAL = 50
-_RAW_BATCH_SIZE         = 16_384
+_RAW_BATCH_SIZE         = 65_536
 
 
 def _bulk_compute_store_stats(store, rfs) -> None:
@@ -209,7 +209,7 @@ class LoadWorker(QObject):
         store.raw_frame_store = rfs
 
         # ── Read once: drain packed frames into raw_frame_store ──────────
-        self.progress.emit("Reading and packing raw frames...")
+        self.progress.emit("Bulk reading and packing raw frame arrays...")
         read_started = time.perf_counter()
         base_ts: float | None = None
         index   = 0
@@ -317,7 +317,7 @@ class LoadWorker(QObject):
         rfs.seal()
         read_elapsed = time.perf_counter() - read_started
         self.progress.emit(
-            f"Packed frame read/store complete: {index:,} frames in {read_elapsed:.1f} s"
+            f"Bulk frame-array read/store complete: {index:,} frames in {read_elapsed:.1f} s"
         )
 
         if _batched or _fast:

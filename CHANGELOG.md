@@ -1,4 +1,5 @@
 # Changelog
+## [v00.00.51] — 2026-07-21:new feature "New Signal" signal generation by formula added 
 ## [v00.00.50] — 2026-07-15: Fast load of MDF, BLF,ASC Fast loading CAN trace enabled 
 ## [v00.00.49] — 2026-07-12: build check
 ## [v00.00.48] — 2026-07-11

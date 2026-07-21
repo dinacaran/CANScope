@@ -15,6 +15,25 @@ class ASCReadError(RuntimeError):
     pass
 
 
+def _parse_payload_tail(tail: bytes, data_len: int, numeric_base: int) -> bytes:
+    """Decode only the payload prefix, leaving ASC trailing columns untouched."""
+    if data_len <= 0:
+        return b""
+    if numeric_base == 16:
+        # Vector ASC uses two hex digits plus one space per byte.  Cutting the
+        # fixed-width prefix avoids splitting the many trailing CAN-FD fields.
+        compact = tail.lstrip()[:data_len * 3 - 1].replace(b" ", b"")
+        if len(compact) == data_len * 2:
+            try:
+                return binascii.unhexlify(compact)
+            except binascii.Error:
+                pass
+        fields = tail.split(None, data_len)
+        return binascii.unhexlify(b"".join(fields[:data_len]))
+    fields = tail.split(None, data_len)
+    return bytes(int(value, 10) for value in fields[:data_len])
+
+
 class ASCCANReader:
     """
     Reads a Vector CANalyzer ASCII log (.asc) and decodes signals using
@@ -40,7 +59,7 @@ class ASCCANReader:
             f"ASC + DBC  ({self._path.name} / {self._decoder.dbc_path.name})"
         )
         self.load_messages: list[str] = list(decoder.load_messages) + [
-            "Fast path: direct ASC column-array extraction."
+            "Fast path: bulk fixed-column ASC array extraction."
         ]
 
     # ── Protocol-required iterator ────────────────────────────────────────
@@ -140,11 +159,11 @@ class ASCCANReader:
             raise ASCReadError(f"ASC file not found: {self._path}")
 
         timestamps: list[float] = []
-        channels: list[int] = []
+        channels = bytearray()
         arb_ids: list[int] = []
-        dlcs: list[int] = []
-        directions: list[int] = []
-        flags: list[int] = []
+        dlcs = bytearray()
+        directions = bytearray()
+        flags = bytearray()
         data_block = bytearray(batch_size * 64)
         base_ts: float | None = None
         numeric_base = 16
@@ -152,71 +171,117 @@ class ASCCANReader:
         try:
             with self._path.open('rb', buffering=4 << 20) as stream:
                 for line in stream:
-                    fields = line.split()
-                    if len(fields) >= 2 and fields[0].lower() == b'base':
-                        numeric_base = 10 if fields[1].lower() == b'dec' else 16
-                        continue
-                    if len(fields) < 6:
-                        continue
-                    try:
-                        timestamp = float(fields[0])
-                    except (ValueError, TypeError):
+                    if line[:5].lower() == b'base ':
+                        header = line.split(None, 2)
+                        numeric_base = 10 if header[1].lower() == b'dec' else 16
                         continue
 
-                    is_fd = fields[1].upper() == b'CANFD'
-                    try:
-                        if is_fd:
-                            # ts CANFD channel Rx id brs esi dlc data_len data...
-                            if len(fields) < 9:
-                                continue
-                            channel = int(fields[2])
-                            direction_token = fields[3].lower()
-                            id_token = fields[4]
-                            # Some CANalyzer exports include a symbolic message
-                            # name after the ID.  The BRS/ESI/DLC fields are
-                            # numeric, so detect and skip that optional token.
-                            fd_offset = 1 if not fields[5].isdigit() else 0
-                            data_len = min(int(fields[8 + fd_offset]), 64)
-                            data_start = 9 + fd_offset
-                        else:
-                            # ts channel id [symbolic-name] Rx d|r dlc data...
-                            channel = int(fields[1])
-                            id_token = fields[2]
-                            direction_index = (
-                                3 if fields[3].lower() in (b'rx', b'tx') else 4
+                    # asammdf/Vector CAN-FD exports use fixed prefix columns.
+                    # Read those slices directly so a multi-million-line file
+                    # does not allocate and discard every unused trailing
+                    # status field.  Non-standard lines use the general parser
+                    # below without changing accepted ASC variants.
+                    fixed_canfd = False
+                    if numeric_base == 16 and len(line) >= 79 \
+                            and line[12:17] == b'CANFD':
+                        try:
+                            timestamp = float(line[:12])
+                            channel = int(line[17:22])
+                            direction_initial = line[22]
+                            direction_value = (
+                                0 if direction_initial in (ord('R'), ord('r'))
+                                else 1 if direction_initial in (ord('T'), ord('t'))
+                                else 2
                             )
-                            direction_token = fields[direction_index].lower()
-                            frame_kind = fields[direction_index + 1].lower()
-                            if frame_kind not in (b'd', b'r'):
-                                continue
-                            data_len = (
-                                0 if frame_kind == b'r'
-                                else min(int(fields[direction_index + 2]), 64)
-                            )
-                            data_start = direction_index + 3
-
-                        extended = id_token[-1:].lower() == b'x'
-                        if extended:
-                            id_token = id_token[:-1]
-                        arb_id = int(id_token, numeric_base)
-                    except (ValueError, IndexError):
-                        continue
-
-                    available = min(data_len, max(0, len(fields) - data_start))
-                    try:
-                        if not available:
-                            payload = b''
-                        elif numeric_base == 16:
+                            id_token = line[32:42].strip()
+                            data_len = min(int(line[75:79]), 64)
+                            extended = id_token[-1:] in (b'x', b'X')
+                            if extended:
+                                id_token = id_token[:-1]
+                            arb_id = int(id_token, 16)
                             payload = binascii.unhexlify(
-                                b''.join(fields[data_start:data_start + available])
+                                line[79:79 + data_len * 3 - 1].replace(b' ', b'')
+                            ) if data_len else b''
+                            if len(payload) != data_len:
+                                raise ValueError("short fixed-column payload")
+                            is_fd = True
+                            fixed_canfd = True
+                        except (ValueError, IndexError, binascii.Error):
+                            fixed_canfd = False
+
+                    if not fixed_canfd:
+                        try:
+                            # Split only the stable ASC prefix.  The final
+                            # element retains payload + trailing CAN-FD
+                            # columns as one bytes object.
+                            fields = line.split(None, 9)
+                            if len(fields) < 2:
+                                continue
+                            timestamp = float(fields[0])
+                        except (ValueError, TypeError):
+                            continue
+
+                        is_fd = fields[1].upper() == b'CANFD'
+                        try:
+                            if is_fd:
+                                # ts CANFD channel Rx id brs esi dlc data_len data...
+                                if len(fields) < 10:
+                                    continue
+                                channel = int(fields[2])
+                                direction_token = fields[3].lower()
+                                id_token = fields[4]
+                                # Some CANalyzer exports include a symbolic
+                                # message name after the ID.
+                                if fields[5].isdigit():
+                                    data_len = min(int(fields[8]), 64)
+                                    payload_tail = fields[9]
+                                else:
+                                    length_and_payload = fields[9].split(None, 1)
+                                    if len(length_and_payload) != 2:
+                                        continue
+                                    data_len = min(int(length_and_payload[0]), 64)
+                                    payload_tail = length_and_payload[1]
+                            else:
+                                # ts channel id [symbolic-name] Rx d|r dlc data...
+                                classic = line.split(None, 6)
+                                if len(classic) < 6:
+                                    continue
+                                channel = int(classic[1])
+                                id_token = classic[2]
+                                direction_index = 3 if classic[3].lower() in (b'rx', b'tx') else 4
+                                direction_token = classic[direction_index].lower()
+                                frame_kind = classic[direction_index + 1].lower()
+                                if frame_kind not in (b'd', b'r'):
+                                    continue
+                                if frame_kind == b'r':
+                                    data_len = 0
+                                    payload_tail = b''
+                                elif direction_index == 3:
+                                    data_len = min(int(classic[5]), 64)
+                                    payload_tail = classic[6] if len(classic) > 6 else b''
+                                else:
+                                    length_and_payload = classic[6].split(None, 1)
+                                    data_len = min(int(length_and_payload[0]), 64)
+                                    payload_tail = length_and_payload[1] if len(length_and_payload) > 1 else b''
+
+                            extended = id_token[-1:].lower() == b'x'
+                            if extended:
+                                id_token = id_token[:-1]
+                            arb_id = int(id_token, numeric_base)
+                        except (ValueError, IndexError):
+                            continue
+
+                        try:
+                            payload = _parse_payload_tail(
+                                payload_tail, data_len, numeric_base,
                             )
-                        else:
-                            payload = bytes(
-                                int(value, 10)
-                                for value in fields[data_start:data_start + available]
-                            )
-                    except (ValueError, OverflowError, binascii.Error):
-                        continue
+                        except (ValueError, OverflowError, binascii.Error):
+                            continue
+                        direction_value = (
+                            0 if direction_token == b'rx'
+                            else 1 if direction_token == b'tx'
+                            else 2
+                        )
 
                     if base_ts is None:
                         base_ts = timestamp
@@ -225,14 +290,9 @@ class ASCCANReader:
                     channels.append(channel if 0 <= channel < 255 else 255)
                     arb_ids.append(arb_id & 0xFFFF_FFFF)
                     dlcs.append(data_len)
-                    directions.append(
-                        0 if direction_token == b'rx'
-                        else 1 if direction_token == b'tx'
-                        else 2
-                    )
+                    directions.append(direction_value)
                     flags.append((1 if extended else 0) | (2 if is_fd else 0))
                     offset = slot * 64
-                    data_block[offset:offset + 64] = b'\x00' * 64
                     if payload:
                         data_block[offset:offset + len(payload)] = payload
 
@@ -242,11 +302,11 @@ class ASCCANReader:
                             directions, flags, data_block,
                         )
                         timestamps = []
-                        channels = []
+                        channels = bytearray()
                         arb_ids = []
-                        dlcs = []
-                        directions = []
-                        flags = []
+                        dlcs = bytearray()
+                        directions = bytearray()
+                        flags = bytearray()
                         data_block = bytearray(batch_size * 64)
 
             if timestamps:
