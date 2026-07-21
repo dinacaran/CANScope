@@ -43,7 +43,7 @@ Stacked plot:
 <img width="3193" height="2022" alt="CANScope_V35" src="https://github.com/user-attachments/assets/0f413b0b-a23a-439f-b8c8-41848969c99c" />
 
 Multiple Axis plot:
-<img width="2376" height="1300" alt="Multi_plot" src="https://github.com/user-attachments/assets/efc7b429-befa-4344-bed3-4d5c2151ca98" />
+<img width="2214" height="1590" alt="multi-axis plot" src="https://github.com/user-attachments/assets/7d3ef351-1b02-45e0-85f5-4dfd1217ad6e" />
 
 CAN Trace / Raw Frame viewer:
 <img width="1543" height="1019" alt="CANScope_RawCAN Frame" src="https://github.com/user-attachments/assets/69ad9749-ecec-445d-a31f-4b47901855cf" />
