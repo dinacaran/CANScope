@@ -80,6 +80,31 @@ def _get_xy_range(panel):
     return list(vr[0]), list(vr[1])
 
 
+def _set_mode(panel, mode: str) -> None:
+    """Mirror MainWindow's mutually-exclusive plot mode buttons."""
+    if mode == "normal":
+        if panel._stacked_mode:
+            panel.set_stacked(False)
+        if panel._multi_axis:
+            panel.set_multi_axis(False)
+    elif mode == "multi_axis":
+        if panel._stacked_mode:
+            panel.set_stacked(False)
+        panel.set_multi_axis(True)
+    elif mode == "stacked":
+        if panel._multi_axis:
+            panel.set_multi_axis(False)
+        panel.set_stacked(True)
+    else:
+        raise ValueError(mode)
+
+
+def _visible_x_range(panel):
+    if panel._stacked_mode:
+        return list(panel._stacked_plots[0].vb.viewRange()[0])
+    return list(panel.plot.plotItem.vb.viewRange()[0])
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -182,3 +207,31 @@ class TestViewPreservedOnAddRemove:
 
         xr, _ = _get_xy_range(panel)
         assert xr[1] - xr[0] > 0.5, "fit_to_window() should restore full X extent"
+
+
+def test_mode_switch_preserves_time_window_and_cursors(panel, qapp):
+    panel.add_series("A", _make_series(signal_name="A", unit="km/h"))
+    panel.add_series("B", _make_series(signal_name="B", unit="degC"))
+    panel.plot.setXRange(0.2, 0.55, padding=0)
+    panel.set_cursor1_enabled(True)
+    panel.set_cursor2_enabled(True)
+    panel.v_line.setPos(0.31)
+    panel.v_line2.setPos(0.47)
+    qapp.processEvents()
+    expected_x = _visible_x_range(panel)
+
+    # Exercise normal -> multi-axis -> stacked and the reverse route back to
+    # normal, matching the mutually-exclusive toolbar button behavior.
+    for mode in ("multi_axis", "stacked", "multi_axis", "normal"):
+        _set_mode(panel, mode)
+        qapp.processEvents()
+
+        actual_x = _visible_x_range(panel)
+        assert actual_x == pytest.approx(expected_x, abs=0.01)
+        assert panel.v_line.value() == pytest.approx(0.31)
+        assert panel.v_line2.value() == pytest.approx(0.47)
+        if mode == "stacked":
+            assert all(line.value() == pytest.approx(0.31)
+                       for line in panel._stacked_c1_lines)
+            assert all(line.value() == pytest.approx(0.47)
+                       for line in panel._stacked_c2_lines)

@@ -48,6 +48,25 @@ def test_iter_frames_only_channel(blf_reader):
     assert all(f.channel is not None for f in frames)
 
 
+def test_iter_raw_batches_preserves_count_and_ids(blf_reader):
+    batches = list(blf_reader.iter_raw_batches(batch_size=4))
+    assert sum(len(batch[1]) for batch in batches) == 9
+    assert {arb_id for batch in batches for arb_id in batch[3]} == {
+        0x100, 0x200, 0x300,
+    }
+
+
+def test_iter_raw_batches_bypasses_can_message_construction(blf_reader, monkeypatch):
+    import can.io.blf
+
+    def fail_message_construction(*_args, **_kwargs):
+        raise AssertionError("bulk BLF path must not allocate can.Message objects")
+
+    monkeypatch.setattr(can.io.blf, "Message", fail_message_construction)
+    batches = list(blf_reader.iter_raw_batches(batch_size=4))
+    assert sum(len(batch[1]) for batch in batches) == 9
+
+
 # ── Decoded signal iteration ──────────────────────────────────────────────
 
 def test_yields_decoded_samples(blf_reader):

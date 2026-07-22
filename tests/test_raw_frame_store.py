@@ -123,6 +123,61 @@ def test_append_raw_name_always_empty():
     assert rec.frame_name == ""
 
 
+def test_append_raw_batch_preserves_metadata_and_payload():
+    store = RawFrameStore()
+    data = bytearray(2 * 64)
+    data[0:3] = b"\x01\x02\x03"
+    data[64:66] = b"\xAA\xBB"
+    store.append_raw_batch(
+        timestamps=[0.0, 0.1],
+        channels=[1, 2],
+        arb_ids=[0x123, 0x18FEF100],
+        dlcs=[3, 2],
+        directions=[0, 1],
+        flags=[0, 3],
+        data_block=data,
+    )
+    store.seal()
+
+    first, second = store.get_window([0, 1])
+    assert first.data == b"\x01\x02\x03"
+    assert first.direction == "Rx"
+    assert second.data == b"\xAA\xBB"
+    assert second.channel == 2
+    assert second.direction == "Tx"
+    assert second.is_extended is True
+    assert second.is_fd is True
+
+
+def test_append_numpy_batch_preserves_columns_and_pads_payload():
+    store = RawFrameStore()
+    try:
+        store.append_numpy_batch(
+            timestamps=np.array([2.0, 2.1], dtype=np.float64),
+            channels=np.array([1, 2], dtype=np.uint8),
+            arb_ids=np.array([0x123, 0x18FEF100], dtype=np.uint32),
+            dlcs=np.array([3, 2], dtype=np.uint8),
+            directions=np.array([0, 1], dtype=np.uint8),
+            flags=np.array([0, 3], dtype=np.uint8),
+            data_rows=np.array([
+                [1, 2, 3, 0, 0, 0, 0, 0],
+                [0xAA, 0xBB, 0, 0, 0, 0, 0, 0],
+            ], dtype=np.uint8),
+        )
+        store.seal()
+
+        first, second = store.get_window([0, 1])
+        assert first.time_s == pytest.approx(2.0)
+        assert first.data == b"\x01\x02\x03"
+        assert second.channel == 2
+        assert second.data == b"\xAA\xBB"
+        assert second.direction == "Tx"
+        assert second.is_extended is True
+        assert second.is_fd is True
+    finally:
+        store.close()
+
+
 # ── build_match_mask ──────────────────────────────────────────────────────
 
 def test_match_mask_no_filter_returns_none():

@@ -6,6 +6,7 @@ by tests/fixtures/_generate.py and are intentionally not committed to git.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,26 @@ import numpy as np
 import pytest
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# ── Strict fixture mode ────────────────────────────────────────────────────
+# Binary fixtures are generated on demand and not committed, so a generation
+# failure would normally skip every BLF/ASC test and leave the run green —
+# silently disabling coverage of the loading/decoding pipeline. CI sets
+# CANSCOPE_STRICT_FIXTURES=1 to turn those skips into hard failures.
+STRICT_FIXTURES = bool(os.environ.get("CANSCOPE_STRICT_FIXTURES"))
+
+
+def skip_or_fail(reason: str) -> None:
+    """Skip locally, fail under CANSCOPE_STRICT_FIXTURES. Never returns."""
+    if STRICT_FIXTURES:
+        pytest.fail(f"{reason} (CANSCOPE_STRICT_FIXTURES is set)")
+    pytest.skip(reason)
+
+
+# Keep diagnostic telemetry out of the repo's logs/ during test runs.
+@pytest.fixture(autouse=True)
+def _no_diag_telemetry(monkeypatch):
+    monkeypatch.setenv("CANSCOPE_DIAG_TELEMETRY", "0")
 
 # ── Payload constants (match sample.dbc signal layout) ────────────────────
 # EngineControl 0x100: EngSpeed raw=2400 (0x0960 LE) → 1200.0 rpm; Throttle raw=100 → 50.0 %
@@ -51,6 +72,19 @@ def wide_csv_path() -> Path:
     return FIXTURES_DIR / "sample_wide.csv"
 
 
+@pytest.fixture()
+def raw_can_csv_path(tmp_path) -> Path:
+    path = tmp_path / "sample_can.csv"
+    path.write_text(
+        "TimestampEpoch;BusChannel;ID;IDE;DLC;DataLength;Dir;EDL;BRS;ESI;RTR;DataBytes\n"
+        "1660503551.100000;1;100;0;8;8;0;0;0;0;0;6009640000000000\n"
+        "1660503551.200000;1;200;0;4;4;1;0;0;0;0;04000000\n"
+        "1660503551.300000;2;18FF50E5;1;9;12;0;1;0;0;0;000102030405060708090A0B\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.fixture(scope="session")
 def blf_path() -> Path:
     path = FIXTURES_DIR / "sample.blf"
@@ -61,9 +95,9 @@ def blf_path() -> Path:
                 timeout=30,
             )
         except Exception as exc:
-            pytest.skip(f"Could not generate sample.blf: {exc}")
+            skip_or_fail(f"Could not generate sample.blf: {exc}")
     if not path.exists():
-        pytest.skip("sample.blf not found — run tests/fixtures/_generate.py")
+        skip_or_fail("sample.blf not found — run tests/fixtures/_generate.py")
     return path
 
 
@@ -77,9 +111,9 @@ def asc_path() -> Path:
                 timeout=30,
             )
         except Exception as exc:
-            pytest.skip(f"Could not generate sample.asc: {exc}")
+            skip_or_fail(f"Could not generate sample.asc: {exc}")
     if not path.exists():
-        pytest.skip("sample.asc not found — run tests/fixtures/_generate.py")
+        skip_or_fail("sample.asc not found — run tests/fixtures/_generate.py")
     return path
 
 
@@ -204,9 +238,40 @@ def make_store_with_signals(
     return store
 
 
+def make_store_with_named_signals(
+    signals: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    channel: int = 1,
+):
+    """Return a SignalStore holding arbitrary named signals with explicit,
+    possibly *offset* timebases.
+
+    ``signals`` maps signal name -> (timestamps, values).  Each signal gets its
+    own synthetic message so store keys stay distinct.  Used by the ZOH /
+    episode / knowledge-enrichment tests which need EngFault, Active_DTC_ID,
+    OilPressure, EngSpeed on independent timelines.
+    """
+    from core.signal_store import SignalStore
+
+    store = SignalStore()
+    for i, (name, (ts, vals)) in enumerate(signals.items()):
+        store.add_series_bulk(
+            channel=channel,
+            message_name=f"{name}Msg",
+            message_id=0x400 + i,
+            signal_name=name,
+            unit="",
+            timestamps=np.asarray(ts, dtype=np.float64),
+            values=np.asarray(vals, dtype=np.float64),
+            raw_values=[],
+            has_labels=False,
+        )
+    return store
+
+
 # ── Minimal DomainConfig for unit tests ───────────────────────────────────
 
-def make_test_domain(name: str = "TestDomain"):
+def make_test_domain(name: str = "TestDomain", context_window_s: float = 2.0):
     """Create a minimal DomainConfig with empty signal_map for rule processor tests."""
     from core.diagnostics.config_loader import DomainConfig
     from pathlib import Path
@@ -217,4 +282,5 @@ def make_test_domain(name: str = "TestDomain"):
         signal_map={},
         rules=[],
         source_path=Path("test.yaml"),
+        context_window_s=context_window_s,
     )

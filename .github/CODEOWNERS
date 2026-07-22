@@ -1,0 +1,33 @@
+# Auto-requests review from the owner when these paths change.
+#
+# This file requests review; it does not enforce it. Enforcement lives in
+# tools/check_protected_paths.py, run by the `guard` job in pr.yml.
+# Do NOT enable "Require review from Code Owners" in branch protection —
+# with a single owner it would block the owner's own PRs, since GitHub
+# does not allow self-approval.
+
+# Default
+*                           @dinacaran
+
+# Validated loading/decoding pipeline — see CLAUDE.md
+/core/load_worker.py        @dinacaran
+/core/channel_config.py     @dinacaran
+/core/dbc_decoder.py        @dinacaran
+/core/vectorized_decoder.py @dinacaran
+/core/raw_frame_store.py    @dinacaran
+/core/blf_reader.py         @dinacaran
+/core/readers/              @dinacaran
+/requirements.txt           @dinacaran
+
+# Protected core files
+/core/signal_store.py       @dinacaran
+/CANScope.spec              @dinacaran
+
+# Owner-only release metadata
+/CHANGELOG.md               @dinacaran
+/app.py                     @dinacaran
+
+# CI and policy
+/.github/                   @dinacaran
+/tools/                     @dinacaran
+/CLAUDE.md                  @dinacaran

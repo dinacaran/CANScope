@@ -7,7 +7,9 @@ import pytest
 from core.diagnostics.config_loader import RuleConfig
 from core.diagnostics.context import DiagnosticContext
 from core.diagnostics.models import Severity
-from core.diagnostics.rules.expression import run, _parse
+from core.diagnostics.rules.expression import (
+    run, parse, condition_signals, ExpressionError,
+)
 
 from tests.conftest import make_store_with_signals, make_test_domain
 
@@ -26,44 +28,45 @@ def _ctx(store, domain=None):
     return DiagnosticContext(store, domain or make_test_domain())
 
 
-# ── _parse unit tests ─────────────────────────────────────────────────────
+# ── parser unit tests (new recursive-descent API) ─────────────────────────
 
 def test_parse_simple():
-    terms, conns = _parse("EngSpeed > 5000")
-    assert len(terms) == 1
-    assert terms[0] == ("EngSpeed", ">", 5000.0)
-    assert conns == []
+    parse("EngSpeed > 5000")                       # does not raise
+    assert condition_signals("EngSpeed > 5000") == ["EngSpeed"]
 
 
 def test_parse_compound_and():
-    terms, conns = _parse("EngSpeed > 4000 and Throttle > 80")
-    assert len(terms) == 2
-    assert conns == ["and"]
+    assert condition_signals("EngSpeed > 4000 and Throttle > 80") == ["EngSpeed", "Throttle"]
 
 
 def test_parse_compound_or():
-    terms, conns = _parse("Gear = 3 or Gear = 4")
-    assert conns == ["or"]
+    parse("Gear = 3 or Gear = 4")
+    assert condition_signals("Gear = 3 or Gear = 4") == ["Gear"]
 
 
 def test_parse_equality_operator():
-    terms, _ = _parse("Gear = 3")
-    assert terms[0][1] == "="
+    parse("Gear = 3")
+    parse("Gear == 3")                             # == is a synonym for =
 
 
 def test_parse_not_equal():
-    terms, _ = _parse("Gear != 0")
-    assert terms[0][1] == "!="
+    parse("Gear != 0")
 
 
 def test_parse_invalid_raises():
-    with pytest.raises(ValueError):
-        _parse("not a valid expression")
+    with pytest.raises(ExpressionError):
+        parse("not a valid expression")
 
 
 def test_parse_empty_raises():
-    with pytest.raises(ValueError):
-        _parse("")
+    with pytest.raises(ExpressionError):
+        parse("")
+
+
+def test_expression_error_is_valueerror():
+    # Subclassing ValueError keeps triage / config_loader's `except ValueError`
+    # working unchanged.
+    assert issubclass(ExpressionError, ValueError)
 
 
 # ── Single-signal threshold ───────────────────────────────────────────────

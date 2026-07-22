@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from core.readers.csv_reader import CSVSignalReader, CSVReadError
+from core.readers.csv_reader import (
+    CSVRawCANReader,
+    CSVSignalReader,
+    CSVReadError,
+    is_can_bus_logging_csv,
+    prescan_can_bus_logging_csv,
+)
 
 
 # ── Narrow format ─────────────────────────────────────────────────────────
@@ -107,3 +113,41 @@ def test_missing_file_raises():
 def test_source_description_contains_filename(narrow_csv_path):
     reader = CSVSignalReader(narrow_csv_path)
     assert "sample_narrow.csv" in reader.source_description
+
+
+# ── Raw CAN-frame CSV format ────────────────────────────────────────────────
+
+def test_raw_can_csv_detected_and_prescanned(raw_can_csv_path):
+    assert is_can_bus_logging_csv(raw_can_csv_path)
+    channels, ids = prescan_can_bus_logging_csv(raw_can_csv_path)
+    assert channels == [1, 2]
+    assert ids[1] == {0x100, 0x200}
+    assert ids[2] == {0x18FF50E5}
+
+
+def test_raw_can_csv_emits_packed_batches(raw_can_csv_path, decoder):
+    reader = CSVRawCANReader(raw_can_csv_path, decoder)
+    batches = list(reader.iter_raw_batches(batch_size=2))
+
+    assert len(batches) == 2
+    base_ts, timestamps, channels, ids, dlcs, directions, flags, data = batches[0]
+    assert base_ts == pytest.approx(1660503551.1)
+    assert timestamps == pytest.approx([0.0, 0.1], abs=1e-6)
+    assert channels == [1, 1]
+    assert ids == [0x100, 0x200]
+    assert dlcs == [8, 4]
+    assert directions == [0, 1]
+    assert flags == [0, 0]
+    assert bytes(data[:8]) == bytes.fromhex("6009640000000000")
+
+    _, _, channels, ids, dlcs, _, flags, data = batches[1]
+    assert channels == [2]
+    assert ids == [0x18FF50E5]
+    assert dlcs == [12]
+    assert flags == [3]
+    assert bytes(data[:12]) == bytes(range(12))
+
+
+def test_signal_reader_explains_raw_can_csv_needs_database(raw_can_csv_path):
+    with pytest.raises(CSVReadError, match="raw CAN frames"):
+        list(CSVSignalReader(raw_can_csv_path))

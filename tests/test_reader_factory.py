@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from core.readers import reader_factory, dbc_required_for, UnsupportedFormatError
-from core.readers.csv_reader import CSVSignalReader
+from core.readers.csv_reader import CSVRawCANReader, CSVSignalReader
 
 
 # ── Missing-DBC errors ─────────────────────────────────────────────────────
@@ -37,6 +37,17 @@ def test_csv_returns_csv_reader(narrow_csv_path):
 
 def test_csv_no_dbc_required(narrow_csv_path):
     assert dbc_required_for(str(narrow_csv_path)) is False
+
+
+def test_raw_can_csv_requires_database(raw_can_csv_path):
+    assert dbc_required_for(str(raw_can_csv_path)) is True
+    with pytest.raises(ValueError, match="DBC or ARXML"):
+        reader_factory(str(raw_can_csv_path))
+
+
+def test_raw_can_csv_returns_raw_reader(raw_can_csv_path, sample_dbc_path):
+    reader = reader_factory(str(raw_can_csv_path), str(sample_dbc_path))
+    assert isinstance(reader, CSVRawCANReader)
 
 
 # ── BLF / ASC return correct reader types ─────────────────────────────────

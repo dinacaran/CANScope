@@ -42,6 +42,24 @@ def test_iter_frames_only_arb_ids(asc_reader):
     assert 0x300 in ids
 
 
+def test_iter_raw_tuples_matches_frame_count_and_ids(asc_reader):
+    rows = list(asc_reader.iter_raw_tuples())
+    assert len(rows) == 9
+    assert {row[2] for row in rows} == {0x100, 0x200, 0x300}
+    assert all(row[1] == 2 for row in rows)
+
+
+def test_iter_raw_batches_parses_classic_asc_columns(asc_reader):
+    batches = list(asc_reader.iter_raw_batches(batch_size=4))
+    assert sum(len(batch[1]) for batch in batches) == 9
+    assert {arb_id for batch in batches for arb_id in batch[3]} == {
+        0x100, 0x200, 0x300,
+    }
+    assert all(channel == 2 for batch in batches for channel in batch[2])
+    first = batches[0]
+    assert bytes(first[7][0:8]) == bytes([0x60, 0x09, 0x64, 0, 0, 0, 0, 0])
+
+
 # ── Decoded signal iteration ──────────────────────────────────────────────
 
 def test_yields_decoded_samples(asc_reader):

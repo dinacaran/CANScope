@@ -1,0 +1,111 @@
+name: PR Checks
+
+# Runs on every pull request into main. Kept separate from build.yml, which
+# publishes releases and therefore needs `contents: write` — this workflow
+# only ever reads.
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Fast fail: seconds on Linux, before spending Windows minutes ─────────
+  guard:
+    name: Protected paths
+    runs-on: ubuntu-latest
+    # NOTE: deliberately no job-level `if:`. This job is a required status
+    # check, so it must always run and report a conclusion. The override label
+    # is handled inside the step below — a skipped job would leave the required
+    # check in an ambiguous state instead of a clean pass.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # need both sides of the diff
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check protected paths
+        if: github.event_name == 'pull_request'
+        env:
+          # The owner applies this label to authorise a pipeline change.
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'approved-pipeline-change') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$APPROVED" = "true" ]; then
+            echo "::notice::'approved-pipeline-change' label present — protected-path check waived by the project owner."
+            exit 0
+          fi
+          python tools/check_protected_paths.py "$BASE_SHA" "$HEAD_SHA"
+
+  test:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    env:
+      # Turn fixture/Qt skips into failures — a green run must mean the
+      # loading/decoding and GUI tests actually executed.
+      CANSCOPE_STRICT_FIXTURES: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # -rs lists the reason for every skip in the summary, so a suite that
+      # quietly stops covering something is visible in the log rather than
+      # hidden behind a green check.
+      - name: Run test suite
+        run: python -m pytest tests/ -q --tb=short -rs
+
+  build:
+    name: Portable build (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build portable EXE
+        run: pyinstaller CANScope.spec
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\CANScope\CANScope.exe")) {
+            Write-Error "Build failed: CANScope.exe not found"
+            exit 1
+          }
+          Write-Host "Build succeeded."

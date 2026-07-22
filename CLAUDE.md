@@ -13,6 +13,8 @@ for next step refer: TODO.md
 ---
 for commands refer to file: docs/commands.md
 ---
+for Pull Request Policy: docs/PR_Policy.md
+
 ## Project Overview
 
 **CANScope** (v00.00.45) is a Windows desktop tool built with Python 3.12 + PySide6.  
