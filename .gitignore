@@ -2,7 +2,7 @@
 .claude
 .claude/
 *.log
-docs/
+docs_int/
 claude.md
 
 # ── Python ────────────────────────────────────────────────────────────────
