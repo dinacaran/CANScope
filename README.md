@@ -1,41 +1,11 @@
 # CAN Scope
 
-> A portable, zero-install Windows tool for loading CAN/automotive measurement files,
-> decoding signals with DBC or ARXML (AUTOSAR) databases, and plotting them interactively.
+> A portable Windows application for loading automotive measurements, decoding CAN signals, inspecting raw frames, and plotting signal data interactively.
 
-![Python](https://img.shields.io/badge/Python-3.12%2B-blue?logo=python)
+![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Release](https://img.shields.io/github/v/release/dinacaran/canscope)
-
----
-
-## Supported Formats
-
-| Format | Extension | Database Required |
-|--------|-----------|-------------------|
-| Vector Binary Logging Format | `.blf` | Yes |
-| Vector CANalyzer ASCII Log | `.asc` | Yes |
-| ASAM MDF4 — bus logging (raw CAN frames) | `.mf4` | Yes — auto-detected |
-| ASAM MDF4 / MDF3 — pre-decoded signals | `.mf4` / `.mdf` | No |
-| CSV (narrow or wide columnar) | `.csv` | No |
-
-> **MDF auto-detection:** CAN Scope automatically probes each MDF file on open.
-> If it contains raw CAN bus frames (`CAN_DataFrame.*` channel groups) it routes
-> through the bus-logging pipeline and requires a database file (`.dbc` or `.arxml`).
-> Pre-decoded MDF files load directly without a database.
-
-### Database Formats
-
-Both `.dbc` and `.arxml` (AUTOSAR System Description) files are accepted wherever
-a CAN database is required.
-
-- Open an `.arxml` in the **Database Manager** exactly as you would a `.dbc`.
-- Mixed configurations are supported: some CAN channels can use a `.dbc` and others an `.arxml`.
-- Supported ARXML variants: AUTOSAR 3.x and AUTOSAR 4.x.
-- To convert an existing `.dbc` to `.arxml` for testing: `cantools convert input.dbc output.arxml`
-
----
 
 ## Screenshots
 
@@ -49,211 +19,116 @@ Multiple Axis plot:
 CAN Trace / Raw Frame viewer:
 <img width="1543" height="1019" alt="CANScope_RawCAN Frame" src="https://github.com/user-attachments/assets/69ad9749-ecec-445d-a31f-4b47901855cf" />
 
----
+## Supported formats
 
-## Features
+| Measurement | Content | Database |
+|---|---|---|
+| BLF (`.blf`) | Raw CAN frames | DBC or ARXML required |
+| ASC (`.asc`) | Raw CAN frames | DBC or ARXML required |
+| MDF4/MDF3 (`.mf4`, `.mdf`) | Raw CAN bus logging or pre-decoded signals | Required only for raw bus logging |
+| CSV (`.csv`) | Raw CAN export, narrow signals, or wide signals | Required only for raw CAN data |
 
-### File & Decoding
-- **Multi-format loading** — BLF, ASC, MF4 (bus-logged and pre-decoded), MDF3, and CSV in one tool
-- **Multi-channel database mapping** — assign a different `.dbc` or `.arxml` to each CAN channel via the Database Manager; channel 0 acts as an "All Channels" fallback
-- **Database match quality indicators** — the Database Manager shows per-channel decode coverage bars with J1939 PGN fallback scoring
-- **Streaming decode** — signal tree and plots update in real time while large files are still decoding
-- **Persistent channel config** — database-to-channel assignments saved as `.canscope_ch` JSON and reloaded automatically between sessions
+MDF and CSV content is detected automatically. Database Manager supports per-channel DBC/ARXML assignments, mixed database formats, decode-coverage indicators, and a channel-0 fallback.
 
-### Plot Modes
-- **Normal** — all signals share one Y axis
-- **Multi-Axis** — independent Y axis per signal, all on the same X axis
-- **Stacked** — INCA/CANdb-style lanes, one row per signal with independent Y scaling
 
-### Cursors & Navigation
-- **Dual cursors** — draggable C1 and C2 with live value readout in the signal table
-- **ΔT display** — time delta between C1 and C2 shown in the toolbar
-- **Fit to Window** — rescales X and Y to the full extent of all visible data
-- **Fit Vertical** — rescales Y only to match data in the current X view (X range unchanged)
-- Both fit operations work correctly across all three plot modes including multi-axis floating ViewBoxes
+## Current capabilities
 
-### Signal Table
-- **5-column table** — Visibility ☑ | Signal | Cursor 1 | Cursor 2 | Unit
-- **Signal grouping** — assign signals to named groups; collapse/expand groups with the arrow; toggle group visibility via the checkbox in the same column
-- **Drag-and-drop reorder** — drag signals or use Ctrl+Up / Ctrl+Down
-- **Visibility toggle** — check/uncheck individual signals or an entire group; cursor position and all other signal values remain stable during toggle
-- **Signal name display options** — optionally prefix signal names with channel number and/or message name
+- Fast bulk loading and decoding for BLF, ASC, MDF/MF4, and CSV measurements.
+- Searchable channel/message/signal tree with multi-select plotting and drag-and-drop.
+- Indexed **CAN Trace** viewer for raw frames, filtering, and on-demand signal decode.
+- Formula-based **New Signal** generation with arithmetic, comparisons, and logical expressions; generated definitions are saved in configurations.
+- CSV and Excel (`.xlsx`) export of plotted signals on a shared time axis.
+- JSON configuration save/load for measurement paths, database mapping, generated signals, plotted order, groups, colors, visibility, axes, cursors, and display settings.
+- YAML rule-based diagnostics for expressions, ranges, fault flags, and message loss; optional GitHub Models analysis is available through `Ctrl+Shift+A`.
 
-### Configuration
-- **Save / Load configuration** — fully persists: file paths, channel-DBC mapping, plotted signal list, group assignments, per-signal visibility, signal colors, plot background color, plot mode, cursor state, table column widths, signal name display flags
-- **Undo** — up to 3 levels of undo for plot actions (Ctrl+Z)
+### Plotting
 
-### CAN Trace (Raw Frame Viewer)
-- **On-disk indexed store** — no frame cap; 18 B/frame RAM, 64 B/frame on disk with memory-mapped O(1) access
-- **Sliding window display** — shows 5 000 frames at a time with scroll
-- **Filter by ID and channel** — vectorised numpy mask, no disk access for filtering
-- **On-demand signal decode** — click a frame row to see decoded signals using the per-channel DBC
+- **Stacked** is the default mode and gives each signal its own lane and Y scale.
+- **Normal** overlays signals on one Y axis.
+- **Multi-Axis** groups axes by unit, with an optional individual axis per signal.
+- Dual draggable cursors provide values and delta time.
+- Fit-to-window and vertical-fit work across all plot modes while preserving the relevant view range.
+- Signals can be grouped, reordered by dragging, recolored, hidden, or removed.
+- **Show Data Points** uses adaptive markers and thinner lines.
+- **Hide Line** is enabled only when data points are shown; when ON, it displays points without signal lines.
 
-### Portable Build
-- **Single-folder `.exe`** — no Python installation required on the target machine
-- **Splash screen** — shows loading progress; minimisable, appears in taskbar, responds to Win+D / Show Desktop
-- **Auto-build CI** — GitHub Actions builds and uploads a release ZIP on every `v*.*.*` tag push
+## Install and run
 
----
+### Portable release
 
-## Getting Started
+Download the latest Windows ZIP from [Releases](https://github.com/dinacaran/canscope/releases), extract it, and run `CANScope.exe`. No installer or Python installation is required.
 
-### Run from Source
+### From source
 
-```bash
+```powershell
 git clone https://github.com/dinacaran/canscope.git
 cd canscope
-pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 python app.py
 ```
 
-For MDF bus-logging support (raw CAN frames inside MF4) also install:
-```bash
-pip install canmatrix
-```
+The portable build and CI release build use Python 3.12.
 
-### Download Portable .exe
+## Basic workflow
 
-Go to [Releases](https://github.com/dinacaran/canscope/releases) and download
-the latest `CANScope_vXX.XX.XX_Windows.zip`. Unzip anywhere and run `CANScope.exe` — no installer needed.
+1. Select **Open File** and choose a supported measurement.
+2. If the file contains raw CAN frames, select **Open Database** and configure DBC/ARXML mapping.
+3. Select **Load + Decode**.
+4. Search the signal tree, then double-click, drag, press `Space`, or use the context menu to plot signals.
+5. Use cursors, plot modes, data points, grouping, and fit controls as needed.
+6. Select **Save Config** to preserve the session or **Export** to write CSV/Excel data.
+7. Open **CAN Trace** when the source contains raw CAN frames.
 
----
-
-## Usage
-
-| Step | Action |
-|------|--------|
-| 1 | **Open File** — select `.blf`, `.asc`, `.mf4`, `.mdf`, or `.csv` |
-| 2 | **Open Database** — required for BLF, ASC, and MF4 bus-logged files (`.dbc` or `.arxml`) |
-| 3 | **Database Manager** *(optional)* — assign a different database per CAN channel |
-| 4 | **Load + Decode** — background decode; signal tree populates live |
-| 5 | Double-click or drag a signal to plot it, or select and press Space |
-| 6 | Drag **Cursor 1** to read time and signal value in the table |
-| 7 | Toggle **Cursor 2** to measure ΔT between two points |
-| 8 | Switch between **Normal**, **Multi-Axis**, and **Stacked** plot modes |
-| 9 | **Fit to Window** or **Fit Vertical** to rescale the view |
-| 10 | **Save Config** (Ctrl+S) — persists file paths, database mapping, plotted signals, and all view state |
-| 11 | **Export CSV** to save selected signal data to a time-aligned file |
-| 12 | **CAN Trace** to browse raw CAN frames (BLF / ASC / MF4 bus-log) |
-
-### Keyboard Shortcuts
+## Keyboard shortcuts
 
 | Key | Action |
-|-----|--------|
-| `F` | Fit to Window — rescale X and Y to all data |
-| `V` | Fit Vertical — rescale Y only, keep current X |
-| `Space` | Plot selected signal(s) from the signal tree |
-| `Delete` | Remove selected signal from plot |
-| `Ctrl+Z` | Undo last plot action (up to 3 levels) |
+|---|---|
+| `F` | Fit X and Y to all visible data |
+| `V` | Fit Y to the current X range |
+| `Space` | Plot selected signal-tree entries |
+| `C` | Change the selected signal color |
+| `R` | Toggle both cursors |
+| `Delete` | Remove selected plotted signals |
+| `Ctrl+Z` | Undo the last plot action |
 | `Ctrl+S` | Save configuration |
-| `Ctrl+Up` | Move selected signal up |
-| `Ctrl+Down` | Move selected signal down |
-| `Ctrl+Shift+R` | Open Raw CAN Frame viewer |
+| `Ctrl+Shift+R` | Open CAN Trace |
+| `Ctrl+Shift+-` / `Ctrl+Shift++` | Collapse / expand signal-tree messages |
 
----
 
-## Build Portable .exe
+## Test and build
 
-```bash
-pip install pyinstaller
-pyinstaller CANScope.spec
+```powershell
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
 ```
 
-Output in `dist/CANScope/`. The GitHub Actions workflow (`.github/workflows/build.yml`)
-builds and uploads the ZIP automatically on every tag push matching `v*.*.*`.
+Build the portable application with:
 
----
-
-## Project Structure
-
-```
-canscope/
-├── app.py                        # Entry point, APP_NAME="CAN Scope", APP_VERSION
-├── config/
-│   └── diagnostics/
-│       ├── motor_control.yaml    # Fault rules for motor/inverter domain (user-editable)
-│       └── README.md             # Rule authoring guide
-├── core/
-│   ├── models.py                 # RawFrame, DecodedSignalSample dataclasses
-│   ├── channel_config.py         # ChannelConfig: {channel → DBC or ARXML}, decoder cache, save/load .canscope_ch
-│   ├── load_worker.py            # QThread: CAN-raw / bulk-array / sample-loop decode paths
-│   ├── signal_store.py           # SignalStore, SignalSeries (array.array storage)
-│   ├── raw_frame_store.py        # On-disk indexed store: 18 B/frame RAM + 64 B/frame disk, mmap
-│   ├── dbc_decoder.py            # DBCDecoder with 3-level cache — accepts .dbc and .arxml
-│   ├── vectorized_decoder.py     # Vectorised BLF/ASC decode + cached series refs
-│   ├── blf_reader.py             # BLFReaderService (wraps python-can)
-│   ├── export.py                 # CSV export
-│   ├── readers/
-│   │   ├── __init__.py           # reader_factory() + dbc_required_for() — format detection
-│   │   ├── db_format.py          # SUPPORTED_DB_SUFFIXES, is_database_file(), db_format_label()
-│   │   ├── base.py               # MeasurementReader protocol
-│   │   ├── blf_can_reader.py     # BLF + DBC/ARXML pipeline
-│   │   ├── asc_can_reader.py     # ASC + DBC/ARXML pipeline
-│   │   ├── mdf_reader.py         # MF4/MDF pre-decoded via asammdf + is_bus_logging() probe
-│   │   ├── mdf_can_reader.py     # MDF4 bus logging via python-can MF4Reader + DBC/ARXML
-│   │   └── csv_reader.py         # Wide and narrow CSV
-│   └── diagnostics/              # AI-powered diagnostics engine (Ctrl+Shift+A)
-│       ├── __init__.py
-│       ├── config_loader.py      # YAML domain parser — infers rule type, auto-generates id/title
-│       ├── context.py            # DiagnosticContext — read-only SignalStore adapter for rule processors
-│       ├── engine.py             # DiagnosticEngine — orchestrates rule runs and evidence building
-│       ├── evidence.py           # EvidenceBuilder — reduces large data to <5 KB LLM snippets
-│       ├── models.py             # Finding, Severity, AnalysisResult dataclasses
-│       ├── rules/
-│       │   ├── __init__.py       # RULE_PROCESSORS dispatch table
-│       │   ├── expression.py     # Free-form condition evaluation (>, <, =, !=, and, or)
-│       │   ├── fault_signal.py   # fault_when operator evaluation
-│       │   ├── range_check.py    # min/max boundary check
-│       │   └── message_loss.py   # Gap detection between CAN samples
-│       └── llm/
-│           ├── __init__.py
-│           ├── client.py         # GitHubModelsClient — streaming OpenAI-compatible REST
-│           └── prompts.py        # Analysis and chat follow-up prompt builders
-├── gui/
-│   ├── main_window.py            # MainWindow, toolbar, config save/load, plot_finding()
-│   ├── plot_widget.py            # PlotPanel: normal / multi-axis / stacked, dual cursors, zoom_to_time()
-│   ├── signal_tree.py            # SignalTreeWidget with live search
-│   ├── raw_frame_dialog.py       # Sliding-window CAN Trace (RawFrameStore, no cap)
-│   ├── dbc_manager.py            # Database Manager dialog: per-channel DBC/ARXML, match quality bars
-│   ├── splash.py                 # CANScopeSplash — minimisable, taskbar-visible splash screen
-│   └── diagnostics/              # Diagnostics UI (non-modal window)
-│       ├── activation.py         # Wires Ctrl+Shift+A shortcut in MainWindow
-│       ├── window.py             # DiagnosticsWindow — domain selector, run controls, auto-plot on fault
-│       ├── findings_panel.py     # Left panel — severity-coloured finding list + details pane
-│       ├── chat_panel.py         # Right panel — streaming LLM chat with status label
-│       └── worker.py             # AnalysisWorker / LLMWorker (background thread helpers)
-├── resources/
-│   ├── splashscreen.png          # 1635 × 962 splash image
-│   ├── CANScope_ICON.png         # 1254 × 1254 app icon source
-│   └── app_icon.ico              # Multi-resolution ICO (256/128/64/48/32/16 px)
-├── requirements.txt
-├── CANScope.spec                 # PyInstaller spec, bundles resources/ and config/
-└── .github/workflows/build.yml  # Auto-build on v*.*.* tag push
+```powershell
+.\build_portable.bat
 ```
 
----
+Output is written to `dist\CANScope\`. Pushing a `v*.*.*` tag runs the Windows build workflow and publishes a release ZIP.
 
-## Dependencies
+## Repository layout
 
-| Package | Version | Purpose | License |
-|---------|---------|---------|---------|
-| PySide6 | ≥ 6.7 | GUI framework | LGPL v3 |
-| pyqtgraph | ≥ 0.13 | Interactive plots | MIT |
-| python-can | ≥ 4.6 | BLF / ASC / MF4 bus-log reading | LGPL v3 |
-| cantools | ≥ 39.4 | DBC + ARXML (AUTOSAR 3/4) decoding | MIT |
-| numpy | ≥ 1.26 | Array operations | BSD |
-| asammdf | ≥ 7.0 | MF4 / MDF pre-decoded signals | MIT |
-| canmatrix | any | MF4 bus-log support (optional) | LGPL v3 |
-| pyinstaller | ≥ 6.0 | Portable .exe build | GPL v2 (build-only) |
+```text
+app.py                 Application entry point and version
+core/readers/          BLF, ASC, MDF/MF4, and CSV readers
+core/                  Decode, signal storage, export, and generated-signal logic
+core/diagnostics/      Rule engine and optional AI-assisted diagnostics
+gui/                   Main window, plots, database manager, CAN Trace, diagnostics
+config/diagnostics/    User-editable diagnostic rules and documentation
+resources/             Application icon and splash assets
+tests/                 Pytest regression suite
+```
 
----
+Runtime dependencies are maintained in [requirements.txt](requirements.txt). 
 
-## Code Signing Policy
+## Security and license
 
-⚠️ Release builds are currently unsigned. Windows SmartScreen may show a warning on first run — click **More info → Run anyway**.
+Release binaries are currently unsigned, so Windows SmartScreen may show a warning on first launch.
 
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+CAN Scope is licensed under the [MIT License](LICENSE).
