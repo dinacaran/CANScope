@@ -8,6 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from core.calculated_signals import CalculatedSignalDefinition
@@ -70,6 +71,64 @@ def _wait_for_calculation(window: MainWindow, qapp: QApplication) -> None:
         time.sleep(0.005)
     qapp.processEvents()
     assert window._calc_thread is None
+
+
+def test_stacked_plot_is_enabled_by_default(window):
+    assert window.btn_stacked.isChecked()
+    assert window.plot_panel._stacked_mode
+
+    window.add_signals_to_plot([window.store.all_keys()[0]])
+
+    assert window.plot_panel.view_stack.currentIndex() == 1
+
+
+def test_data_point_toggle_thins_then_restores_curve(window):
+    key = window.store.all_keys()[0]
+    window.add_signals_to_plot([key])
+    window.plot_panel.table.clearSelection()
+    window.plot_panel._refresh_highlight()
+    plotted = window.plot_panel._items[key]
+
+    assert plotted.curve.opts["pen"].widthF() == pytest.approx(2.8)
+
+    window.btn_points.setChecked(True)
+    assert plotted.curve.opts["pen"].widthF() == pytest.approx(1.2)
+    assert window.btn_points.text() == "Hide Data Points"
+
+    window.btn_points.setChecked(False)
+    assert plotted.curve.opts["pen"].widthF() == pytest.approx(2.8)
+    assert window.btn_points.text() == "Show Data Points"
+
+
+def test_hide_line_requires_data_points_and_restores_line(window):
+    key = window.store.all_keys()[0]
+    window.add_signals_to_plot([key])
+    plotted = window.plot_panel._items[key]
+    window.plot_panel._POINTS_VISIBLE_THRESHOLD = 2
+
+    assert not window.btn_hide_line.isEnabled()
+    assert not window.btn_hide_line.isChecked()
+    window.btn_hide_line.setChecked(True)
+    assert not window.btn_hide_line.isChecked()
+
+    window.btn_points.setChecked(True)
+    assert window.btn_hide_line.isEnabled()
+
+    window.btn_hide_line.setChecked(True)
+    assert window.plot_panel._hide_lines
+    assert plotted.curve.opts["pen"].style() == Qt.PenStyle.NoPen
+    assert plotted.scatter is not None
+    point_x, _point_y = plotted.scatter.getData()
+    assert len(point_x) == 2
+    assert window.btn_hide_line.text() == "Hide Line"
+
+    window.btn_points.setChecked(False)
+    assert not window.btn_hide_line.isEnabled()
+    assert not window.btn_hide_line.isChecked()
+    assert not window.plot_panel._hide_lines
+    assert plotted.curve.opts["pen"].style() != Qt.PenStyle.NoPen
+    assert plotted.curve.opts["pen"].widthF() == pytest.approx(2.8)
+    assert window.btn_hide_line.text() == "Hide Line"
 
 
 def test_background_create_is_cached_but_not_auto_plotted(window, qapp):

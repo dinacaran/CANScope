@@ -1,4 +1,12 @@
 # Changelog
+## [v00.00.52] — 2026-07-22: Plot display improvements
+
+### Changed — Stacked plot mode is enabled by default when CANScope opens.
+
+### Changed — Showing data points uses thinner signal lines so markers remain clearly visible; hiding data points restores the normal line thickness.
+
+### Added — "Hide Line" point-only plot mode. The option is available only while data points are enabled, automatically restores lines when points are disabled, and retains a capped marker set when zoomed out so the plot never appears empty.
+
 ## [v00.00.51] — 2026-07-21:new feature "New Signal" signal generation by formula added 
 ## [v00.00.50] — 2026-07-15: Fast load of MDF, BLF,ASC Fast loading CAN trace enabled 
 ## [v00.00.49] — 2026-07-12: build check

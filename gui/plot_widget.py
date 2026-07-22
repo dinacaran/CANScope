@@ -350,6 +350,10 @@ class PlotPanel(QWidget):
     # Debounce for recomputing the visible point slice on X-range changes, so
     # nothing is recomputed during an interactive drag-zoom (ms).
     _POINTS_DEBOUNCE_MS: int = 120
+    _LINE_WIDTH: float = 2.8
+    _SELECTED_LINE_WIDTH: float = 5.0
+    _POINTS_LINE_WIDTH: float = 1.2
+    _SELECTED_POINTS_LINE_WIDTH: float = 2.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -357,6 +361,7 @@ class PlotPanel(QWidget):
         self._current_key: str | None = None
         self._cursor_label_base = 'Cursor: move mouse over plot'
         self._show_points = False
+        self._hide_lines = False
         # Adaptive-point machinery: a single-shot debounce timer coalesces the
         # bursts of sigXRangeChanged emitted during a drag-zoom into one
         # recompute, and _xrange_vb tracks which ViewBox we're currently
@@ -573,6 +578,11 @@ class PlotPanel(QWidget):
         the line.
         """
         self._show_points = bool(show)
+        if not self._show_points:
+            self._hide_lines = False
+        # Keep the data-point markers prominent: use a finer line while they
+        # are displayed, then restore the normal line widths when hidden.
+        self._refresh_highlight()
         # In stacked mode each PlotItem triggers its own repaint when its scene
         # changes.  Suppress individual paint events so all N rows coalesce into
         # one repaint pass when setUpdatesEnabled(True) is restored.
@@ -591,6 +601,16 @@ class PlotPanel(QWidget):
         finally:
             if self._stacked_mode:
                 self.glw.setUpdatesEnabled(True)
+
+    def set_hide_lines(self, hide: bool) -> None:
+        """Hide curve lines only while point markers are enabled."""
+        self._hide_lines = bool(hide and self._show_points)
+        self._refresh_highlight()
+        if self._hide_lines:
+            # Adaptive points are normally omitted when zoomed far out. In
+            # point-only mode refresh them immediately so the plot stays non-empty.
+            self._ensure_scatters()
+            self._update_adaptive_points()
 
     def set_multi_axis(self, enabled: bool) -> None:
         saved_x_range = self._visible_x_range()
@@ -1402,8 +1422,15 @@ class PlotPanel(QWidget):
         """
         if plotted.curve is None:
             return
-        width = 5.0 if selected else 2.8
-        pen   = pg.mkPen(color=plotted.color, width=width)
+        if self._hide_lines:
+            pen = pg.mkPen(None)
+        elif self._show_points:
+            width = (self._SELECTED_POINTS_LINE_WIDTH if selected
+                     else self._POINTS_LINE_WIDTH)
+            pen = pg.mkPen(color=plotted.color, width=width)
+        else:
+            width = self._SELECTED_LINE_WIDTH if selected else self._LINE_WIDTH
+            pen = pg.mkPen(color=plotted.color, width=width)
 
         if set_data:
             # np.asarray on array.array('d') is zero-copy via the buffer
@@ -1519,10 +1546,9 @@ class PlotPanel(QWidget):
 
         For each visible curve we searchsorted the (monotonic) timestamp array
         for the current X range and, if the number of samples in view is at or
-        below the threshold, push just that slice into the scatter; otherwise
-        the scatter is emptied and the curve reads as a line.  The scatter is
-        therefore never handed more than ``_POINTS_VISIBLE_THRESHOLD`` points,
-        regardless of file size.
+        below the threshold, push just that slice into the scatter. Above the
+        threshold markers are normally omitted; in point-only mode a capped,
+        evenly sampled slice is retained so the plot can never appear empty.
         """
         if not self._show_points or not self._items:
             for plotted in self._items.values():
@@ -1549,6 +1575,10 @@ class PlotPanel(QWidget):
             if 0 < count <= thr:
                 vs = np.asarray(plotted.series.values, dtype=np.float64)
                 sc.setData(x=ts[lo:hi], y=vs[lo:hi])
+            elif count > thr and self._hide_lines:
+                vs = np.asarray(plotted.series.values, dtype=np.float64)
+                indices = np.linspace(lo, hi - 1, num=thr, dtype=np.int64)
+                sc.setData(x=ts[indices], y=vs[indices])
             else:
                 # Zoomed out past the threshold (or nothing in view) → line only.
                 sc.setData(x=[], y=[])

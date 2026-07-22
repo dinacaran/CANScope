@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         self.btn_multi_axis.setCheckable(True)
         self.btn_stacked = QPushButton('Stacked')
         self.btn_stacked.setCheckable(True)
+        self.btn_stacked.setChecked(True)  # default plot mode on app startup
         self.btn_cursor1 = QPushButton('Cursor 1')
         self.btn_cursor1.setCheckable(True)
         self.btn_cursor1.setChecked(False)  # OFF by default
@@ -155,7 +156,10 @@ class MainWindow(QMainWindow):
         self.btn_cursor2.setCheckable(True)
         self.btn_points = QPushButton('Show Data Points')
         self.btn_points.setCheckable(True)
-        for btn in (self.btn_fit, self.btn_fit_v, self.btn_remove, self.btn_multi_axis, self.btn_stacked, self.btn_cursor1, self.btn_cursor2, self.btn_points):
+        self.btn_hide_line = QPushButton('Hide Line')
+        self.btn_hide_line.setCheckable(True)
+        self.btn_hide_line.setEnabled(False)
+        for btn in (self.btn_fit, self.btn_fit_v, self.btn_remove, self.btn_multi_axis, self.btn_stacked, self.btn_cursor1, self.btn_cursor2, self.btn_points, self.btn_hide_line):
             button_layout.addWidget(btn)
         button_layout.addStretch(1)
 
@@ -167,6 +171,8 @@ class MainWindow(QMainWindow):
         self.btn_cursor1.toggled.connect(self._toggle_cursor1)
         self.btn_cursor2.toggled.connect(self._toggle_cursor2)
         self.btn_points.toggled.connect(self._toggle_points)
+        self.btn_hide_line.toggled.connect(self._toggle_line)
+        self.plot_panel.set_stacked(self.btn_stacked.isChecked())
 
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
@@ -530,7 +536,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
     def _toggle_points(self, checked: bool) -> None:
         self.plot_panel.set_show_points(checked)
         self.btn_points.setText('Hide Data Points' if checked else 'Show Data Points')
+        if not checked:
+            self.btn_hide_line.setChecked(False)
+        self.btn_hide_line.setEnabled(checked)
         self._update_status('Plot markers updated', 'Continue plotting, fit view, or save configuration')
+
+    def _toggle_line(self, checked: bool) -> None:
+        # The control is enabled only while data points are visible, ensuring
+        # that hiding the line can never leave the plot without a data trace.
+        if checked and not self.btn_points.isChecked():
+            self.btn_hide_line.setChecked(False)
+            return
+        hide_line = bool(checked and self.btn_points.isChecked())
+        self.plot_panel.set_hide_lines(hide_line)
+        self._update_status('Plot line visibility updated', 'Continue plotting, fit view, or save configuration')
 
     def _refresh_generated_signal_tree(self) -> None:
         rows = []
@@ -768,6 +787,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ],
             'generated_signals': self.calculated_signals.to_config(),
             'show_data_points': self.btn_points.isChecked(),
+            'hide_plot_lines': self.btn_hide_line.isChecked(),
             'plot_background_color': self.plot_panel.background_color(),
             'signal_colors': self.plot_panel.series_colors(),
             'multi_axis': self.btn_multi_axis.isChecked(),
@@ -884,11 +904,18 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
         # Apply visual settings regardless of data source
         self.btn_points.setChecked(bool(data.get('show_data_points', False)))
+        self.btn_hide_line.setChecked(
+            bool(data.get('hide_plot_lines', False)) and self.btn_points.isChecked()
+        )
         bg = data.get('plot_background_color')
         if bg:
             self.plot_panel.set_background_color(str(bg))
-        self.btn_multi_axis.setChecked(bool(data.get('multi_axis', False)))
-        self.btn_stacked.setChecked(bool(data.get('stacked', False)))
+        multi_axis = bool(data.get('multi_axis', False))
+        self.btn_multi_axis.setChecked(multi_axis)
+        # Configurations that explicitly saved a plot mode keep it. Older
+        # configurations without a ``stacked`` key use the new app default,
+        # unless they explicitly select multi-axis mode.
+        self.btn_stacked.setChecked(bool(data.get('stacked', not multi_axis)))
         self.btn_cursor1.setChecked(bool(data.get('cursor1', False)))
         self.btn_cursor2.setChecked(bool(data.get('cursor2', False)))
         self.plot_panel._name_show_channel = bool(data.get('name_show_channel', False))
