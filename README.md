@@ -1,6 +1,6 @@
 # CAN Scope
 
-> A portable Windows application for loading automotive measurements, decoding CAN signals, inspecting raw frames, and plotting signal data interactively.
+> A portable Windows application for loading automotive measurements, decoding CAN signals (.mf4, mdf, .blf, .asc,.csv) , inspecting raw frames, and plotting signal data interactively.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
