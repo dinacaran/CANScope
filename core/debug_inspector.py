@@ -22,7 +22,10 @@ import zlib
 
 _MDF4_ID = struct.Struct("<8s8s8s4sH30s2H")
 _MDF4_BLOCK_HEADER = struct.Struct("<4s4sQQ")
+_MDF4_HEADER_ADDRESS = 64
 _MAX_BLOCK_LINKS = 32
+_MAX_RAW_DATA_GROUPS = 64
+_MAX_RAW_CHANNEL_GROUPS = 512
 _MAX_CAN_GROUPS = 16
 _MAX_CHANNEL_LINES = 40
 _PROBE_RECORDS = 3
@@ -196,6 +199,250 @@ def _block_line(header: Mapping[str, object]) -> str:
         f"id={header.get('block_id')} len={header.get('block_len')} "
         f"links={header.get('links_nr')} [{link_text}] "
         f"aligned={'YES' if header.get('aligned') else 'NO'}{extra}"
+    )
+
+
+def _raw_block_problem(
+    header: Mapping[str, object],
+    expected_id: str,
+    minimum_links: int,
+) -> str | None:
+    """Return the first structural problem in a raw MDF4 block header."""
+    if "error" in header:
+        return str(header["error"])
+    if not header.get("aligned"):
+        return "target address is not 8-byte aligned"
+    if header.get("block_id") != expected_id:
+        return (
+            f"expected {expected_id}, found "
+            f"{header.get('block_id') or '(empty block id)'}"
+        )
+    if not header.get("complete"):
+        return (
+            f"block extends outside file "
+            f"(declared length={header.get('block_len')})"
+        )
+
+    links_nr = int(header.get("links_nr", 0) or 0)
+    if links_nr < minimum_links:
+        return (
+            f"{expected_id} declares {links_nr} links; "
+            f"at least {minimum_links} required"
+        )
+    if links_nr > _MAX_BLOCK_LINKS:
+        return str(
+            header.get("links_error")
+            or f"declares too many links ({links_nr})"
+        )
+
+    block_len = int(header.get("block_len", 0) or 0)
+    required_len = _MDF4_BLOCK_HEADER.size + links_nr * 8
+    if block_len < required_len:
+        return (
+            f"declared length {block_len} is shorter than its "
+            f"{links_nr}-entry link table ({required_len} bytes required)"
+        )
+    if len(header.get("links", [])) != links_nr:
+        return str(header.get("links_error") or "incomplete link table")
+    return None
+
+
+def _raw_pointer_line(
+    source_id: str,
+    source_address: int,
+    link_index: int,
+    link_name: str,
+    target_address: int,
+) -> str:
+    return (
+        f"{source_id}.{link_name}: source={_address(source_address)} "
+        f"link[{link_index}] target={_address(target_address)}"
+    )
+
+
+def _inspect_mdf4_hd_dg_cg(
+    path: Path,
+) -> tuple[list[str], str, str]:
+    """Inspect the raw MDF4 HD -> DG -> CG links without using a parser.
+
+    Only the common block headers and the standard link positions needed for
+    this chain are read. Every read is file-bounded, every linked target is
+    type-checked, and cycles plus excessive chains are capped.
+    """
+    file_size = path.stat().st_size
+    lines = [
+        "RAW MDF4 ##HD -> ##DG -> ##CG LINK VALIDATION",
+        (
+            f"  File bounds: 0x0.."
+            f"{max(0, file_size - 1):X} ({file_size:,} bytes)"
+        ),
+        "  Link layout: ##HD[0]=first ##DG; "
+        "##DG[0]=next ##DG, ##DG[1]=first ##CG; "
+        "##CG[0]=next ##CG",
+    ]
+    failures: list[str] = []
+    warnings: list[str] = []
+    data_group_count = 0
+    channel_group_count = 0
+
+    hd = _block_header(path, _MDF4_HEADER_ADDRESS)
+    hd_problem = _raw_block_problem(hd, "##HD", 1)
+    lines.append(f"  ##HD {_block_line(hd)}")
+    if hd_problem:
+        detail = (
+            f"fixed ##HD address {_address(_MDF4_HEADER_ADDRESS)}: "
+            f"{hd_problem}"
+        )
+        lines.append(f"  EXACT STRUCTURAL FAILURE: {detail}")
+        return lines, "FAIL", detail
+
+    first_dg = int(hd["links"][0])
+    lines.append(
+        "  "
+        + _raw_pointer_line(
+            "##HD", _MDF4_HEADER_ADDRESS, 0, "first_dg", first_dg
+        )
+        + (" (END - no data groups)" if not first_dg else "")
+    )
+
+    dg_address = first_dg
+    dg_source_id = "##HD"
+    dg_source_address = _MDF4_HEADER_ADDRESS
+    dg_source_link = 0
+    dg_source_name = "first_dg"
+    seen_dg: set[int] = set()
+    seen_cg_global: set[int] = set()
+
+    while dg_address:
+        pointer = _raw_pointer_line(
+            dg_source_id,
+            dg_source_address,
+            dg_source_link,
+            dg_source_name,
+            dg_address,
+        )
+        if dg_address in seen_dg:
+            detail = f"{pointer}: cycle to an already visited ##DG"
+            lines.append(f"  EXACT CORRUPT POINTER: {detail}")
+            failures.append(detail)
+            break
+        if data_group_count >= _MAX_RAW_DATA_GROUPS:
+            detail = (
+                f"stopped after {_MAX_RAW_DATA_GROUPS} data groups at "
+                f"{pointer}; safety cap reached"
+            )
+            lines.append(f"  WARN {detail}")
+            warnings.append(detail)
+            break
+
+        seen_dg.add(dg_address)
+        dg = _block_header(path, dg_address)
+        dg_problem = _raw_block_problem(dg, "##DG", 2)
+        lines.append(
+            f"  DG[{data_group_count}] target from {pointer}\n"
+            f"    {_block_line(dg)}"
+        )
+        if dg_problem:
+            detail = f"{pointer}: {dg_problem}"
+            lines.append(f"    EXACT CORRUPT POINTER: {detail}")
+            failures.append(detail)
+            break
+
+        data_group_count += 1
+        dg_links = [int(item) for item in dg["links"]]
+        next_dg = dg_links[0]
+        first_cg = dg_links[1]
+        lines.append(
+            "    "
+            + _raw_pointer_line("##DG", dg_address, 1, "first_cg", first_cg)
+            + (" (END - no channel groups)" if not first_cg else "")
+        )
+
+        cg_address = first_cg
+        cg_source_address = dg_address
+        cg_source_id = "##DG"
+        cg_source_link = 1
+        cg_source_name = "first_cg"
+        seen_cg_in_dg: set[int] = set()
+        while cg_address:
+            pointer = _raw_pointer_line(
+                cg_source_id,
+                cg_source_address,
+                cg_source_link,
+                cg_source_name,
+                cg_address,
+            )
+            if cg_address in seen_cg_in_dg:
+                detail = f"{pointer}: cycle to an already visited ##CG"
+                lines.append(f"    EXACT CORRUPT POINTER: {detail}")
+                failures.append(detail)
+                break
+            if cg_address in seen_cg_global:
+                detail = f"{pointer}: ##CG is referenced by multiple data groups"
+                lines.append(f"    EXACT CORRUPT POINTER: {detail}")
+                failures.append(detail)
+                break
+            if channel_group_count >= _MAX_RAW_CHANNEL_GROUPS:
+                detail = (
+                    f"stopped after {_MAX_RAW_CHANNEL_GROUPS} channel groups "
+                    f"at {pointer}; safety cap reached"
+                )
+                lines.append(f"    WARN {detail}")
+                warnings.append(detail)
+                break
+
+            seen_cg_in_dg.add(cg_address)
+            seen_cg_global.add(cg_address)
+            cg = _block_header(path, cg_address)
+            cg_problem = _raw_block_problem(cg, "##CG", 1)
+            lines.append(
+                f"    CG[{channel_group_count}] target from {pointer}\n"
+                f"      {_block_line(cg)}"
+            )
+            if cg_problem:
+                detail = f"{pointer}: {cg_problem}"
+                lines.append(f"      EXACT CORRUPT POINTER: {detail}")
+                failures.append(detail)
+                break
+
+            channel_group_count += 1
+            next_cg = int(cg["links"][0])
+            lines.append(
+                "      "
+                + _raw_pointer_line(
+                    "##CG", cg_address, 0, "next_cg", next_cg
+                )
+                + (" (END)" if not next_cg else "")
+            )
+            cg_source_id = "##CG"
+            cg_source_address = cg_address
+            cg_source_link = 0
+            cg_source_name = "next_cg"
+            cg_address = next_cg
+
+        lines.append(
+            "    "
+            + _raw_pointer_line("##DG", dg_address, 0, "next_dg", next_dg)
+            + (" (END)" if not next_dg else "")
+        )
+        dg_source_id = "##DG"
+        dg_source_address = dg_address
+        dg_source_link = 0
+        dg_source_name = "next_dg"
+        dg_address = next_dg
+
+    lines.append(
+        f"  Raw chain totals: data_groups={data_group_count}, "
+        f"channel_groups={channel_group_count}"
+    )
+    if failures:
+        return lines, "FAIL", failures[0]
+    if warnings:
+        return lines, "WARN", warnings[0]
+    return (
+        lines,
+        "PASS",
+        f"data_groups={data_group_count}, channel_groups={channel_group_count}",
     )
 
 
@@ -763,6 +1010,10 @@ class _Inspection:
             classification = "MDF-VLSD-PAYLOAD"
             layer = "MDF variable-length CAN payload storage"
             dbc_involved = "NO - payload failed before DBC decoding"
+        elif any("Raw MDF4 HD-DG-CG links" in item for item in self.failures):
+            classification = "MDF-RAW-BLOCK-LINK"
+            layer = "MDF4 HD/DG/CG structural links"
+            dbc_involved = "NO - file structure failed before DBC decoding"
         elif self.failures:
             classification = "MDF-STRUCTURE-OR-READER"
             layer = "MDF/CAN measurement loading"
@@ -874,6 +1125,14 @@ def inspect_measurement(
             body.append("  WARN MDF3 detected; MDF4 block-link probe is not applicable.")
             inspection.probe(
                 "Direct MDF4 block links", "WARN", f"MDF version {mdf_version}"
+            )
+        elif mdf_version is not None:
+            raw_lines, raw_status, raw_detail = _inspect_mdf4_hd_dg_cg(path)
+            body.extend([""] + raw_lines)
+            inspection.probe(
+                "Raw MDF4 HD-DG-CG links",
+                raw_status,
+                raw_detail,
             )
     except Exception as exc:
         detail = _exception_text(exc, [path])
