@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt
@@ -16,6 +18,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QButtonGroup,
+    QComboBox,
+    QDoubleSpinBox,
     QSizePolicy,
     QStatusBar,
     QTabWidget,
@@ -32,7 +36,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
 )
 
-from core.export import ExportService
+from core.export import ExportService, ExportTimebase
 from core.calculated_signals import (
     LARGE_OUTPUT_WARNING_POINTS,
     CalculatedSignalDefinition,
@@ -49,6 +53,12 @@ from gui.plot_widget import PlotPanel
 from gui.signal_tree import SignalTreeWidget
 from gui.calculated_signal_dialog import CalculatedSignalDialog, CalculationWorker
 from gui.raw_frame_dialog import RawFrameDialog
+from gui.load_debug_window import LoadDebugWindow, LoadDebugWorker
+from core.debug_inspector import (
+    format_runtime_failure,
+    inspect_databases,
+    inspect_measurement,
+)
 
 
 class MainWindow(QMainWindow):
@@ -92,11 +102,29 @@ class MainWindow(QMainWindow):
         self._pending_plot_groups:  dict[str, str]  = {}
         self._pending_plot_axis_visible: dict[str, bool] = {}
         self._pending_plot_own_axis: dict[str, bool] = {}
+        self._pending_plot_type: str | None = None
+        self._temporary_plot_handoff: dict | None = None
+        self._temporary_plot_config_path = (
+            self._application_root() / 'canscope_temp_plot_config.json'
+        )
         # Store keys plotted by the most recent plot_finding() call — cleared
         # and replaced (not accumulated) on each subsequent finding click.
         self._finding_plot_keys: set[str] = set()
         self._raw_frame_dialog = None
         self._log_file_path = Path(__file__).resolve().parents[1] / 'canscope_dev.log'
+        # Hidden, session-only CAN load forensics (Ctrl+Alt+D).
+        self._debug_mode = False
+        self._debug_window: LoadDebugWindow | None = None
+        self._debug_thread: QThread | None = None
+        self._debug_worker: LoadDebugWorker | None = None
+        self._debug_generation = 0
+        self._debug_active_generation = -1
+        self._debug_active_kind = ''
+        self._debug_pending_inspections: list[
+            tuple[str, int, Callable[[], str]]
+        ] = []
+        self._debug_runtime_lines: list[str] = []
+        self._debug_measurement_summary = ''
 
         self._splash_status('Initialising plot panel...')
         self._build_ui()
@@ -266,7 +294,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.setStatusBar(status_bar)
         self.status_state_label = QLabel('State: Ready')
         self.status_next_step_label = QLabel('Next: Open BLF, then Open Database, then Load + Decode')
+        self.debug_mode_label = QLabel('DEBUG MODE: ON')
+        self.debug_mode_label.setStyleSheet(
+            'color: #ff6060; font-weight: bold; padding-right: 10px;'
+        )
+        self.debug_mode_label.hide()
         self.statusBar().addWidget(self.status_state_label)
+        self.statusBar().addPermanentWidget(self.debug_mode_label)
         self.statusBar().addPermanentWidget(self.status_next_step_label, 1)
         self._sync_panel_toggle_buttons()
 
@@ -310,7 +344,189 @@ QToolButton:pressed { background-color: #1a2a3a; }
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=lambda: self.add_signals_to_plot(self.signal_tree.selected_signal_keys()))
         # Raw Frames hidden from GUI to prevent hang on large files — accessible via shortcut
         QShortcut(QKeySequence('Ctrl+Shift+R'), self, activated=self.show_raw_frames)
+        QShortcut(QKeySequence('Ctrl+Alt+D'), self, activated=self.toggle_debug_mode)
         QShortcut(QKeySequence('Ctrl+Z'), self, activated=self.plot_panel.undo)
+
+    def toggle_debug_mode(self) -> None:
+        """Toggle the hidden, session-only CAN load forensic mode."""
+        self._debug_mode = not self._debug_mode
+        self.debug_mode_label.setVisible(self._debug_mode)
+
+        if self._debug_mode:
+            if self._debug_window is None:
+                self._debug_window = LoadDebugWindow(self)
+                self._debug_window.openMeasurementRequested.connect(
+                    self.choose_blf
+                )
+                self._debug_window.openDatabaseRequested.connect(
+                    self.choose_dbc
+                )
+                self._debug_window.loadDecodeRequested.connect(
+                    lambda: self.load_data()
+                )
+            self._debug_window.showMaximized()
+            self._debug_window.raise_()
+            self._debug_window.activateWindow()
+            self._log('CAN load debug mode enabled (session-only).')
+            self._update_status(
+                'Debug mode enabled',
+                'Open the issue measurement and database; inspection starts automatically',
+            )
+            if self.measurement_path:
+                self._queue_measurement_debug_inspection(
+                    self.measurement_path
+                )
+                if not self.channel_config.is_empty():
+                    self._queue_database_debug_inspection()
+        else:
+            self._debug_generation += 1
+            self._debug_pending_inspections.clear()
+            if self._debug_window is not None:
+                self._debug_window.hide()
+            self._log('CAN load debug mode disabled; normal mode restored.')
+            self._update_status('Normal mode', self._next_step_message())
+
+    def _queue_measurement_debug_inspection(self, path: str) -> None:
+        if not self._debug_mode or self._debug_window is None:
+            return
+        self._debug_generation += 1
+        generation = self._debug_generation
+        self._debug_pending_inspections.clear()
+        self._debug_runtime_lines = []
+        self._debug_measurement_summary = ''
+        self._debug_window.clear_report()
+        self._debug_window.set_busy(
+            f'Inspecting measurement structure: {Path(path).name}'
+        )
+        self._debug_pending_inspections.append((
+            'measurement',
+            generation,
+            lambda path=path, version=self.version: inspect_measurement(
+                path, app_version=version
+            ),
+        ))
+        self._start_next_debug_inspection()
+
+    def _debug_observed_ids(self) -> dict[int, set[int]]:
+        if (
+            self._prescan_cache is not None
+            and self._prescan_cache[0] == self.measurement_path
+        ):
+            return {
+                int(channel): set(frame_ids)
+                for channel, frame_ids in self._prescan_cache[2].items()
+            }
+        return {}
+
+    def _queue_database_debug_inspection(self) -> None:
+        if (
+            not self._debug_mode
+            or self._debug_window is None
+            or self.channel_config.is_empty()
+        ):
+            return
+        generation = self._debug_generation
+        mappings = dict(self.channel_config.channels)
+        observed_ids = self._debug_observed_ids()
+        self._debug_pending_inspections.append((
+            'database',
+            generation,
+            lambda mappings=mappings, observed_ids=observed_ids: inspect_databases(
+                mappings, observed_ids
+            ),
+        ))
+        self._debug_window.set_busy('Inspecting database structure and CAN-ID mapping...')
+        self._start_next_debug_inspection()
+
+    def _start_next_debug_inspection(self) -> None:
+        if self._debug_thread is not None or not self._debug_pending_inspections:
+            return
+        kind, generation, inspector = self._debug_pending_inspections.pop(0)
+        self._debug_active_kind = kind
+        self._debug_active_generation = generation
+        self._debug_thread = QThread(self)
+        self._debug_worker = LoadDebugWorker(kind, inspector)
+        self._debug_worker.moveToThread(self._debug_thread)
+        self._debug_thread.started.connect(self._debug_worker.run)
+        self._debug_worker.completed.connect(
+            self._on_debug_inspection_completed
+        )
+        self._debug_worker.failed.connect(self._on_debug_inspection_failed)
+        self._debug_worker.completed.connect(self._debug_worker.deleteLater)
+        self._debug_worker.failed.connect(self._debug_worker.deleteLater)
+        self._debug_worker.completed.connect(self._debug_thread.quit)
+        self._debug_worker.failed.connect(self._debug_thread.quit)
+        self._debug_thread.finished.connect(self._cleanup_debug_inspection)
+        self._debug_thread.start()
+
+    def _on_debug_inspection_completed(self, kind: str, report: str) -> None:
+        if (
+            not self._debug_mode
+            or self._debug_window is None
+            or self._debug_active_generation != self._debug_generation
+        ):
+            return
+        if kind == 'measurement':
+            self._debug_measurement_summary = '\n'.join(
+                report.splitlines()[:24]
+            )
+            self._debug_window.set_report(report)
+            if self._debug_runtime_lines:
+                self._debug_window.append_report(
+                    '\n'.join(self._debug_runtime_lines)
+                )
+        else:
+            self._debug_window.append_report(report)
+            database_summary = [
+                line for line in report.splitlines()
+                if line.startswith((
+                    'DATABASE:',
+                    '  Assignment:',
+                    '  LOAD ',
+                    '  Messages:',
+                    '  Observed IDs:',
+                    '  Unmatched IDs:',
+                    'DATABASE STATUS:',
+                ))
+            ]
+            self._debug_window.append_report(
+                '\n' + '=' * 100 + '\n'
+                'SCREENSHOT SUMMARY - MEASUREMENT + DATABASE\n'
+                + self._debug_measurement_summary
+                + '\n\nDATABASE SUMMARY\n'
+                + '\n'.join(database_summary[:32])
+            )
+            self._debug_window.set_busy('Database inspection complete.')
+
+    def _on_debug_inspection_failed(self, kind: str, error: str) -> None:
+        if (
+            self._debug_mode
+            and self._debug_window is not None
+            and self._debug_active_generation == self._debug_generation
+        ):
+            self._debug_window.append_report(
+                f'\nDEBUG INSPECTOR INTERNAL FAILURE ({kind})\n{error}'
+            )
+            self._debug_window.set_busy(
+                'Inspector failed internally; the normal loader remains available.'
+            )
+
+    def _cleanup_debug_inspection(self) -> None:
+        self._debug_worker = None
+        if self._debug_thread is not None:
+            self._debug_thread.deleteLater()
+            self._debug_thread = None
+        self._debug_active_kind = ''
+        self._debug_active_generation = -1
+        self._start_next_debug_inspection()
+
+    def _append_debug_runtime(self, message: str) -> None:
+        if not self._debug_mode or self._debug_window is None:
+            return
+        self._debug_runtime_lines.append(message)
+        # If measurement inspection is still running this is visible now and
+        # replayed once after the full report replaces the placeholder.
+        self._debug_window.append_report(message)
 
     def choose_blf(self) -> None:
         """Open any supported measurement file (BLF, ASC, MF4, MDF, CSV)."""
@@ -329,8 +545,14 @@ QToolButton:pressed { background-color: #1a2a3a; }
         )
         if not path:
             return
+        temporary_handoff = (
+            self._capture_temporary_plot_configuration()
+            or self._temporary_plot_handoff
+        )
         self.measurement_path = path
         self.blf_path = path   # keep alias in sync for config
+        self._reset_for_new_measurement()
+        self._temporary_plot_handoff = temporary_handoff
         needs_dbc = dbc_required_for(path)
         self._log(f'Selected measurement file: {path}')
         if not needs_dbc:
@@ -356,6 +578,131 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_action_states()
         self._update_status(
             'Measurement file selected', self._next_step_message()
+        )
+        self._queue_measurement_debug_inspection(path)
+
+    @staticmethod
+    def _application_root() -> Path:
+        """Return the source root, or the packaged executable directory."""
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parents[1]
+
+    def _capture_temporary_plot_configuration(self) -> dict | None:
+        """Persist the current plot-only setup for the next measurement."""
+        keys = self.plot_panel.plotted_keys()
+        if not keys:
+            return None
+
+        if self.btn_stacked.isChecked():
+            plot_type = 'stacked'
+        elif self.btn_multi_axis.isChecked():
+            plot_type = 'multi_axis'
+        else:
+            plot_type = 'normal'
+
+        config = {
+            'type': 'canscope_temporary_plot_config',
+            'version': 1,
+            'plot_type': plot_type,
+            'signals': [
+                {
+                    'key': key,
+                    'color': self.plot_panel._items[key].color,
+                    'visible': self.plot_panel._items[key].visible,
+                    'group': self.plot_panel._items[key].group,
+                    'axis_visible': self.plot_panel._items[key].axis_visible,
+                    'own_axis': self.plot_panel._items[key].own_axis,
+                }
+                for key in keys
+            ],
+        }
+        try:
+            self._temporary_plot_config_path.write_text(
+                json.dumps(config, indent=2),
+                encoding='utf-8',
+            )
+            self._log(
+                f'Saved temporary plot configuration: '
+                f'{self._temporary_plot_config_path}'
+            )
+        except Exception as exc:
+            self._log(f'Temporary plot configuration save warning: {exc}')
+        return config
+
+    def _arm_temporary_plot_handoff(self) -> None:
+        """Queue a captured plot-only configuration for post-decode restore."""
+        data = self._temporary_plot_handoff
+        if not data:
+            return
+
+        signals = [
+            signal for signal in data.get('signals', [])
+            if isinstance(signal, dict) and signal.get('key')
+        ]
+        self._pending_plot_keys = [str(signal['key']) for signal in signals]
+        self._pending_plot_colors = {
+            str(signal['key']): str(signal['color'])
+            for signal in signals if signal.get('color')
+        }
+        self._pending_plot_visible = {
+            str(signal['key']): bool(signal['visible'])
+            for signal in signals if 'visible' in signal
+        }
+        self._pending_plot_groups = {
+            str(signal['key']): str(signal['group'])
+            for signal in signals if signal.get('group')
+        }
+        self._pending_plot_axis_visible = {
+            str(signal['key']): bool(signal['axis_visible'])
+            for signal in signals if 'axis_visible' in signal
+        }
+        self._pending_plot_own_axis = {
+            str(signal['key']): bool(signal['own_axis'])
+            for signal in signals if 'own_axis' in signal
+        }
+        plot_type = str(data.get('plot_type', 'normal'))
+        self._pending_plot_type = (
+            plot_type if plot_type in {'normal', 'multi_axis', 'stacked'}
+            else 'normal'
+        )
+
+    def _apply_pending_plot_type(self) -> None:
+        """Apply a temporary handoff's mutually-exclusive plot mode."""
+        plot_type = self._pending_plot_type
+        if plot_type is None:
+            return
+        if plot_type == 'stacked':
+            self.btn_multi_axis.setChecked(False)
+            self.btn_stacked.setChecked(True)
+        elif plot_type == 'multi_axis':
+            self.btn_stacked.setChecked(False)
+            self.btn_multi_axis.setChecked(True)
+        else:
+            self.btn_stacked.setChecked(False)
+            self.btn_multi_axis.setChecked(False)
+        self._pending_plot_type = None
+
+    def _reset_for_new_measurement(self) -> None:
+        """Remove decoded and plotted state belonging to the previous file."""
+        self.plot_panel.clear_all()
+        self.plot_panel.discard_undo_history()
+        self.signal_tree.set_payload({})
+        self.signal_tree.set_generated_signals([])
+        self.calculated_signals.invalidate_cache()
+        self._calc_queue.clear()
+        self._finding_plot_keys.clear()
+        self._pending_plot_keys = []
+        self._pending_plot_colors = {}
+        self._pending_plot_visible = {}
+        self._pending_plot_groups = {}
+        self._pending_plot_axis_visible = {}
+        self._pending_plot_own_axis = {}
+        self._pending_plot_type = None
+        self.store = None
+        self.diagnostics_box.clear()
+        self._update_measurement_tab(
+            frames='0', decoded='0', samples='0', channels='0'
         )
 
     def _collect_channel_data(
@@ -479,6 +826,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_measurement_tab()
         self._update_action_states()
         self._update_status('Database configured', self._next_step_message())
+        self._queue_database_debug_inspection()
 
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
@@ -825,6 +1173,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
         except Exception as exc:
             QMessageBox.critical(self, 'Load configuration failed', str(exc))
             return
+        # An explicitly loaded configuration takes precedence over the
+        # session-only measurement handoff.
+        self._temporary_plot_handoff = None
+        self._pending_plot_type = None
 
         # measurement_path is the canonical key; blf_path is read as a fallback
         # for configs saved by older CANScope versions.
@@ -989,6 +1341,12 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self.load_data(pending_plot_keys=self._pending_plot_keys)
 
     def load_data(self, pending_plot_keys: list[str] | None = None) -> None:
+        # QAction.triggered emits its checked state.  A normal toolbar click
+        # therefore arrives as ``False`` rather than ``None``; normalize it so
+        # the session handoff is armed.  Explicit configuration loads pass a
+        # real list and remain unchanged.
+        if isinstance(pending_plot_keys, bool):
+            pending_plot_keys = None
         if self._calc_thread is not None:
             QMessageBox.information(
                 self,
@@ -1016,7 +1374,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             if self.channel_config.is_empty():
                 self._update_status('Waiting for input', self._next_step_message())
                 return
-        self._pending_plot_keys = list(pending_plot_keys or [])
+        if pending_plot_keys is None and self._temporary_plot_handoff:
+            self._arm_temporary_plot_handoff()
+        else:
+            self._pending_plot_keys = list(pending_plot_keys or [])
         self.plot_panel.clear_all()
         self.plot_panel.discard_undo_history()
         self.calculated_signals.invalidate_cache()
@@ -1028,6 +1389,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_action_states()
         self._update_measurement_tab(frames='0', decoded='0', samples='0', channels='0')
         self._log(f'Loading: {mpath}')
+        databases = ', '.join(
+            Path(path).name for path in self.channel_config.all_dbc_paths()
+        ) or '(not required)'
+        self._append_debug_runtime(
+            '\n' + '=' * 100 + '\n'
+            'LOAD + DECODE START\n'
+            f'Measurement: {Path(mpath).name}\n'
+            f'Database(s): {databases}'
+        )
         self._update_status('Loading and decoding...', 'Wait for decode to finish, then inspect Diagnostics and plot signals')
         self._thread = QThread(self)
         self._worker = LoadWorker(mpath, self.channel_config if not self.channel_config.is_empty() else None)
@@ -1160,6 +1530,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ('Excel (.xlsx)', 'Excel Files (*.xlsx)', '.xlsx', self._write_export_xlsx),
         ]
 
+    @staticmethod
+    def _format_recurrence(seconds: float | None) -> str:
+        if seconds is None:
+            return 'recurrence unavailable'
+        if seconds < 1e-3:
+            return f'~{seconds * 1e6:g} us'
+        if seconds < 1.0:
+            return f'~{seconds * 1e3:g} ms'
+        return f'~{seconds:g} s'
+
     def export_selected(self) -> None:
         series_items = self.plot_panel.plotted_series()
         if not series_items:
@@ -1167,9 +1547,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             return
 
         formats = self._export_formats()
-        choice = self._ask_export_format(formats)
-        if choice is None:
+        options = self._ask_export_options(formats, series_items)
+        if options is None:
             return
+        choice, timebase = options
         label, file_filter, default_ext, handler = choice
 
         path, _ = QFileDialog.getSaveFileName(
@@ -1181,26 +1562,99 @@ QToolButton:pressed { background-color: #1a2a3a; }
             path += default_ext
 
         try:
-            wrote = handler(series_items, path)
+            wrote = handler(series_items, path, timebase)
         except Exception as exc:
             QMessageBox.critical(self, 'Export failed', str(exc))
             return
         if wrote:
             self._log(f'Exported {label}: {path}')
 
-    def _ask_export_format(self, formats):
-        """Modal format picker (radio list); returns the chosen entry or None."""
+    def _ask_export_options(self, formats, series_items):
+        """Ask for output format and an explicit shared timestamp source."""
         dlg = QDialog(self)
         dlg.setWindowTitle('Export')
         layout = QVBoxLayout(dlg)
+
         layout.addWidget(QLabel('Choose an export format:'))
-        group = QButtonGroup(dlg)
+        format_group = QButtonGroup(dlg)
         for i, (label, *_rest) in enumerate(formats):
             rb = QRadioButton(label, dlg)
             if i == 0:
                 rb.setChecked(True)
-            group.addButton(rb, i)
+            format_group.addButton(rb, i)
             layout.addWidget(rb)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel('Choose the exported timestamp source:'))
+        timebase_group = QButtonGroup(dlg)
+
+        reference_radio = QRadioButton(
+            'Use the exact timestamps of a reference signal', dlg
+        )
+        reference_radio.setChecked(True)
+        timebase_group.addButton(reference_radio, 0)
+        layout.addWidget(reference_radio)
+
+        reference_row = QHBoxLayout()
+        reference_row.addSpacing(22)
+        reference_row.addWidget(QLabel('Reference signal:'))
+        reference_combo = QComboBox(dlg)
+        reference_combo.setMinimumContentsLength(50)
+        reference_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        for series in series_items:
+            recurrence = self._format_recurrence(
+                ExportService.typical_recurrence_seconds(series)
+            )
+            reference_combo.addItem(
+                f'{series.key} — {len(series.timestamps):,} samples, {recurrence}',
+                series.key,
+            )
+        reference_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        reference_row.addWidget(reference_combo, 1)
+        layout.addLayout(reference_row)
+
+        manual_radio = QRadioButton('Use a manual recurrence time', dlg)
+        timebase_group.addButton(manual_radio, 1)
+        layout.addWidget(manual_radio)
+
+        manual_row = QHBoxLayout()
+        manual_row.addSpacing(22)
+        manual_row.addWidget(QLabel('Recurrence time:'))
+        recurrence_value = QDoubleSpinBox(dlg)
+        recurrence_value.setDecimals(6)
+        recurrence_value.setRange(0.001, 1_000_000_000.0)
+        recurrence_value.setValue(10.0)
+        recurrence_value.setKeyboardTracking(False)
+        recurrence_unit = QComboBox(dlg)
+        recurrence_unit.addItem('seconds', 1.0)
+        recurrence_unit.addItem('milliseconds', 1e-3)
+        recurrence_unit.addItem('microseconds', 1e-6)
+        recurrence_unit.setCurrentIndex(1)
+        manual_row.addWidget(recurrence_value)
+        manual_row.addWidget(recurrence_unit)
+        manual_row.addStretch(1)
+        layout.addLayout(manual_row)
+
+        help_text = QLabel(
+            'Other signal values are held at their latest sample on the '
+            'selected timestamp axis.'
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        def update_timebase_controls() -> None:
+            use_reference = reference_radio.isChecked()
+            reference_combo.setEnabled(use_reference)
+            recurrence_value.setEnabled(not use_reference)
+            recurrence_unit.setEnabled(not use_reference)
+
+        reference_radio.toggled.connect(update_timebase_controls)
+        update_timebase_controls()
+
         buttons = QHBoxLayout()
         export_btn = QPushButton('Export')
         cancel_btn = QPushButton('Cancel')
@@ -1210,16 +1664,30 @@ QToolButton:pressed { background-color: #1a2a3a; }
         buttons.addWidget(export_btn)
         buttons.addWidget(cancel_btn)
         layout.addLayout(buttons)
+        dlg.resize(760, dlg.sizeHint().height())
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
-        return formats[group.checkedId()]
+        if reference_radio.isChecked():
+            timebase = ExportTimebase.from_reference_signal(
+                str(reference_combo.currentData())
+            )
+        else:
+            seconds_per_unit = float(recurrence_unit.currentData())
+            timebase = ExportTimebase.from_recurrence(
+                recurrence_value.value() * seconds_per_unit
+            )
+        return formats[format_group.checkedId()], timebase
 
-    def _write_export_csv(self, series_items, path) -> bool:
-        ExportService.export_series_to_csv(series_items, path)
+    def _write_export_csv(self, series_items, path, timebase=None) -> bool:
+        ExportService.export_series_to_csv(
+            series_items, path, timebase=timebase
+        )
         return True
 
-    def _write_export_xlsx(self, series_items, path) -> bool:
-        data_rows = ExportService.count_data_rows(series_items)
+    def _write_export_xlsx(self, series_items, path, timebase=None) -> bool:
+        data_rows = ExportService.count_data_rows(
+            series_items, timebase=timebase
+        )
         max_data_rows = None
         if data_rows + 1 > ExportService.EXCEL_MAX_ROWS:
             cap = ExportService.EXCEL_MAX_ROWS - 1
@@ -1234,7 +1702,12 @@ QToolButton:pressed { background-color: #1a2a3a; }
             if answer != QMessageBox.StandardButton.Ok:
                 return False
             max_data_rows = cap
-        ExportService.export_series_to_excel(series_items, path, max_data_rows=max_data_rows)
+        ExportService.export_series_to_excel(
+            series_items,
+            path,
+            max_data_rows=max_data_rows,
+            timebase=timebase,
+        )
         return True
 
     # ── Shortcuts dialog ──────────────────────────────────────────────────
@@ -1276,6 +1749,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
     def _on_worker_progress(self, message: str) -> None:
         self._log(message)
+        self._append_debug_runtime(f'RUNTIME  {message}')
         self._update_status(message, 'Wait for decode to finish')
 
     def _on_tree_update(self, payload: dict) -> None:
@@ -1303,6 +1777,18 @@ QToolButton:pressed { background-color: #1a2a3a; }
             samples=f'{store.total_samples:,}',
         )
         self._log('Decode finished successfully.')
+        self._append_debug_runtime(
+            '\nLOAD + DECODE RESULT: PASS\n'
+            f'Frames: {store.total_frames:,} | '
+            f'Decoded: {store.decoded_frames:,} | '
+            f'Signals: {len(store.all_keys()):,} | '
+            f'Samples: {store.total_samples:,}'
+        )
+        temporary_handoff_active = (
+            self._temporary_plot_handoff is not None
+            and self._pending_plot_type is not None
+        )
+        self._apply_pending_plot_type()
         if self._pending_plot_keys:
             wanted       = list(self._pending_plot_keys)
             colors       = dict(self._pending_plot_colors)
@@ -1352,10 +1838,20 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._pending_plot_own_axis = {
                 key: value for key, value in own_axis.items() if key in waiting_generated
             }
+        if temporary_handoff_active:
+            self._temporary_plot_handoff = None
         self._update_status('Decode complete', 'Select signal(s) and plot them by double-click, right-click, drag, or Space.')
 
     def _on_worker_failed(self, error_message: str) -> None:
         self._log(f'ERROR: {error_message}')
+        mpath = self.measurement_path or self.blf_path or ''
+        self._append_debug_runtime(
+            format_runtime_failure(error_message, mpath)
+        )
+        if self._debug_mode and self._debug_window is not None:
+            self._debug_window.showMaximized()
+            self._debug_window.raise_()
+            self._debug_window.activateWindow()
         QMessageBox.critical(self, 'Load failed', error_message)
         self._update_status('Load failed', 'Review the log, verify BLF/DBC paths, and try again')
 

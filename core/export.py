@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Sequence
 
@@ -8,10 +9,10 @@ import numpy as np
 
 from core.signal_store import SignalSeries
 
-# The exported table is *wide*: column A is a shared "Time" axis (the union of
-# every signal's sample timestamps) and each following column is one signal,
-# forward-filled onto that axis. Both the CSV and Excel writers consume the same
-# grid + row generator below so the two formats can never diverge.
+# The exported table is *wide*: column A is the selected shared "Time" axis and
+# each following column is one signal, forward-filled onto that axis. Both the
+# CSV and Excel writers consume the same grid + row generator below so the two
+# formats can never diverge.
 
 # Excel worksheets are capped at 1,048,576 rows (including the header row).
 EXCEL_MAX_ROWS = 1_048_576
@@ -26,12 +27,24 @@ _MAX_GRID_POINTS = 5_000_000
 _TIME_HEADER = "Time"
 
 
-def _build_grid(series_items: Sequence[SignalSeries]) -> np.ndarray:
-    """Shared time axis: the sorted union of every signal's timestamps.
+@dataclass(frozen=True, slots=True)
+class ExportTimebase:
+    """Explicit timestamp source selected by the user for an export."""
 
-    Falls back to the densest signal's own timestamps when the union would
-    exceed _MAX_GRID_POINTS, to keep memory bounded on huge measurements.
-    """
+    reference_key: str | None = None
+    recurrence_seconds: float | None = None
+
+    @classmethod
+    def from_reference_signal(cls, key: str) -> "ExportTimebase":
+        return cls(reference_key=key)
+
+    @classmethod
+    def from_recurrence(cls, seconds: float) -> "ExportTimebase":
+        return cls(recurrence_seconds=float(seconds))
+
+
+def _legacy_union_grid(series_items: Sequence[SignalSeries]) -> np.ndarray:
+    """Legacy shared time axis retained for non-GUI API compatibility."""
     grids = [
         s.numpy_timestamps() for s in series_items
         if len(s.timestamps) > 0
@@ -42,6 +55,105 @@ def _build_grid(series_items: Sequence[SignalSeries]) -> np.ndarray:
     if union.size > _MAX_GRID_POINTS:
         return np.asarray(max(grids, key=len), dtype=np.float64)
     return union
+
+
+def _regular_grid(
+    series_items: Sequence[SignalSeries],
+    recurrence_seconds: float,
+    *,
+    max_points: int | None = None,
+) -> np.ndarray:
+    """Regular grid spanning the complete timestamp range of plotted signals."""
+    if not np.isfinite(recurrence_seconds) or recurrence_seconds <= 0:
+        raise ValueError("Manual recurrence time must be greater than zero.")
+
+    non_empty = [
+        s.numpy_timestamps() for s in series_items
+        if len(s.timestamps) > 0
+    ]
+    if not non_empty:
+        return np.empty(0, dtype=np.float64)
+
+    start = min(float(ts[0]) for ts in non_empty)
+    stop = max(float(ts[-1]) for ts in non_empty)
+    if not np.isfinite(start) or not np.isfinite(stop) or stop < start:
+        raise ValueError("Signal timestamps are invalid or not sorted.")
+
+    ratio = (stop - start) / recurrence_seconds
+    rounded_ratio = round(ratio)
+    if np.isclose(ratio, rounded_ratio, rtol=1e-12, atol=1e-12):
+        step_count = int(rounded_ratio)
+    else:
+        step_count = int(np.floor(ratio))
+    point_count = step_count + 1
+    if max_points is not None:
+        point_count = min(point_count, max_points)
+    return start + np.arange(point_count, dtype=np.float64) * recurrence_seconds
+
+
+def _regular_grid_size(
+    series_items: Sequence[SignalSeries],
+    recurrence_seconds: float,
+) -> int:
+    """Count a regular grid without allocating it."""
+    if not np.isfinite(recurrence_seconds) or recurrence_seconds <= 0:
+        raise ValueError("Manual recurrence time must be greater than zero.")
+    non_empty = [
+        s.numpy_timestamps() for s in series_items
+        if len(s.timestamps) > 0
+    ]
+    if not non_empty:
+        return 0
+    start = min(float(ts[0]) for ts in non_empty)
+    stop = max(float(ts[-1]) for ts in non_empty)
+    if not np.isfinite(start) or not np.isfinite(stop) or stop < start:
+        raise ValueError("Signal timestamps are invalid or not sorted.")
+    ratio = (stop - start) / recurrence_seconds
+    rounded_ratio = round(ratio)
+    if np.isclose(ratio, rounded_ratio, rtol=1e-12, atol=1e-12):
+        return int(rounded_ratio) + 1
+    return int(np.floor(ratio)) + 1
+
+
+def _build_grid(
+    series_items: Sequence[SignalSeries],
+    timebase: ExportTimebase | None = None,
+    *,
+    max_points: int | None = None,
+) -> np.ndarray:
+    """Build the selected shared time axis.
+
+    ``None`` retains the original union behavior for callers outside the GUI.
+    GUI exports always provide either a reference signal or manual recurrence.
+    """
+    if timebase is None:
+        return _legacy_union_grid(series_items)
+
+    has_reference = timebase.reference_key is not None
+    has_recurrence = timebase.recurrence_seconds is not None
+    if has_reference == has_recurrence:
+        raise ValueError(
+            "Select exactly one export timestamp source: "
+            "a reference signal or a manual recurrence time."
+        )
+
+    if has_reference:
+        reference = next(
+            (series for series in series_items if series.key == timebase.reference_key),
+            None,
+        )
+        if reference is None:
+            raise ValueError(
+                f"Reference signal is not plotted: {timebase.reference_key}"
+            )
+        grid = np.asarray(reference.numpy_timestamps(), dtype=np.float64)
+        return grid if max_points is None else grid[:max_points]
+
+    return _regular_grid(
+        series_items,
+        float(timebase.recurrence_seconds),
+        max_points=max_points,
+    )
 
 
 def _column_headers(series_items: Sequence[SignalSeries]) -> List[str]:
@@ -121,18 +233,61 @@ class ExportService:
     EXCEL_MAX_ROWS = EXCEL_MAX_ROWS
 
     @staticmethod
-    def count_data_rows(series_items: Sequence[SignalSeries]) -> int:
-        """Number of data rows (header excluded) the wide export will hold.
-
-        Equals the length of the shared time axis. Used by the GUI to decide
-        whether the table exceeds Excel's row limit before writing.
-        """
-        return int(_build_grid(series_items).size)
+    def typical_recurrence_seconds(series: SignalSeries) -> float | None:
+        """Median positive sample interval, for an informative UI label."""
+        timestamps = series.numpy_timestamps()
+        if timestamps.size < 2:
+            return None
+        deltas = np.diff(timestamps)
+        usable = deltas[np.isfinite(deltas) & (deltas > 0)]
+        if usable.size == 0:
+            return None
+        return float(np.median(usable))
 
     @staticmethod
-    def export_series_to_csv(series_items: Sequence[SignalSeries], path: str | Path) -> None:
+    def count_data_rows(
+        series_items: Sequence[SignalSeries],
+        *,
+        timebase: ExportTimebase | None = None,
+    ) -> int:
+        """Number of data rows (header excluded) the wide export will hold.
+
+        Equals the length of the selected time axis. Used by the GUI to decide
+        whether the table exceeds Excel's row limit before writing.
+        """
+        if timebase is not None and timebase.reference_key is not None:
+            reference = next(
+                (
+                    series for series in series_items
+                    if series.key == timebase.reference_key
+                ),
+                None,
+            )
+            if reference is None:
+                raise ValueError(
+                    f"Reference signal is not plotted: {timebase.reference_key}"
+                )
+            if timebase.recurrence_seconds is not None:
+                raise ValueError(
+                    "Select exactly one export timestamp source: "
+                    "a reference signal or a manual recurrence time."
+                )
+            return len(reference.timestamps)
+        if timebase is not None and timebase.recurrence_seconds is not None:
+            return _regular_grid_size(
+                series_items, float(timebase.recurrence_seconds)
+            )
+        return int(_build_grid(series_items, timebase).size)
+
+    @staticmethod
+    def export_series_to_csv(
+        series_items: Sequence[SignalSeries],
+        path: str | Path,
+        *,
+        timebase: ExportTimebase | None = None,
+    ) -> None:
         series_items = list(series_items)
-        grid = _build_grid(series_items)
+        grid = _build_grid(series_items, timebase)
         path = Path(path)
         with path.open("w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
@@ -146,6 +301,7 @@ class ExportService:
         path: str | Path,
         *,
         max_data_rows: int | None = None,
+        timebase: ExportTimebase | None = None,
     ) -> None:
         """Write the same wide, time-aligned table as the CSV export to .xlsx.
 
@@ -159,11 +315,11 @@ class ExportService:
         """
         from openpyxl import Workbook
 
-        series_items = list(series_items)
-        grid = _build_grid(series_items)
-
         hard_cap = EXCEL_MAX_ROWS - 1  # reserve one row for the header
         cap = hard_cap if max_data_rows is None else min(max_data_rows, hard_cap)
+
+        series_items = list(series_items)
+        grid = _build_grid(series_items, timebase, max_points=cap)
 
         path = Path(path)
         wb = Workbook(write_only=True)

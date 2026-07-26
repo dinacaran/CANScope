@@ -1,6 +1,6 @@
 # CAN Scope
 
-> A portable Windows application for loading automotive measurements, decoding CAN signals (.mf4, mdf, .blf, .asc,.csv) , inspecting raw frames, and plotting signal data interactively.
+> A portable Windows application for loading automotive measurements, decoding CAN signals, inspecting raw frames, and plotting signal data interactively.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
@@ -37,7 +37,7 @@ MDF and CSV content is detected automatically. Database Manager supports per-cha
 - Searchable channel/message/signal tree with multi-select plotting and drag-and-drop.
 - Indexed **CAN Trace** viewer for raw frames, filtering, and on-demand signal decode.
 - Formula-based **New Signal** generation with arithmetic, comparisons, and logical expressions; generated definitions are saved in configurations.
-- CSV and Excel (`.xlsx`) export of plotted signals on a shared time axis.
+- CSV and Excel (`.xlsx`) export using a selected signal's timestamps or a manually entered recurrence time.
 - JSON configuration save/load for measurement paths, database mapping, generated signals, plotted order, groups, colors, visibility, axes, cursors, and display settings.
 - YAML rule-based diagnostics for expressions, ranges, fault flags, and message loss; optional GitHub Models analysis is available through `Ctrl+Shift+A`.
 
@@ -78,7 +78,7 @@ The portable build and CI release build use Python 3.12.
 3. Select **Load + Decode**.
 4. Search the signal tree, then double-click, drag, press `Space`, or use the context menu to plot signals.
 5. Use cursors, plot modes, data points, grouping, and fit controls as needed.
-6. Select **Save Config** to preserve the session or **Export** to write CSV/Excel data.
+6. Select **Save Config** to preserve the session or **Export** to choose CSV/Excel and its timestamp source.
 7. Open **CAN Trace** when the source contains raw CAN frames.
 
 ## Keyboard shortcuts
@@ -125,7 +125,7 @@ resources/             Application icon and splash assets
 tests/                 Pytest regression suite
 ```
 
-Runtime dependencies are maintained in [requirements.txt](requirements.txt). 
+Runtime dependencies are maintained in [requirements.txt](requirements.txt).
 
 ## Security and license
 

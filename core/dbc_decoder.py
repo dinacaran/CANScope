@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import inspect
+import xml.etree.ElementTree as ET
 
 import cantools
 from cantools.database.errors import DecodeError
@@ -14,6 +15,193 @@ from core.readers.db_format import db_format_label
 
 class DBCLoadError(RuntimeError):
     pass
+
+
+_NON_UNIQUE_COMPU_SCALE_ERROR_PARTS = (
+    "non-unique child node",
+    "compu-scale",
+    "ought to be unique",
+)
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    """Return exception messages without following the same link twice."""
+    messages: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+    return "\n".join(messages)
+
+
+def _is_non_unique_compu_scale_error(exc: BaseException) -> bool:
+    text = _exception_chain_text(exc).lower()
+    return all(part in text for part in _NON_UNIQUE_COMPU_SCALE_ERROR_PARTS)
+
+
+def _xml_local_name(tag: object) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _direct_xml_children(element: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in element if _xml_local_name(child.tag) == name]
+
+
+def _first_direct_xml_child(
+    element: ET.Element, name: str
+) -> ET.Element | None:
+    return next(iter(_direct_xml_children(element, name)), None)
+
+
+def _has_xml_descendant(element: ET.Element, name: str) -> bool:
+    return any(_xml_local_name(child.tag) == name for child in element.iter())
+
+
+def _prepare_mixed_linear_text_arxml(
+    path: Path,
+) -> tuple[str, list[str]]:
+    """Patch only safely identified mixed LINEAR/text methods in memory."""
+    root = ET.fromstring(path.read_bytes())
+    patched_methods: list[str] = []
+
+    for method in root.iter():
+        if _xml_local_name(method.tag) != "COMPU-METHOD":
+            continue
+
+        category = _first_direct_xml_child(method, "CATEGORY")
+        if category is None or (category.text or "").strip() != "LINEAR":
+            continue
+
+        scale_sets: list[ET.Element] = []
+        for direction in _direct_xml_children(
+            method, "COMPU-INTERNAL-TO-PHYS"
+        ):
+            scale_sets.extend(_direct_xml_children(direction, "COMPU-SCALES"))
+        if len(scale_sets) != 1:
+            continue
+
+        scales = _direct_xml_children(scale_sets[0], "COMPU-SCALE")
+        rational_scales: list[ET.Element] = []
+        text_scales: list[ET.Element] = []
+        safe = len(scales) >= 2
+
+        for scale in scales:
+            has_rational = _has_xml_descendant(
+                scale, "COMPU-RATIONAL-COEFFS"
+            )
+            has_text = _has_xml_descendant(scale, "COMPU-CONST")
+            if has_rational == has_text:
+                safe = False
+                break
+            if has_rational:
+                rational_scales.append(scale)
+            else:
+                # Require a real text value; do not reinterpret other
+                # COMPU-CONST layouts as an enumeration.
+                if not _has_xml_descendant(scale, "VT"):
+                    safe = False
+                    break
+                text_scales.append(scale)
+
+        # cantools supports precisely this layout through
+        # SCALE_LINEAR_AND_TEXTTABLE: one linear scale plus one or more
+        # enumerated point values.
+        if not safe or len(rational_scales) != 1 or not text_scales:
+            continue
+
+        category.text = "SCALE_LINEAR_AND_TEXTTABLE"
+        short_name = _first_direct_xml_child(method, "SHORT-NAME")
+        patched_methods.append(
+            (short_name.text or "").strip()
+            if short_name is not None and short_name.text
+            else "<unnamed>"
+        )
+
+    return ET.tostring(root, encoding="unicode"), patched_methods
+
+
+def load_database_file(
+    path: str | Path,
+    *,
+    strict_first: bool = True,
+) -> tuple[Any, list[str]]:
+    """Load a CAN database, including a narrow in-memory ARXML fallback."""
+    resolved_path = Path(path)
+    if not resolved_path.exists():
+        raise DBCLoadError(f"Database file not found: {resolved_path}")
+
+    load_messages: list[str] = []
+    if strict_first:
+        try:
+            db = cantools.database.load_file(str(resolved_path), strict=True)
+            load_messages.append("Database loaded in strict mode.")
+            return db, load_messages
+        except Exception as strict_exc:
+            load_messages.append(
+                "WARNING: Strict database validation failed. "
+                "Retrying with compatibility mode."
+            )
+            load_messages.append(f"Strict mode details: {strict_exc}")
+
+    try:
+        db = cantools.database.load_file(str(resolved_path), strict=False)
+        load_messages.append("Database loaded in compatibility mode.")
+        return db, load_messages
+    except Exception as compatibility_exc:
+        eligible_error = (
+            resolved_path.suffix.lower() == ".arxml"
+            and _is_non_unique_compu_scale_error(compatibility_exc)
+        )
+        if not eligible_error:
+            raise DBCLoadError(
+                f"Failed to load database file '{resolved_path}': "
+                f"{compatibility_exc}"
+            ) from compatibility_exc
+
+        try:
+            patched_xml, patched_methods = _prepare_mixed_linear_text_arxml(
+                resolved_path
+            )
+        except Exception as fallback_exc:
+            raise DBCLoadError(
+                f"Failed to load database file '{resolved_path}': "
+                f"{compatibility_exc}. Guarded in-memory ARXML compatibility "
+                f"inspection failed: {fallback_exc}"
+            ) from compatibility_exc
+
+        if not patched_methods:
+            raise DBCLoadError(
+                f"Failed to load database file '{resolved_path}': "
+                f"{compatibility_exc}. Guarded in-memory ARXML compatibility "
+                "fallback found no eligible mixed linear/text COMPU-METHOD."
+            ) from compatibility_exc
+
+        try:
+            db = cantools.database.load_string(
+                patched_xml,
+                database_format="arxml",
+                strict=False,
+            )
+        except Exception as fallback_exc:
+            raise DBCLoadError(
+                f"Failed to load database file '{resolved_path}': "
+                f"{compatibility_exc}. Guarded in-memory ARXML compatibility "
+                f"load also failed: {fallback_exc}"
+            ) from compatibility_exc
+
+        method_list = ", ".join(patched_methods)
+        load_messages.append(
+            "WARNING: Applied guarded in-memory ARXML compatibility fallback "
+            "for mixed linear/text COMPU-METHOD."
+        )
+        load_messages.append(f"Adjusted COMPU-METHOD(s): {method_list}")
+        load_messages.append("The original ARXML file was not modified.")
+        load_messages.append("Database loaded in ARXML compatibility mode.")
+        return db, load_messages
 
 
 class DBCDecoder:
@@ -49,24 +237,7 @@ class DBCDecoder:
 
     @staticmethod
     def _load_database(path: Path):
-        if not path.exists():
-            raise DBCLoadError(f"Database file not found: {path}")
-        load_messages: list[str] = []
-        try:
-            db = cantools.database.load_file(str(path), strict=True)
-            load_messages.append("Database loaded in strict mode.")
-            return db, load_messages
-        except Exception as strict_exc:
-            load_messages.append(
-                "WARNING: Strict database validation failed. Retrying with compatibility mode."
-            )
-            load_messages.append(f"Strict mode details: {strict_exc}")
-            try:
-                db = cantools.database.load_file(str(path), strict=False)
-                load_messages.append("Database loaded in compatibility mode.")
-                return db, load_messages
-            except Exception as exc:
-                raise DBCLoadError(f"Failed to load database file '{path}': {exc}") from exc
+        return load_database_file(path)
 
     # ── Index building ────────────────────────────────────────────────────
 

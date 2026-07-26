@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
+from core.dbc_decoder import load_database_file
 
 
 def _j1939_pgn(frame_id: int) -> int | None:
@@ -49,9 +50,9 @@ def _load_database_match_data(
     """Parse match-only DBC metadata once per unchanged database file."""
     # mtime_ns and file_size intentionally participate in the cache key.
     del mtime_ns, file_size
-    import cantools
-
-    db = cantools.database.load_file(resolved_path, strict=False)
+    db, _load_messages = load_database_file(
+        resolved_path, strict_first=False
+    )
     dbc_ids = frozenset(
         int(message.frame_id) & 0x1FFFFFFF for message in db.messages
     )

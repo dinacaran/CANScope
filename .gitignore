@@ -41,6 +41,7 @@ desktop.ini
 # ── CAN Scope runtime files ───────────────────────────────────────────────
 canscope_dev.log
 canscope_config.json
+canscope_temp_plot_config.json
 # ── Diagnostics agent workspace + telemetry ───────────────────────────────
 # Agent-generated candidate rules are a scratch workspace, not source.
 config/diagnostics/generated/*.yaml
