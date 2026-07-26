@@ -9,7 +9,7 @@ Thank you for taking the time to contribute.
 1. **Check existing issues** — your bug or feature may already be tracked.
 2. **Open an issue first** for any non-trivial change so we can discuss the
    approach before you invest time writing code.
-3. For small fixes (typos, one-line bugs) you can submit a PR directly.
+3. For small fixes (typos, one-line bugs) you can submit your proposal
 4. **Check the protected areas below** — if your change touches one, discuss it
    in an issue first. CI will block the PR otherwise.
 
