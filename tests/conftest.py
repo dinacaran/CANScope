@@ -336,30 +336,31 @@ def qapp():
 
 @pytest.fixture(autouse=True)
 def _no_gc_during_qt(request):
-    """Disable the cyclic collector for the duration of any test that
-    touches Qt (detected by transitive dependency on the ``qapp`` fixture),
-    and re-enable it at teardown. Collection itself is left to the *next*
-    Qt test's setup (see ``_gc_collect_before_qt`` below); running gc.collect()
-    inside teardown crashes on pyqtgraph cycles that still hold references
-    to Qt objects torn down by the widget fixture's ``close()``.
+    """Disable the cyclic collector for Qt tests, and leave it disabled
+    for the rest of the session once any Qt test has run.
 
-    Pure-logic tests (no ``qapp`` in fixturenames) are unaffected."""
+    This is stronger than a per-test disable+re-enable, but the softer
+    version does not hold with pyqtgraph on Windows: pyqtgraph items
+    form Python-side cycles that reach through sip/shiboken wrappers to
+    Qt C++ state. Once a PlotPanel's underlying Qt objects have been
+    close()d, ANY subsequent gc.collect() — whether we call it explicitly
+    at teardown or Python auto-triggers it after gc.enable() when the
+    generation-0 threshold is crossed — walks those cycles and touches
+    freed C++ objects, producing a Windows fatal access violation.
+
+    Pure-logic tests (no ``qapp`` in fixturenames) don't touch Qt objects,
+    so their behaviour under gc is unchanged: they run before any Qt
+    test disables the collector, or on runs that don't touch Qt at all,
+    with gc fully enabled and unaffected.
+
+    Cycles from Qt tests are reclaimed at interpreter exit by ordinary
+    reference-count teardown of module globals — no leak beyond session
+    lifetime, which is what we care about for a test run."""
     if "qapp" not in request.fixturenames:
         yield
         return
-    gc.disable()
-    try:
-        yield
-    finally:
-        gc.enable()
-
-
-@pytest.fixture(autouse=True)
-def _gc_collect_before_qt(request):
-    """Collect leftover cycles from the *previous* Qt test before setting
-    up the next one — a safe point where no widget teardown is mid-flight."""
-    if "qapp" in request.fixturenames:
-        gc.collect()
+    if gc.isenabled():
+        gc.disable()
     yield
 
 
@@ -369,10 +370,10 @@ def panel(qapp):
 
     Deliberately does NOT call ``.show()`` — offscreen rendering does not
     require a shown window, and a real top-level window is exactly what
-    triggers OS paint events that race with the collector. Teardown
-    closes the widget, then explicitly deletes the underlying Qt object
-    via shiboken6 so pyqtgraph's Python-side cycles no longer point at
-    live C++ state by the time gc collects them."""
+    triggers OS paint events that race with the collector on Windows.
+    Teardown closes the widget and drains deleteLater; the reference is
+    dropped, but no explicit gc.collect() or shiboken.delete() is issued
+    (both destabilise pyqtgraph's inter-item references)."""
     from gui.plot_widget import PlotPanel
     p = PlotPanel()
     p.resize(900, 500)
@@ -382,10 +383,3 @@ def panel(qapp):
     finally:
         p.close()
         qapp.processEvents()
-        try:
-            from shiboken6 import delete as _shiboken_delete
-            _shiboken_delete(p)
-        except Exception:
-            pass
-        qapp.processEvents()
-        del p
