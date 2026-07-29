@@ -55,7 +55,8 @@ cd canscope
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -r requirements.txt -r requirements-dev.txt
-python tests/install_hooks.py   # runs the test suite before every commit
+tools\install-hooks.bat          # Windows: blocks diagnostics commits + runs tests before every commit
+:: or on macOS/Linux/Git Bash:   tools/install-hooks.sh
 python app.py
 ```
 

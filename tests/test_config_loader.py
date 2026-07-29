@@ -126,6 +126,43 @@ def test_non_list_rules_raises(tmp_path):
         load_one_config(bad)
 
 
+# ── bad expression condition is recorded, not fatal ───────────────────────
+# A single mistyped condition must not skip the whole file (that would be a
+# worse silence). It is recorded on the rule so the engine surfaces it.
+
+def test_bad_condition_records_error_not_skips_file(tmp_path):
+    p = tmp_path / "d.yaml"
+    p.write_text(textwrap.dedent("""\
+        domain: D
+        rules:
+          - id: broken
+            condition: (A - B > 5
+          - id: ok
+            condition: A > 5
+    """))
+    cfg = load_one_config(p)
+    assert [r.id for r in cfg.rules] == ["broken", "ok"]      # both loaded
+    broken = next(r for r in cfg.rules if r.id == "broken")
+    assert broken.condition_error and "position" in broken.condition_error
+    assert broken.source_file == "d.yaml"
+    ok = next(r for r in cfg.rules if r.id == "ok")
+    assert ok.condition_error is None
+    assert ok.source_file == "d.yaml"
+
+
+def test_bad_condition_file_not_dropped(tmp_path):
+    (tmp_path / "d.yaml").write_text(
+        "domain: D\nrules:\n  - id: broken\n    condition: A >\n", encoding="utf-8")
+    domains = load_domain_configs(tmp_path)
+    assert len(domains) == 1
+    assert domains[0].rules[0].condition_error is not None
+
+
+def test_valid_condition_has_no_error(motor_control_yaml_path):
+    cfg = load_one_config(motor_control_yaml_path)
+    assert all(r.condition_error is None for r in cfg.rules)
+
+
 # ── load_domain_configs ───────────────────────────────────────────────────
 
 def test_load_nonexistent_dir_returns_empty(tmp_path):

@@ -1,8 +1,8 @@
 # Changelog
+## [v00.00.54] — 2026-07-27: Update: forensic debug mode added
 ## [v00.00.53] — 2026-07-26: bug fix: .arxml loading failure
 ### changed - auto retrieval of plotted signal without user action
 ### Changed - Debug mode added to investigate measurement and database failures
-
 ## [v00.00.52] — 2026-07-22: Plot display improvements
 
 ### Changed — Stacked plot mode is enabled by default when CANScope opens.

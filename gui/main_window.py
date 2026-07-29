@@ -1894,7 +1894,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         btn_w = max(self.bottom_edge_btn.sizeHint().width(), 36)
         btn_h = self.bottom_edge_btn.height() or 18
         bottom_h = self.bottom_dock.height() if self.bottom_dock.isVisible() else 0
-        y = self.height() - self.statusBar().height() - bottom_h - btn_h - 2
+        y = self.height() - self.statusBar().height() - bottom_h - btn_h + 10
         y = max(80, y)
         x = max(40, (self.width() - btn_w) // 2)
         self.bottom_edge_btn.setGeometry(x, y, btn_w, btn_h)

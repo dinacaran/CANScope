@@ -1,0 +1,10 @@
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Conservative initial rule set: pyflakes (undefined names, unused imports,
+# etc.) plus the pycodestyle checks that flag actual bugs rather than style
+# (E9 syntax errors). Deliberately excludes rules that would mass-rewrite
+# existing code — see the `lint` job in .github/workflows/pr.yml, which
+# reports on this but does not yet block merges.
+select = ["F", "E9"]
