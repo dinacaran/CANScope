@@ -2,22 +2,14 @@ from __future__ import annotations
 
 import array
 import json
-import os
 
 import numpy as np
 import pytest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from core.signal_store import SignalSeries, SignalStore
 from gui.main_window import MainWindow
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
 
 
 def _series(signal_name: str = "OldSignal") -> SignalSeries:

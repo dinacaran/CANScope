@@ -6,10 +6,18 @@ by tests/fixtures/_generate.py and are intentionally not committed to git.
 """
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+# Force Qt to the offscreen platform for the entire test session before any
+# PySide6 import happens. This removes OS-level paint events, which is what
+# lets the cyclic garbage collector free a pyqtgraph C++ item mid-paint on
+# Windows (access violation in AxisItem.paint → boundingRect). setdefault
+# keeps a developer's explicit QT_QPA_PLATFORM (xcb / windows / cocoa) intact.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
@@ -284,3 +292,100 @@ def make_test_domain(name: str = "TestDomain", context_window_s: float = 2.0):
         source_path=Path("test.yaml"),
         context_window_s=context_window_s,
     )
+
+
+# ── Qt / GUI test harness ─────────────────────────────────────────────────
+#
+# Shared across every GUI test. Anything that needs a QApplication just
+# requests the ``qapp`` fixture; that in turn triggers the GC guard below.
+# The offscreen QT_QPA_PLATFORM is set at the top of this file, before Qt
+# is imported anywhere.
+#
+# GC guard: pyqtgraph holds C++ items via Python wrappers. During a paint
+# event on Windows, Python's cyclic collector can free a graphics item
+# while Qt is still walking it (AxisItem.paint → boundingRect), yielding
+# an access violation. Disabling gc for the duration of a Qt test and
+# collecting only at teardown — after close() + processEvents() has
+# drained deleteLater — keeps the collector out of any paint call.
+
+def _qt_available() -> bool:
+    """True iff we can construct (or find) a QApplication under the
+    currently-selected Qt platform plugin. Never raises."""
+    try:
+        from PySide6.QtWidgets import QApplication
+    except Exception:
+        return False
+    try:
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        return app is not None
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """Session-scoped QApplication. Skips the test if Qt is unavailable
+    so pure-logic tests remain runnable on any machine."""
+    if not _qt_available():
+        pytest.skip("No Qt platform plugin available — skipping GUI test")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    yield app
+    # Do not quit() the app here — session-scoped, tests may still hold refs.
+
+
+@pytest.fixture(autouse=True)
+def _no_gc_during_qt(request):
+    """Disable the cyclic collector for the duration of any test that
+    touches Qt (detected by transitive dependency on the ``qapp`` fixture),
+    and re-enable it at teardown. Collection itself is left to the *next*
+    Qt test's setup (see ``_gc_collect_before_qt`` below); running gc.collect()
+    inside teardown crashes on pyqtgraph cycles that still hold references
+    to Qt objects torn down by the widget fixture's ``close()``.
+
+    Pure-logic tests (no ``qapp`` in fixturenames) are unaffected."""
+    if "qapp" not in request.fixturenames:
+        yield
+        return
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def _gc_collect_before_qt(request):
+    """Collect leftover cycles from the *previous* Qt test before setting
+    up the next one — a safe point where no widget teardown is mid-flight."""
+    if "qapp" in request.fixturenames:
+        gc.collect()
+    yield
+
+
+@pytest.fixture()
+def panel(qapp):
+    """Shared PlotPanel fixture for GUI tests.
+
+    Deliberately does NOT call ``.show()`` — offscreen rendering does not
+    require a shown window, and a real top-level window is exactly what
+    triggers OS paint events that race with the collector. Teardown
+    closes the widget, then explicitly deletes the underlying Qt object
+    via shiboken6 so pyqtgraph's Python-side cycles no longer point at
+    live C++ state by the time gc collects them."""
+    from gui.plot_widget import PlotPanel
+    p = PlotPanel()
+    p.resize(900, 500)
+    qapp.processEvents()
+    try:
+        yield p
+    finally:
+        p.close()
+        qapp.processEvents()
+        try:
+            from shiboken6 import delete as _shiboken_delete
+            _shiboken_delete(p)
+        except Exception:
+            pass
+        qapp.processEvents()
+        del p

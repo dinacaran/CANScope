@@ -1,59 +1,13 @@
 """
 Test that adding/removing signals in PlotPanel does not reset the view range.
 
-These tests require a Qt platform plugin. On headless CI set
-QT_QPA_PLATFORM=offscreen before running. If no display is found the
-tests are skipped rather than erroring out.
+The ``qapp`` and ``panel`` fixtures come from tests/conftest.py, which also
+forces the offscreen Qt platform and guards the cyclic GC around Qt paints.
 """
 from __future__ import annotations
 
-import os
-import sys
 import pytest
 import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Skip machinery — skip the whole module if Qt cannot open a display
-# ---------------------------------------------------------------------------
-
-def _qt_available() -> bool:
-    # Force offscreen when no display is set (CI / headless)
-    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    try:
-        from PySide6.QtWidgets import QApplication
-        app = QApplication.instance() or QApplication(sys.argv[:1])
-        return app is not None
-    except Exception:
-        return False
-
-
-if not _qt_available():
-    pytest.skip("No Qt display available — skipping GUI tests", allow_module_level=True)
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def qapp():
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    return app
-
-
-@pytest.fixture()
-def panel(qapp):
-    from gui.plot_widget import PlotPanel
-    p = PlotPanel()
-    p.resize(800, 400)
-    p.show()
-    qapp.processEvents()
-    yield p
-    p.close()
-    qapp.processEvents()
 
 
 def _make_series(n: int = 100, signal_name: str = "Sig", unit: str = "") -> object:

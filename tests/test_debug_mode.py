@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-import os
-
 import pytest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from gui.main_window import MainWindow
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
 
 
 def _wait_for_debug_worker(window: MainWindow, qapp: QApplication) -> None:

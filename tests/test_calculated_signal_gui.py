@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import array
-import os
 import time
 
 import pytest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -44,11 +41,6 @@ def _series(name: str, values) -> SignalSeries:
         timestamps=array.array("d", [0.0, 1.0, 2.0]),
         values=array.array("d", values),
     )
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
 
 
 @pytest.fixture()
