@@ -1,4 +1,34 @@
 # Changelog
+
+## [Unreleased]
+
+### Added — Calculated signals can be used as inputs to other calculated signals.
+
+The New Signal picker now lists generated signals alongside measurement signals
+in two sections, so a formula can reference a signal you already created.
+Chains are resolved in dependency order by the existing single calculation
+worker: referencing a generated signal that has not been computed yet queues it
+first. Circular references are rejected with the offending path (for example
+`Circular reference: A -> B -> A`), editing a signal invalidates and refreshes
+whatever depends on it, and deleting one is blocked while other signals still
+reference it.
+
+### Added — Save and load formulas in the New Signal dialog.
+
+Formulas can be written to a library file and loaded back, including into a
+different measurement.
+
+### Changed — The diagnostics feature is no longer part of this repository.
+
+Its source, config and tests are untracked here going forward; existing history
+is unchanged. The Ctrl+Shift+A shortcut is inert in this build, and the import
+is guarded so the application starts normally without the package.
+
+### Fixed — `.gitignore` no longer excludes the whole `config/` directory.
+
+A bare `config/` rule meant any new file under `config/` silently failed to
+stage. The rule now covers `config/diagnostics/` only.
+
 ## [v00.00.54] — 2026-07-27: Update: forensic debug mode added
 ## [v00.00.53] — 2026-07-26: bug fix: .arxml loading failure
 ### changed - auto retrieval of plotted signal without user action
