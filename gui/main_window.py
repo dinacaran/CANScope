@@ -140,8 +140,13 @@ class MainWindow(QMainWindow):
 
         # Hidden diagnostics feature — Ctrl+Shift+A. No menu/toolbar entry.
         # Disable with env var CANSCOPE_DIAGNOSTICS=0.
-        from gui.diagnostics.activation import install_shortcut
-        install_shortcut(self)
+        # The package is not part of this repo, so a build without it must still start.
+        try:
+            from gui.diagnostics.activation import install_shortcut
+        except ImportError:
+            pass
+        else:
+            install_shortcut(self)
 
         self._log(f'{self.app_name} {self.version} started.')
         self._log(f'Dev log file: {self._log_file_path}')

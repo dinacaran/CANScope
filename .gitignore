@@ -4,12 +4,17 @@
 *.log
 docs_int/
 claude.md
-config/diagnostics/
-config/
-core/diagnostics/
-core/diagnostics
 docs/Internals/
+
+# ── Diagnostics feature — developed in the private repo only ──────────────
+core/diagnostics/
 gui/diagnostics/
+config/diagnostics/
+tests/test_config_loader.py
+tests/test_engine.py
+tests/test_evidence.py
+tests/test_reload_and_run.py
+tests/test_rules.py
 
 # ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
@@ -48,11 +53,6 @@ desktop.ini
 canscope_dev.log
 canscope_config.json
 canscope_temp_plot_config.json
-# ── Diagnostics agent workspace + telemetry ───────────────────────────────
-# Agent-generated candidate rules are a scratch workspace, not source.
-config/diagnostics/generated/*.yaml
-config/diagnostics/generated/*.yml
-!config/diagnostics/generated/.gitkeep
 # Per-run diagnostic telemetry JSON (logs/diagnostics/ is created at runtime).
 logs/
 *.blf
@@ -82,6 +82,3 @@ secrets.json
 *.xlsx
 *.csv
 AGENTS.md
-
-
-/core/diagnostics

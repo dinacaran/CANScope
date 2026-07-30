@@ -280,8 +280,15 @@ def make_store_with_named_signals(
 # ── Minimal DomainConfig for unit tests ───────────────────────────────────
 
 def make_test_domain(name: str = "TestDomain", context_window_s: float = 2.0):
-    """Create a minimal DomainConfig with empty signal_map for rule processor tests."""
-    from core.diagnostics.config_loader import DomainConfig
+    """Create a minimal DomainConfig with empty signal_map for rule processor tests.
+
+    The diagnostics package is developed in the private repo and is absent here,
+    so callers skip rather than error.
+    """
+    try:
+        from core.diagnostics.config_loader import DomainConfig
+    except ImportError:
+        pytest.skip("diagnostics package is not part of this repository")
     from pathlib import Path
 
     return DomainConfig(
