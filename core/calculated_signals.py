@@ -97,6 +97,11 @@ def validate_name(name: str) -> str:
     return cleaned
 
 
+def formula_references(formula: str) -> list[str]:
+    """Backtick-delimited keys in a formula, even one that does not parse yet."""
+    return [match.strip() for match in _REFERENCE_RE.findall(formula)]
+
+
 def parse_formula(
     formula: str,
     available_keys: Iterable[str] | None = None,
@@ -309,12 +314,107 @@ class CalculatedSignalManager:
             if key != except_key and definition.name.casefold() == cleaned.casefold():
                 raise CalculatedSignalError(f"A generated signal named '{cleaned}' already exists")
 
+    def _generated_references(
+        self,
+        definition: CalculatedSignalDefinition,
+        known: Mapping[str, CalculatedSignalDefinition],
+    ) -> list[str]:
+        try:
+            parsed = parse_formula(definition.formula)
+        except CalculatedSignalError:
+            return []
+        references: list[str] = []
+        for key in parsed.references:
+            if key in known and key not in references:
+                references.append(key)
+        return references
+
+    def dependencies_of(self, key: str) -> list[str]:
+        """Generated signals this one reads directly; measurement inputs are excluded."""
+        definition = self._definitions.get(key)
+        if definition is None:
+            return []
+        return self._generated_references(definition, self._definitions)
+
+    def dependents_of(self, key: str, transitive: bool = True) -> list[str]:
+        direct = [
+            other
+            for other in self._definitions
+            if other != key and key in self.dependencies_of(other)
+        ]
+        if not transitive:
+            return direct
+        found: list[str] = []
+        pending = list(direct)
+        while pending:
+            current = pending.pop(0)
+            if current in found:
+                continue
+            found.append(current)
+            pending.extend(self.dependents_of(current, transitive=False))
+        return found
+
+    def resolution_order(self, key: str) -> list[str]:
+        """Generated signals to compute before `key`, dependencies first and `key` last."""
+        order: list[str] = []
+        visiting: set[str] = set()
+
+        def visit(current: str) -> None:
+            if current in order or current in visiting:
+                return
+            visiting.add(current)
+            for dependency in self.dependencies_of(current):
+                visit(dependency)
+            visiting.discard(current)
+            order.append(current)
+
+        if key in self._definitions:
+            visit(key)
+        return order
+
+    def detect_cycle(self, definition: CalculatedSignalDefinition) -> list[str] | None:
+        """Cycle path (keys, start repeated at the end) that committing this would create."""
+        candidate = dict(self._definitions)
+        candidate[definition.key] = definition
+        path: list[str] = []
+        on_path: set[str] = set()
+        settled: set[str] = set()
+
+        def visit(current: str) -> list[str] | None:
+            if current in on_path:
+                return path[path.index(current):] + [current]
+            if current in settled:
+                return None
+            path.append(current)
+            on_path.add(current)
+            for dependency in self._generated_references(candidate[current], candidate):
+                cycle = visit(dependency)
+                if cycle is not None:
+                    return cycle
+            path.pop()
+            on_path.discard(current)
+            settled.add(current)
+            return None
+
+        return visit(definition.key)
+
+    def _cycle_name(self, key: str) -> str:
+        known = self._definitions.get(key)
+        return known.name if known is not None else key.rsplit("::", 1)[-1]
+
     def commit(
         self,
         definition: CalculatedSignalDefinition,
         series: SignalSeries | None = None,
     ) -> None:
         self.assert_unique_name(definition.name, except_key=definition.key)
+        cycle = self.detect_cycle(definition)
+        if cycle is not None:
+            names = [
+                definition.name if key == definition.key else self._cycle_name(key)
+                for key in cycle
+            ]
+            raise CalculatedSignalError(f"Circular reference: {' -> '.join(names)}")
         self._definitions[definition.key] = definition
         if series is None:
             self._cache.pop(definition.key, None)
@@ -327,6 +427,9 @@ class CalculatedSignalManager:
 
     def invalidate_cache(self) -> None:
         self._cache.clear()
+
+    def invalidate_series(self, key: str) -> None:
+        self._cache.pop(key, None)
 
     def _key_for_name(self, name: str) -> str | None:
         cleaned = name.casefold()
@@ -361,6 +464,8 @@ class CalculatedSignalManager:
             cleaned = CalculatedSignalDefinition(
                 name=name, formula=definition.formula, unit=definition.unit
             )
+            replaced = self._definitions.get(existing_key) if existing_key else None
+            replaced_series = self._cache.get(existing_key) if existing_key else None
             try:
                 if existing_key is not None:
                     self._cache.pop(existing_key, None)
@@ -368,6 +473,11 @@ class CalculatedSignalManager:
                 self.commit(cleaned)
                 imported.append(name)
             except CalculatedSignalError as exc:
+                # Put the original back: a rejected replacement must not delete it.
+                if replaced is not None:
+                    self._definitions[existing_key] = replaced
+                    if replaced_series is not None:
+                        self._cache[existing_key] = replaced_series
                 errors.append(str(exc))
         return ImportReport(imported=imported, skipped=skipped, errors=errors)
 

@@ -211,6 +211,141 @@ def test_import_definitions_collects_per_entry_errors_without_aborting(sources):
     assert len(report.errors) == 1
 
 
+def _generated(name: str) -> str:
+    return f"`CH?::Generate Signals::{name}`"
+
+
+@pytest.fixture()
+def chained():
+    manager = CalculatedSignalManager()
+    a = CalculatedSignalDefinition("A", "`CH1::Message::A` * 2")
+    b = CalculatedSignalDefinition("B", f"{_generated('A')} + 1")
+    c = CalculatedSignalDefinition("C", f"{_generated('B')} / 2")
+    for definition in (a, b, c):
+        manager.commit(definition)
+    return manager, a, b, c
+
+
+def test_dependencies_of_lists_only_generated_inputs(chained):
+    manager, a, b, c = chained
+
+    assert manager.dependencies_of(a.key) == []
+    assert manager.dependencies_of(b.key) == [a.key]
+    assert manager.dependencies_of(c.key) == [b.key]
+    assert manager.dependencies_of("CH?::Generate Signals::Unknown") == []
+
+
+def test_dependents_of_direct_and_transitive(chained):
+    manager, a, b, c = chained
+
+    assert manager.dependents_of(a.key, transitive=False) == [b.key]
+    assert manager.dependents_of(a.key) == [b.key, c.key]
+    assert manager.dependents_of(c.key) == []
+
+
+def test_resolution_order_places_dependencies_first(chained):
+    manager, a, b, c = chained
+
+    assert manager.resolution_order(c.key) == [a.key, b.key, c.key]
+    assert manager.resolution_order(a.key) == [a.key]
+
+
+def test_resolution_order_visits_a_diamond_dependency_once():
+    manager = CalculatedSignalManager()
+    c = CalculatedSignalDefinition("C", "`CH1::Message::A` * 2")
+    a = CalculatedSignalDefinition("A", f"{_generated('C')} + 1")
+    b = CalculatedSignalDefinition("B", f"{_generated('C')} - 1")
+    d = CalculatedSignalDefinition("D", f"{_generated('A')} + {_generated('B')}")
+    for definition in (c, a, b, d):
+        manager.commit(definition)
+
+    order = manager.resolution_order(d.key)
+
+    assert order.count(c.key) == 1
+    assert order[0] == c.key
+    assert order[-1] == d.key
+    assert sorted(order[1:3]) == sorted([a.key, b.key])
+
+
+def test_commit_rejects_self_reference():
+    manager = CalculatedSignalManager()
+
+    with pytest.raises(CalculatedSignalError, match="Circular reference: Loop -> Loop"):
+        manager.commit(CalculatedSignalDefinition("Loop", f"{_generated('Loop')} + 1"))
+
+
+def test_commit_rejects_direct_cycle():
+    manager = CalculatedSignalManager()
+    manager.commit(CalculatedSignalDefinition("A", f"{_generated('B')} + 1"))
+
+    with pytest.raises(CalculatedSignalError, match="Circular reference: B -> A -> B"):
+        manager.commit(CalculatedSignalDefinition("B", f"{_generated('A')} + 1"))
+
+    assert manager.definition("CH?::Generate Signals::B") is None
+
+
+def test_commit_rejects_indirect_cycle():
+    manager = CalculatedSignalManager()
+    manager.commit(CalculatedSignalDefinition("A", f"{_generated('C')} + 1"))
+    manager.commit(CalculatedSignalDefinition("B", f"{_generated('A')} + 1"))
+
+    with pytest.raises(CalculatedSignalError, match="Circular reference"):
+        manager.commit(CalculatedSignalDefinition("C", f"{_generated('B')} + 1"))
+
+
+def test_replace_definitions_reports_the_cyclic_entry_and_keeps_the_rest():
+    manager = CalculatedSignalManager()
+
+    errors = manager.replace_definitions([
+        {"name": "A", "formula": f"{_generated('B')} + 1", "unit": ""},
+        {"name": "B", "formula": f"{_generated('A')} + 1", "unit": ""},
+        {"name": "Plain", "formula": "`CH1::Message::A` + 1", "unit": ""},
+    ])
+
+    assert len(errors) == 1
+    assert "Circular reference" in errors[0]
+    assert [definition.name for definition in manager.definitions()] == ["A", "Plain"]
+
+
+def test_rejected_overwrite_keeps_the_original_definition(sources):
+    manager = CalculatedSignalManager()
+    original = CalculatedSignalDefinition("A", "`CH1::Message::A` * 2")
+    manager.commit(original, calculate_series(original, sources))
+    manager.commit(CalculatedSignalDefinition("B", f"{_generated('A')} + 1"))
+
+    report = manager.import_definitions(
+        [CalculatedSignalDefinition("A", f"{_generated('B')} + 1")], overwrite=True
+    )
+
+    assert report.imported == []
+    assert len(report.errors) == 1
+    assert manager.definition(original.key) == original
+    assert manager.cached_series(original.key) is not None
+
+
+def test_invalidate_series_drops_only_the_named_cache_entry(sources):
+    manager = CalculatedSignalManager()
+    a = CalculatedSignalDefinition("A", "`CH1::Message::A` * 2")
+    b = CalculatedSignalDefinition("B", "`CH1::Message::B` * 2")
+    manager.commit(a, calculate_series(a, sources))
+    manager.commit(b, calculate_series(b, sources))
+
+    manager.invalidate_series(a.key)
+
+    assert manager.cached_series(a.key) is None
+    assert manager.cached_series(b.key) is not None
+
+
+def test_chained_definition_calculates_from_a_cached_generated_series(sources):
+    a = CalculatedSignalDefinition("A", "`CH1::Message::A` * 2")
+    a_series = calculate_series(a, sources)
+    b = CalculatedSignalDefinition("B", f"{_generated('A')} + 1")
+
+    result = calculate_series(b, {a.key: a_series})
+
+    np.testing.assert_allclose(result.numpy_values(), [5.0, 9.0, 17.0])
+
+
 def test_invalid_config_definition_is_skipped():
     manager = CalculatedSignalManager()
     errors = manager.replace_definitions([

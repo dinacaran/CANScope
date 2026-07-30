@@ -308,6 +308,203 @@ def test_help_button_displays_formula_examples(qapp):
         dialog.close()
 
 
+def _picker_rows(dialog: CalculatedSignalDialog) -> list[tuple[str, bool, bool]]:
+    """(text, is_header, hidden) for every row of the signal picker."""
+    rows = []
+    for index in range(dialog.signal_list.count()):
+        item = dialog.signal_list.item(index)
+        is_header = item.data(Qt.ItemDataRole.UserRole) is None
+        rows.append((item.text(), is_header, item.isHidden()))
+    return rows
+
+
+def test_picker_lists_measurement_and_generated_sections(qapp):
+    measurement_key = "CH1::Message::A"
+    generated_key = "CH?::Generate Signals::Scaled"
+    dialog = CalculatedSignalDialog([measurement_key], generated_keys=[generated_key])
+    try:
+        rows = _picker_rows(dialog)
+
+        assert rows == [
+            ("Measurement signals", True, False),
+            (measurement_key, False, False),
+            ("Generated signals", True, False),
+            (generated_key, False, False),
+        ]
+        headers = [
+            dialog.signal_list.item(index)
+            for index in range(dialog.signal_list.count())
+            if dialog.signal_list.item(index).data(Qt.ItemDataRole.UserRole) is None
+        ]
+        assert all(header.flags() == Qt.ItemFlag.NoItemFlags for header in headers)
+    finally:
+        dialog.close()
+
+
+def test_picker_hides_the_generated_header_when_there_are_none(qapp):
+    dialog = CalculatedSignalDialog(["CH1::Message::A"])
+    try:
+        assert ("Generated signals", True, True) in _picker_rows(dialog)
+    finally:
+        dialog.close()
+
+
+def test_excluded_keys_are_absent_from_the_picker_in_edit_mode(qapp):
+    own_key = "CH?::Generate Signals::Own"
+    dependent_key = "CH?::Generate Signals::Dependent"
+    other_key = "CH?::Generate Signals::Other"
+    existing = CalculatedSignalDefinition("Own", "`CH1::Message::A` + 1")
+    dialog = CalculatedSignalDialog(
+        ["CH1::Message::A"],
+        existing=existing,
+        generated_keys=[own_key, dependent_key, other_key],
+        excluded_keys={own_key, dependent_key},
+    )
+    try:
+        texts = [text for text, is_header, _hidden in _picker_rows(dialog) if not is_header]
+
+        assert own_key not in texts
+        assert dependent_key not in texts
+        assert other_key in texts
+    finally:
+        dialog.close()
+
+
+def test_validation_accepts_a_generated_signal_reference(qapp):
+    generated_key = "CH?::Generate Signals::Scaled"
+    dialog = CalculatedSignalDialog(["CH1::Message::A"], generated_keys=[generated_key])
+    try:
+        dialog.name_edit.setText("Chained")
+        dialog.formula_edit.setPlainText(f"`{generated_key}` + 1")
+
+        assert dialog.save_button.isEnabled()
+        assert "valid" in dialog.validation_label.text().lower()
+    finally:
+        dialog.close()
+
+
+def test_validation_rejects_an_excluded_reference_as_circular(qapp):
+    own_key = "CH?::Generate Signals::Own"
+    existing = CalculatedSignalDefinition("Own", "`CH1::Message::A` + 1")
+    dialog = CalculatedSignalDialog(
+        ["CH1::Message::A"],
+        existing=existing,
+        generated_keys=[own_key],
+        excluded_keys={own_key},
+    )
+    try:
+        dialog.formula_edit.setPlainText(f"`{own_key}` + 1")
+
+        assert not dialog.save_button.isEnabled()
+        assert "circular reference" in dialog.validation_label.text().lower()
+    finally:
+        dialog.close()
+
+
+def test_search_filters_both_sections_and_hides_empty_headers(qapp):
+    measurement_key = "CH1::Message::Speed"
+    generated_key = "CH?::Generate Signals::ScaledSpeed"
+    dialog = CalculatedSignalDialog([measurement_key], generated_keys=[generated_key])
+    try:
+        dialog.search_edit.setText("speed")
+        assert _picker_rows(dialog) == [
+            ("Measurement signals", True, False),
+            (measurement_key, False, False),
+            ("Generated signals", True, False),
+            (generated_key, False, False),
+        ]
+
+        dialog.search_edit.setText("scaled")
+        rows = dict((text, hidden) for text, _is_header, hidden in _picker_rows(dialog))
+        assert rows["Measurement signals"] is True
+        assert rows[measurement_key] is True
+        assert rows["Generated signals"] is False
+        assert rows[generated_key] is False
+    finally:
+        dialog.close()
+
+
+def test_chained_signal_matches_a_direct_calculation(window, qapp):
+    from core.calculated_signals import calculate_series
+
+    source_key = window.store.all_keys()[0]
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    window._queue_calculation(first, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+
+    second = CalculatedSignalDefinition("Second", f"`{first.key}` + 1", "V")
+    window._queue_calculation(second, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+
+    expected = calculate_series(
+        second, {first.key: window.calculated_signals.cached_series(first.key)}
+    )
+    assert list(window.calculated_signals.cached_series(second.key).values) == list(
+        expected.values
+    )
+    assert list(window.calculated_signals.cached_series(second.key).values) == [11.0, 21.0, 31.0]
+
+
+def test_uncached_dependency_is_calculated_before_its_dependant(window, qapp):
+    source_key = window.store.all_keys()[0]
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    second = CalculatedSignalDefinition("Second", f"`{first.key}` + 1", "V")
+    window.calculated_signals.commit(first)
+    window.calculated_signals.commit(second)
+    window._refresh_generated_signal_tree()
+
+    assert window.add_signal_to_plot(second.key) is False
+    _wait_for_calculation(window, qapp)
+
+    assert list(window.calculated_signals.cached_series(first.key).values) == [10.0, 20.0, 30.0]
+    assert list(window.calculated_signals.cached_series(second.key).values) == [11.0, 21.0, 31.0]
+    assert second.key in window.plot_panel.plotted_keys()
+
+
+def test_editing_a_signal_invalidates_and_recalculates_plotted_dependents(window, qapp):
+    source_key = window.store.all_keys()[0]
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    second = CalculatedSignalDefinition("Second", f"`{first.key}` + 1", "V")
+    third = CalculatedSignalDefinition("Third", f"`{first.key}` + 2", "V")
+    window._queue_calculation(first, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+    window._queue_calculation(second, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+    window._queue_calculation(third, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+    window.add_signal_to_plot(second.key)
+    assert second.key in window.plot_panel.plotted_keys()
+
+    edited = CalculatedSignalDefinition("First", f"`{source_key}` * 100", "V")
+    window._queue_calculation(edited, "edit", plot_after=False)
+    _wait_for_calculation(window, qapp)
+
+    # Plotted: recalculated straight away.  Not plotted: left for the lazy path.
+    assert list(window.calculated_signals.cached_series(second.key).values) == [101.0, 201.0, 301.0]
+    assert window.calculated_signals.cached_series(third.key) is None
+
+
+def test_delete_is_blocked_while_another_signal_depends_on_it(window, qapp, monkeypatch):
+    source_key = window.store.all_keys()[0]
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    second = CalculatedSignalDefinition("Second", f"`{first.key}` + 1", "V")
+    window.calculated_signals.commit(first)
+    window.calculated_signals.commit(second)
+    window._refresh_generated_signal_tree()
+    informed = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *a, **k: informed.append(a[2]) or QMessageBox.StandardButton.Ok,
+    )
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+    window.delete_generated_signal(first.key)
+
+    assert window.calculated_signals.contains_key(first.key)
+    assert "Second" in informed[-1]
+
+
 def test_library_buttons_disabled_without_callables(qapp):
     dialog = CalculatedSignalDialog(["CH1::Message::A"])
     try:

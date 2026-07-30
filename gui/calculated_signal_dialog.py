@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -28,6 +28,7 @@ from core.calculated_signals import (
     CalculatedSignalError,
     ImportReport,
     calculate_series,
+    formula_references,
     parse_formula,
     validate_name,
 )
@@ -146,6 +147,8 @@ class CalculatedSignalDialog(QDialog):
         *,
         existing: CalculatedSignalDefinition | None = None,
         name_validator: Callable[[str], None] | None = None,
+        generated_keys: Iterable[str] = (),
+        excluded_keys: Iterable[str] = (),
         library_definitions: Callable[[], list[CalculatedSignalDefinition]] | None = None,
         import_definitions: Callable[[list[CalculatedSignalDefinition], bool], ImportReport]
         | None = None,
@@ -153,6 +156,13 @@ class CalculatedSignalDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._signal_keys = list(signal_keys)
+        # Excluded keys are the signal itself plus everything downstream of it, so a
+        # formula built in this dialog can never close a dependency cycle.
+        self._excluded_keys = set(excluded_keys)
+        self._generated_keys = [
+            key for key in generated_keys if key not in self._excluded_keys
+        ]
+        self._available_keys = self._signal_keys + self._generated_keys
         self._name_validator = name_validator
         self._library_definitions = library_definitions
         self._import_definitions = import_definitions
@@ -203,16 +213,14 @@ class CalculatedSignalDialog(QDialog):
         form.addRow(formula_label, self.formula_edit)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search measurement signals...")
+        self.search_edit.setPlaceholderText("Search signals...")
         self.signal_list = QListWidget()
-        for key in self._signal_keys:
-            item = QListWidgetItem(key)
-            item.setData(Qt.ItemDataRole.UserRole, key)
-            item.setToolTip(key)
-            self.signal_list.addItem(item)
+        self._section_headers: list[tuple[QListWidgetItem, list[QListWidgetItem]]] = []
+        self._add_signal_section("Measurement signals", self._signal_keys)
+        self._add_signal_section("Generated signals", self._generated_keys)
 
         self.insert_button = QPushButton("Insert Signal")
-        self.insert_button.setEnabled(bool(self._signal_keys))
+        self.insert_button.setEnabled(bool(self._available_keys))
         picker_buttons = QHBoxLayout()
         picker_buttons.addStretch(1)
         picker_buttons.addWidget(self.insert_button)
@@ -229,7 +237,7 @@ class CalculatedSignalDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(QLabel("Measurement signal picker:"))
+        layout.addWidget(QLabel("Signal picker:"))
         layout.addWidget(self.search_edit)
         layout.addWidget(self.signal_list, stretch=1)
         layout.addLayout(picker_buttons)
@@ -250,6 +258,23 @@ class CalculatedSignalDialog(QDialog):
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         self._validate()
+
+    def _add_signal_section(self, title: str, keys: list[str]) -> None:
+        header = QListWidgetItem(title)
+        header.setFlags(Qt.ItemFlag.NoItemFlags)
+        font = header.font()
+        font.setBold(True)
+        header.setFont(font)
+        self.signal_list.addItem(header)
+        items: list[QListWidgetItem] = []
+        for key in keys:
+            item = QListWidgetItem(key)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip(key)
+            self.signal_list.addItem(item)
+            items.append(item)
+        header.setHidden(not items)
+        self._section_headers.append((header, items))
 
     @Slot()
     def _show_formula_help(self) -> None:
@@ -289,7 +314,7 @@ class CalculatedSignalDialog(QDialog):
             return
         self._library_picker = FormulaLibraryPickerDialog(
             result.definitions,
-            signal_keys=self._signal_keys,
+            signal_keys=self._available_keys,
             import_definitions=self._import_definitions,
             parent=self,
         )
@@ -363,9 +388,10 @@ class CalculatedSignalDialog(QDialog):
     @Slot(str)
     def _filter_signals(self, text: str) -> None:
         needle = text.strip().casefold()
-        for index in range(self.signal_list.count()):
-            item = self.signal_list.item(index)
-            item.setHidden(bool(needle and needle not in item.text().casefold()))
+        for header, items in self._section_headers:
+            for item in items:
+                item.setHidden(bool(needle and needle not in item.text().casefold()))
+            header.setHidden(all(item.isHidden() for item in items))
 
     @Slot()
     def _insert_selected_signal(self) -> None:
@@ -382,13 +408,24 @@ class CalculatedSignalDialog(QDialog):
         self.formula_edit.setTextCursor(cursor)
         self.formula_edit.setFocus()
 
+    def _reject_excluded_references(self) -> None:
+        if not self._excluded_keys:
+            return
+        for key in formula_references(self.formula_edit.toPlainText()):
+            if key in self._excluded_keys:
+                name = key.rsplit("::", 1)[-1]
+                raise CalculatedSignalError(
+                    f"Cannot reference '{name}': it would create a circular reference"
+                )
+
     @Slot()
     def _validate(self) -> None:
         try:
             name = validate_name(self.name_edit.text())
             if self._name_validator is not None:
                 self._name_validator(name)
-            parse_formula(self.formula_edit.toPlainText(), self._signal_keys)
+            self._reject_excluded_references()
+            parse_formula(self.formula_edit.toPlainText(), self._available_keys)
         except CalculatedSignalError as exc:
             self.validation_label.setStyleSheet("color: #b00020;")
             self.validation_label.setText(str(exc))

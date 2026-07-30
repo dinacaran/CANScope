@@ -43,6 +43,7 @@ from core.calculated_signals import (
     CalculatedSignalError,
     CalculatedSignalManager,
     ImportReport,
+    formula_references,
     parse_formula,
 )
 from core.load_worker import LoadWorker
@@ -82,8 +83,10 @@ class MainWindow(QMainWindow):
         self._calc_thread: QThread | None = None
         self._calc_worker: CalculationWorker | None = None
         self._calc_active_request: tuple[CalculatedSignalDefinition, str, bool] | None = None
+        # source_series is None for chained entries: a dependency's series does not
+        # exist yet at enqueue time, so it is resolved when the entry is dispatched.
         self._calc_queue: list[
-            tuple[CalculatedSignalDefinition, str, bool, dict]
+            tuple[CalculatedSignalDefinition, str, bool, dict | None]
         ] = []
         self._calc_source_store: SignalStore | None = None
         # Pre-scan cache: (path, channels, ids_per_channel)
@@ -950,6 +953,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         dialog = CalculatedSignalDialog(
             self.store.all_keys(),
             name_validator=self.calculated_signals.assert_unique_name,
+            generated_keys=self.calculated_signals.keys(),
             library_definitions=self.calculated_signals.definitions,
             import_definitions=self._import_generated_signal_definitions,
             parent=self,
@@ -970,6 +974,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
             name_validator=lambda name: self.calculated_signals.assert_unique_name(
                 name, except_key=key
             ),
+            generated_keys=self.calculated_signals.keys(),
+            excluded_keys={key, *self.calculated_signals.dependents_of(key)},
             library_definitions=self.calculated_signals.definitions,
             import_definitions=self._import_generated_signal_definitions,
             parent=self,
@@ -987,6 +993,16 @@ QToolButton:pressed { background-color: #1a2a3a; }
                 self,
                 "Calculation in progress",
                 "Wait for this generated-signal calculation to finish before deleting it.",
+            )
+            return
+        dependents = self.calculated_signals.dependents_of(key)
+        if dependents:
+            names = ", ".join(sorted(self._generated_signal_name(k) for k in dependents))
+            QMessageBox.information(
+                self,
+                "Generated signal is in use",
+                f"'{definition.name}' cannot be deleted because these generated signals "
+                f"depend on it: {names}.\n\nDelete or edit those first.",
             )
             return
         answer = QMessageBox.question(
@@ -1011,6 +1027,46 @@ QToolButton:pressed { background-color: #1a2a3a; }
             for definition, _operation, _plot, _sources in self._calc_queue
         )
 
+    def _generated_signal_name(self, key: str) -> str:
+        definition = self.calculated_signals.definition(key)
+        return definition.name if definition is not None else key.rsplit("::", 1)[-1]
+
+    def _resolve_source_series(self, references) -> dict:
+        """Inputs come from the store for measurement keys and from the cache for
+        generated ones, which SignalStore knows nothing about."""
+        resolved = {}
+        for key in references:
+            if self.calculated_signals.contains_key(key):
+                series = self.calculated_signals.cached_series(key)
+            else:
+                series = self.store.get_series(key) if self.store is not None else None
+            if series is None:
+                raise CalculatedSignalError(f"Signal not available: {key}")
+            resolved[key] = series
+        return resolved
+
+    def _uncomputed_prerequisites(self, references) -> list[CalculatedSignalDefinition]:
+        """Generated inputs that must be calculated first, dependencies before dependants."""
+        ordered: list[str] = []
+        for key in references:
+            if not self.calculated_signals.contains_key(key):
+                continue
+            if self.calculated_signals.cached_series(key) is not None:
+                continue
+            for dependency in self.calculated_signals.resolution_order(key):
+                if dependency in ordered:
+                    continue
+                if self.calculated_signals.cached_series(dependency) is not None:
+                    continue
+                if self._calculation_is_pending(dependency):
+                    continue
+                ordered.append(dependency)
+        return [
+            definition
+            for definition in (self.calculated_signals.definition(key) for key in ordered)
+            if definition is not None
+        ]
+
     def _queue_calculation(
         self,
         definition: CalculatedSignalDefinition,
@@ -1024,14 +1080,19 @@ QToolButton:pressed { background-color: #1a2a3a; }
         try:
             if operation == "create":
                 self.calculated_signals.assert_unique_name(definition.name)
-            parsed = parse_formula(definition.formula, self.store.all_keys())
-            source_series = {}
+            available = self.store.all_keys() + self.calculated_signals.keys()
+            parsed = parse_formula(definition.formula, available)
+            prerequisites = self._uncomputed_prerequisites(parsed.references)
+            # Inputs that are not calculated yet contribute no known length; each of
+            # them is queued in its own right and is not warned about separately.
+            estimated_points = 0
             for key in parsed.references:
-                series = self.store.get_series(key)
-                if series is None:
-                    raise CalculatedSignalError(f"Measurement signal not found: {key}")
-                source_series[key] = series
-            estimated_points = sum(len(series.timestamps) for series in source_series.values())
+                if self.calculated_signals.contains_key(key):
+                    series = self.calculated_signals.cached_series(key)
+                else:
+                    series = self.store.get_series(key)
+                if series is not None:
+                    estimated_points += len(series.timestamps)
         except CalculatedSignalError as exc:
             QMessageBox.warning(self, "Invalid generated signal", str(exc))
             return
@@ -1048,11 +1109,43 @@ QToolButton:pressed { background-color: #1a2a3a; }
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
-        request = (definition, operation, plot_after)
-        if self._calc_thread is not None:
-            self._calc_queue.append((definition, operation, plot_after, source_series))
+        for prerequisite in prerequisites:
+            self._calc_queue.append((prerequisite, "lazy", False, None))
+        self._calc_queue.append((definition, operation, plot_after, None))
+        if self._calc_thread is None:
+            self._dispatch_next_calculation()
+
+    def _dispatch_next_calculation(self) -> None:
+        while self._calc_queue:
+            definition, operation, plot_after, source_series = self._calc_queue.pop(0)
+            if source_series is None:
+                try:
+                    parsed = parse_formula(definition.formula)
+                    source_series = self._resolve_source_series(parsed.references)
+                except CalculatedSignalError as exc:
+                    self._log(
+                        f"Generated signal calculation skipped ({definition.name}): {exc}"
+                    )
+                    self._abandon_dependent_calculations(definition.key)
+                    continue
+            self._start_calculation((definition, operation, plot_after), source_series)
             return
-        self._start_calculation(request, source_series)
+
+    def _abandon_dependent_calculations(self, failed_key: str) -> list[str]:
+        """Drop queued work that can no longer succeed, rather than failing it one by one."""
+        blocked = {failed_key, *self.calculated_signals.dependents_of(failed_key)}
+        remaining = []
+        abandoned = []
+        for entry in self._calc_queue:
+            definition = entry[0]
+            if any(key in blocked for key in formula_references(definition.formula)):
+                abandoned.append(definition.name)
+            else:
+                remaining.append(entry)
+        self._calc_queue = remaining
+        if abandoned:
+            self._log(f"Abandoned dependent generated signals: {', '.join(abandoned)}")
+        return abandoned
 
     def _start_calculation(
         self,
@@ -1095,6 +1188,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if plot_after and not key_is_plotted:
             self.add_signal_to_plot(definition.key)
         self._apply_pending_generated_plot_state(definition.key)
+        if operation == "edit":
+            self._refresh_dependents_after_edit(definition.key)
         action = "Updated" if operation == "edit" else "Created"
         if operation == "lazy":
             action = "Calculated"
@@ -1104,11 +1199,37 @@ QToolButton:pressed { background-color: #1a2a3a; }
             "Plot it from Generate Signals or save the configuration.",
         )
 
+    def _refresh_dependents_after_edit(self, key: str) -> None:
+        """An edited formula makes every downstream cached series stale."""
+        dependents = self.calculated_signals.dependents_of(key)
+        if not dependents:
+            return
+        for dependent in dependents:
+            self.calculated_signals.invalidate_series(dependent)
+        names = ", ".join(self._generated_signal_name(k) for k in dependents)
+        self._log(f"Invalidated dependent generated signals: {names}")
+        # Only on-screen curves are recalculated now; the rest wait until plotted.
+        plotted = set(self.plot_panel.plotted_keys())
+        for dependent in dependents:
+            if dependent not in plotted:
+                continue
+            definition = self.calculated_signals.definition(dependent)
+            if definition is not None:
+                self._queue_calculation(definition, "lazy", plot_after=False)
+
     def _on_calculation_failed(self, error_message: str) -> None:
         definition = self._calc_active_request[0] if self._calc_active_request else None
         name = definition.name if definition else "signal"
         self._log(f"Generated signal calculation failed ({name}): {error_message}")
-        QMessageBox.warning(self, "Generated signal calculation failed", error_message)
+        message = error_message
+        if definition is not None:
+            abandoned = self._abandon_dependent_calculations(definition.key)
+            if abandoned:
+                message += (
+                    "\n\nThese generated signals depend on it and were not calculated: "
+                    f"{', '.join(abandoned)}"
+                )
+        QMessageBox.warning(self, "Generated signal calculation failed", message)
         self._update_status("Generated signal failed", "Correct the formula and try again.")
 
     def _cleanup_calculation(self) -> None:
@@ -1119,13 +1240,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._calc_active_request = None
         self._calc_source_store = None
         self._update_action_states()
-        if not self._calc_queue:
-            return
-        definition, operation, plot_after, source_series = self._calc_queue.pop(0)
-        self._start_calculation(
-            (definition, operation, plot_after),
-            source_series,
-        )
+        self._dispatch_next_calculation()
 
     def save_configuration(self) -> None:
         config = {
