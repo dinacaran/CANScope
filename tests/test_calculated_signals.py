@@ -139,6 +139,78 @@ def test_manager_persists_definitions_but_not_cached_samples(sources):
         restored.commit(CalculatedSignalDefinition("scaled", definition.formula))
 
 
+def test_import_definitions_merges_without_clearing_existing(sources):
+    manager = CalculatedSignalManager()
+    existing = CalculatedSignalDefinition("Existing", "`CH1::Message::A` + 1", "V")
+    existing_series = calculate_series(existing, sources)
+    manager.commit(existing, existing_series)
+
+    incoming = [CalculatedSignalDefinition("NewOne", "`CH1::Message::A` * 2", "V")]
+    report = manager.import_definitions(incoming)
+
+    assert report.imported == ["NewOne"]
+    assert report.skipped == []
+    assert report.errors == []
+    assert manager.definition(existing.key) == existing
+    assert manager.cached_series(existing.key) is existing_series
+    assert manager.definition("CH?::Generate Signals::NewOne") == incoming[0]
+
+
+def test_import_definitions_skips_case_insensitive_collision_by_default(sources):
+    manager = CalculatedSignalManager()
+    existing = CalculatedSignalDefinition("Speed", "`CH1::Message::A` + 1", "V")
+    manager.commit(existing)
+
+    colliding = CalculatedSignalDefinition("speed", "`CH1::Message::A` * 2", "rpm")
+    report = manager.import_definitions([colliding])
+
+    assert report.imported == []
+    assert report.skipped == ["speed"]
+    assert report.errors == []
+    assert manager.definition(existing.key) == existing
+
+
+def test_import_definitions_overwrite_replaces_definition_and_drops_cache(sources):
+    manager = CalculatedSignalManager()
+    existing = CalculatedSignalDefinition("Speed", "`CH1::Message::A` + 1", "V")
+    manager.commit(existing, calculate_series(existing, sources))
+
+    replacement = CalculatedSignalDefinition("Speed", "`CH1::Message::A` * 2", "rpm")
+    report = manager.import_definitions([replacement], overwrite=True)
+
+    assert report.imported == ["Speed"]
+    assert report.skipped == []
+    assert manager.definition(replacement.key) == replacement
+    assert manager.cached_series(replacement.key) is None
+
+
+def test_import_definitions_overwrite_with_different_name_case_replaces_original(sources):
+    manager = CalculatedSignalManager()
+    existing = CalculatedSignalDefinition("Speed", "`CH1::Message::A` + 1", "V")
+    manager.commit(existing, calculate_series(existing, sources))
+
+    replacement = CalculatedSignalDefinition("speed", "`CH1::Message::A` * 2", "rpm")
+    report = manager.import_definitions([replacement], overwrite=True)
+
+    assert report.imported == ["speed"]
+    assert manager.definition(existing.key) is None
+    assert manager.definition(replacement.key) == replacement
+    assert manager.cached_series(replacement.key) is None
+    assert manager.keys() == [replacement.key]
+
+
+def test_import_definitions_collects_per_entry_errors_without_aborting(sources):
+    manager = CalculatedSignalManager()
+    bad = CalculatedSignalDefinition("Bad", "1 + 2", "")
+    good = CalculatedSignalDefinition("Good", "`CH1::Message::A` + 1", "V")
+
+    report = manager.import_definitions([bad, good])
+
+    assert report.imported == ["Good"]
+    assert report.skipped == []
+    assert len(report.errors) == 1
+
+
 def test_invalid_config_definition_is_skipped():
     manager = CalculatedSignalManager()
     errors = manager.replace_definitions([

@@ -6,10 +6,11 @@ import time
 import pytest
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from core.calculated_signals import CalculatedSignalDefinition
+from core.calculated_signals import CalculatedSignalDefinition, ImportReport
 from core.calculated_signals import parse_formula
+from core.formula_library import load_formula_library, save_formula_library
 from core.signal_store import SignalSeries
 from gui.calculated_signal_dialog import (
     CalculatedSignalDialog,
@@ -303,5 +304,190 @@ def test_help_button_displays_formula_examples(qapp):
         assert "Logical" in help_text
         assert f"`{_FORMULA_HELP_SIGNAL}` + 100" in help_text
         assert signal_key not in help_text
+    finally:
+        dialog.close()
+
+
+def test_library_buttons_disabled_without_callables(qapp):
+    dialog = CalculatedSignalDialog(["CH1::Message::A"])
+    try:
+        assert not dialog.load_library_button.isEnabled()
+        assert not dialog.save_library_button.isEnabled()
+        assert dialog.load_library_button.toolTip()
+        assert dialog.save_library_button.toolTip()
+    finally:
+        dialog.close()
+
+
+def test_load_library_use_selected_fills_fields_in_create_mode(qapp, monkeypatch, tmp_path):
+    signal_key = "CH1::Message::A"
+    picked = [CalculatedSignalDefinition("Picked", f"`{signal_key}` * 2", "rpm")]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, picked)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        library_definitions=lambda: [],
+        import_definitions=lambda defs, overwrite: ImportReport([], [], []),
+    )
+    try:
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+        assert picker is not None
+        picker.table.selectRow(0)
+        picker.use_button.click()
+        qapp.processEvents()
+
+        assert dialog.name_edit.text() == "Picked"
+        assert dialog.unit_edit.text() == "rpm"
+        assert dialog.formula_edit.toPlainText() == f"`{signal_key}` * 2"
+        assert "valid" in dialog.validation_label.text().lower()
+    finally:
+        dialog.close()
+
+
+def test_load_library_use_selected_leaves_name_untouched_in_edit_mode(qapp, monkeypatch, tmp_path):
+    signal_key = "CH1::Message::A"
+    picked = [CalculatedSignalDefinition("Picked", f"`{signal_key}` * 2", "rpm")]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, picked)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+
+    existing = CalculatedSignalDefinition("Original", f"`{signal_key}` + 1", "V")
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        existing=existing,
+        library_definitions=lambda: [],
+        import_definitions=lambda defs, overwrite: ImportReport([], [], []),
+    )
+    try:
+        assert dialog.name_edit.isReadOnly()
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+        assert picker is not None
+        picker.table.selectRow(0)
+        picker.use_button.click()
+        qapp.processEvents()
+
+        assert dialog.name_edit.text() == "Original"
+        assert dialog.unit_edit.text() == "rpm"
+        assert dialog.formula_edit.toPlainText() == f"`{signal_key}` * 2"
+    finally:
+        dialog.close()
+
+
+def test_import_checked_warns_about_missing_signal_references(qapp, monkeypatch, tmp_path):
+    calls = []
+
+    def fake_import(definitions, overwrite):
+        calls.append(overwrite)
+        return ImportReport(imported=[d.name for d in definitions], skipped=[], errors=[])
+
+    present_key = "CH1::Message::A"
+    missing_key = "CH1::Message::Missing"
+    library_defs = [CalculatedSignalDefinition("UsesMissing", f"`{missing_key}` + 1", "")]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, library_defs)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+
+    questions = []
+
+    def fake_question(*args, **kwargs):
+        questions.append(args[2] if len(args) > 2 else "")
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    dialog = CalculatedSignalDialog(
+        [present_key],
+        library_definitions=lambda: [],
+        import_definitions=fake_import,
+    )
+    try:
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+        picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        picker.import_button.click()
+        qapp.processEvents()
+
+        assert calls == [False]
+        assert any("not present in this measurement" in q for q in questions)
+    finally:
+        dialog.close()
+
+
+def test_import_checked_reports_collisions_and_offers_replace(qapp, monkeypatch, tmp_path):
+    calls = []
+
+    def fake_import(definitions, overwrite):
+        calls.append((list(definitions), overwrite))
+        if not overwrite:
+            return ImportReport(imported=[], skipped=[d.name for d in definitions], errors=[])
+        return ImportReport(imported=[d.name for d in definitions], skipped=[], errors=[])
+
+    signal_key = "CH1::Message::A"
+    library_defs = [CalculatedSignalDefinition("Existing", f"`{signal_key}` + 1", "V")]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, library_defs)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    informed = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *a, **k: informed.append(a[2]) or QMessageBox.StandardButton.Ok,
+    )
+
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        library_definitions=lambda: [],
+        import_definitions=fake_import,
+    )
+    try:
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+        picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        picker.import_button.click()
+        qapp.processEvents()
+
+        assert len(calls) == 2
+        assert calls[0][1] is False
+        assert calls[1][1] is True
+        assert calls[1][0][0].name == "Existing"
+        assert informed[-1] == "1 imported, 0 skipped"
+    finally:
+        dialog.close()
+
+
+def test_save_library_writes_definitions_and_includes_current_formula(qapp, monkeypatch, tmp_path):
+    signal_key = "CH1::Message::A"
+    existing_defs = [CalculatedSignalDefinition("Saved", f"`{signal_key}` + 1", "V")]
+    save_path = tmp_path / "out.formulas.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(save_path), ""))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        library_definitions=lambda: list(existing_defs),
+        import_definitions=lambda defs, overwrite: ImportReport([], [], []),
+    )
+    try:
+        dialog.name_edit.setText("Fresh")
+        dialog.formula_edit.setPlainText(f"`{signal_key}` * 2")
+        qapp.processEvents()
+        assert dialog.save_button.isEnabled()
+
+        dialog.save_library_button.click()
+        qapp.processEvents()
+
+        result = load_formula_library(save_path)
+        assert sorted(d.name for d in result.definitions) == ["Fresh", "Saved"]
     finally:
         dialog.close()

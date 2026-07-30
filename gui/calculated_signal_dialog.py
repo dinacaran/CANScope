@@ -4,16 +4,21 @@ from collections.abc import Callable, Mapping
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -21,10 +26,12 @@ from PySide6.QtWidgets import (
 from core.calculated_signals import (
     CalculatedSignalDefinition,
     CalculatedSignalError,
+    ImportReport,
     calculate_series,
     parse_formula,
     validate_name,
 )
+from core.formula_library import load_formula_library, save_formula_library
 from core.signal_store import SignalSeries
 
 
@@ -139,12 +146,18 @@ class CalculatedSignalDialog(QDialog):
         *,
         existing: CalculatedSignalDefinition | None = None,
         name_validator: Callable[[str], None] | None = None,
+        library_definitions: Callable[[], list[CalculatedSignalDefinition]] | None = None,
+        import_definitions: Callable[[list[CalculatedSignalDefinition], bool], ImportReport]
+        | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._signal_keys = list(signal_keys)
         self._name_validator = name_validator
+        self._library_definitions = library_definitions
+        self._import_definitions = import_definitions
         self._help_dialog: FormulaHelpDialog | None = None
+        self._library_picker: FormulaLibraryPickerDialog | None = None
         self.setWindowTitle("Edit Generated Signal" if existing else "New Signal")
         self.resize(760, 560)
 
@@ -169,9 +182,24 @@ class CalculatedSignalDialog(QDialog):
         formula_label_layout.addWidget(self.help_button)
         formula_label_layout.addStretch(1)
 
+        self.load_library_button = QPushButton("Load...")
+        self.save_library_button = QPushButton("Save...")
+        library_available = library_definitions is not None and import_definitions is not None
+        if not library_available:
+            tooltip = "Formula library loading and saving is not available here"
+            self.load_library_button.setEnabled(False)
+            self.load_library_button.setToolTip(tooltip)
+            self.save_library_button.setEnabled(False)
+            self.save_library_button.setToolTip(tooltip)
+        library_buttons = QHBoxLayout()
+        library_buttons.addWidget(self.load_library_button)
+        library_buttons.addWidget(self.save_library_button)
+        library_buttons.addStretch(1)
+
         form = QFormLayout()
         form.addRow("Signal name:", self.name_edit)
         form.addRow("Unit:", self.unit_edit)
+        form.addRow(library_buttons)
         form.addRow(formula_label, self.formula_edit)
 
         self.search_edit = QLineEdit()
@@ -210,6 +238,8 @@ class CalculatedSignalDialog(QDialog):
 
         self.search_edit.textChanged.connect(self._filter_signals)
         self.help_button.clicked.connect(self._show_formula_help)
+        self.load_library_button.clicked.connect(self._on_load_library)
+        self.save_library_button.clicked.connect(self._on_save_library)
         self.insert_button.clicked.connect(self._insert_selected_signal)
         self.signal_list.itemDoubleClicked.connect(lambda _item: self._insert_selected_signal())
         self.signal_list.itemSelectionChanged.connect(
@@ -228,6 +258,100 @@ class CalculatedSignalDialog(QDialog):
         self._help_dialog.show()
         self._help_dialog.raise_()
         self._help_dialog.activateWindow()
+
+    @Slot()
+    def _on_load_library(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load formula library",
+            "",
+            "Formula files (*.formulas.json *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            result = load_formula_library(path)
+        except CalculatedSignalError as exc:
+            QMessageBox.critical(self, "Load formula library failed", str(exc))
+            return
+        if result.errors:
+            QMessageBox.warning(
+                self,
+                "Some formulas could not be read",
+                "\n".join(result.errors),
+            )
+        if not result.definitions:
+            QMessageBox.information(
+                self,
+                "No formulas found",
+                "This file does not contain any usable formulas.",
+            )
+            return
+        self._library_picker = FormulaLibraryPickerDialog(
+            result.definitions,
+            signal_keys=self._signal_keys,
+            import_definitions=self._import_definitions,
+            parent=self,
+        )
+        self._library_picker.use_requested.connect(self._apply_library_definition)
+        self._library_picker.show()
+        self._library_picker.raise_()
+        self._library_picker.activateWindow()
+
+    @Slot(object)
+    def _apply_library_definition(self, definition: CalculatedSignalDefinition) -> None:
+        if not self.name_edit.isReadOnly():
+            self.name_edit.setText(definition.name)
+        self.unit_edit.setText(definition.unit)
+        self.formula_edit.setPlainText(definition.formula)
+        self._validate()
+
+    def _current_definition_if_valid(self) -> CalculatedSignalDefinition | None:
+        if not self.save_button.isEnabled():
+            return None
+        try:
+            return self.definition()
+        except CalculatedSignalError:
+            return None
+
+    @Slot()
+    def _on_save_library(self) -> None:
+        definitions = list(self._library_definitions()) if self._library_definitions else []
+
+        current = self._current_definition_if_valid()
+        if current is not None:
+            answer = QMessageBox.question(
+                self,
+                "Include current formula?",
+                f"Include the formula currently being edited ('{current.name}') "
+                "in the saved file?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                definitions = [
+                    d for d in definitions if d.name.casefold() != current.name.casefold()
+                ]
+                definitions.append(current)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save formula library",
+            "canscope_formulas.formulas.json",
+            "Formula files (*.formulas.json *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            save_formula_library(path, definitions)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save formula library failed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Formula library saved",
+            f"Saved {len(definitions)} formula(s):\n{path}",
+        )
 
     def definition(self) -> CalculatedSignalDefinition:
         return CalculatedSignalDefinition(
@@ -273,3 +397,150 @@ class CalculatedSignalDialog(QDialog):
         self.validation_label.setStyleSheet("color: #187a28;")
         self.validation_label.setText("Formula is valid")
         self.save_button.setEnabled(True)
+
+
+class FormulaLibraryPickerDialog(QDialog):
+    """Lists formulas loaded from a formula-library file for reuse or import."""
+
+    use_requested = Signal(object)
+
+    def __init__(
+        self,
+        definitions: list[CalculatedSignalDefinition],
+        *,
+        signal_keys: list[str],
+        import_definitions: Callable[[list[CalculatedSignalDefinition], bool], ImportReport]
+        | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._definitions = list(definitions)
+        self._signal_keys = list(signal_keys)
+        self._import_definitions = import_definitions
+        self.setWindowTitle("Formula Library")
+        self.resize(760, 480)
+
+        self.table = QTableWidget(len(self._definitions), 4)
+        self.table.setHorizontalHeaderLabels(["☑", "Name", "Unit", "Formula"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        for row, definition in enumerate(self._definitions):
+            check_item = QTableWidgetItem()
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            check_item.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row, 0, check_item)
+            self.table.setItem(row, 1, QTableWidgetItem(definition.name))
+            self.table.setItem(row, 2, QTableWidgetItem(definition.unit))
+            self.table.setItem(row, 3, QTableWidgetItem(definition.formula))
+        if self._definitions:
+            self.table.selectRow(0)
+
+        self.use_button = QPushButton("Use Selected")
+        self.use_button.setEnabled(bool(self._definitions))
+        self.import_button = QPushButton("Import All Checked")
+        if self._import_definitions is None:
+            self.import_button.setEnabled(False)
+            self.import_button.setToolTip("Importing into this measurement is not available")
+        self.close_button = QPushButton("Close")
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.use_button)
+        buttons.addWidget(self.import_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"{len(self._definitions)} formula(s) found:"))
+        layout.addWidget(self.table, stretch=1)
+        layout.addLayout(buttons)
+
+        self.table.itemSelectionChanged.connect(
+            lambda: self.use_button.setEnabled(bool(self.table.selectedItems()))
+        )
+        self.use_button.clicked.connect(self._on_use_selected)
+        self.import_button.clicked.connect(self._on_import_checked)
+        self.close_button.clicked.connect(self.close)
+
+    def _checked_definitions(self) -> list[CalculatedSignalDefinition]:
+        result = []
+        for row, definition in enumerate(self._definitions):
+            item = self.table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                result.append(definition)
+        return result
+
+    @Slot()
+    def _on_use_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._definitions):
+            return
+        self.use_requested.emit(self._definitions[row])
+        self.accept()
+
+    @Slot()
+    def _on_import_checked(self) -> None:
+        if self._import_definitions is None:
+            return
+        checked = self._checked_definitions()
+        if not checked:
+            QMessageBox.information(self, "Import formulas", "Check at least one formula to import.")
+            return
+
+        missing = 0
+        for definition in checked:
+            try:
+                parsed = parse_formula(definition.formula)
+            except CalculatedSignalError:
+                continue
+            if any(reference not in self._signal_keys for reference in parsed.references):
+                missing += 1
+        if missing:
+            answer = QMessageBox.question(
+                self,
+                "Formulas reference missing signals",
+                f"{missing} of {len(checked)} formulas reference signals not present in "
+                "this measurement. They will be imported but cannot be calculated until "
+                "a matching measurement is loaded.\n\nImport anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        report = self._import_definitions(checked, False)
+        imported = list(report.imported)
+        skipped = list(report.skipped)
+        errors = list(report.errors)
+
+        if skipped:
+            answer = QMessageBox.question(
+                self,
+                "Formulas already exist",
+                f"{len(skipped)} formula(s) already exist and were skipped: "
+                f"{', '.join(skipped)}.\n\nReplace them with the imported versions?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                skipped_fold = {name.casefold() for name in skipped}
+                retry = [d for d in checked if d.name.casefold() in skipped_fold]
+                retry_report = self._import_definitions(retry, True)
+                imported.extend(retry_report.imported)
+                replaced_fold = {name.casefold() for name in retry_report.imported}
+                skipped = [name for name in skipped if name.casefold() not in replaced_fold]
+                errors.extend(retry_report.errors)
+
+        summary = f"{len(imported)} imported, {len(skipped)} skipped"
+        if skipped:
+            summary += ": name already exists"
+        if errors:
+            summary += "\n" + "\n".join(errors)
+        QMessageBox.information(self, "Import formulas", summary)
+        self.accept()

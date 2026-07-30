@@ -274,6 +274,13 @@ def calculate_series(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ImportReport:
+    imported: list[str]
+    skipped: list[str]
+    errors: list[str]
+
+
 class CalculatedSignalManager:
     """Definitions and cached outputs, deliberately separate from SignalStore."""
 
@@ -320,6 +327,49 @@ class CalculatedSignalManager:
 
     def invalidate_cache(self) -> None:
         self._cache.clear()
+
+    def _key_for_name(self, name: str) -> str | None:
+        cleaned = name.casefold()
+        for key, definition in self._definitions.items():
+            if definition.name.casefold() == cleaned:
+                return key
+        return None
+
+    def import_definitions(
+        self,
+        definitions: Iterable[CalculatedSignalDefinition],
+        *,
+        overwrite: bool = False,
+    ) -> ImportReport:
+        """Merge definitions in place; unlike replace_definitions(), never clears existing state."""
+        imported: list[str] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        for definition in definitions:
+            try:
+                name = validate_name(definition.name)
+                parse_formula(definition.formula)
+            except CalculatedSignalError as exc:
+                errors.append(str(exc))
+                continue
+
+            existing_key = self._key_for_name(name)
+            if existing_key is not None and not overwrite:
+                skipped.append(name)
+                continue
+
+            cleaned = CalculatedSignalDefinition(
+                name=name, formula=definition.formula, unit=definition.unit
+            )
+            try:
+                if existing_key is not None:
+                    self._cache.pop(existing_key, None)
+                    self._definitions.pop(existing_key, None)
+                self.commit(cleaned)
+                imported.append(name)
+            except CalculatedSignalError as exc:
+                errors.append(str(exc))
+        return ImportReport(imported=imported, skipped=skipped, errors=errors)
 
     def replace_definitions(self, payload: Iterable[object]) -> list[str]:
         self._definitions.clear()

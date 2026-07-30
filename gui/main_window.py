@@ -42,6 +42,7 @@ from core.calculated_signals import (
     CalculatedSignalDefinition,
     CalculatedSignalError,
     CalculatedSignalManager,
+    ImportReport,
     parse_formula,
 )
 from core.load_worker import LoadWorker
@@ -911,6 +912,15 @@ QToolButton:pressed { background-color: #1a2a3a; }
             ))
         self.signal_tree.set_generated_signals(rows)
 
+    def _import_generated_signal_definitions(
+        self,
+        definitions: list[CalculatedSignalDefinition],
+        overwrite: bool,
+    ) -> ImportReport:
+        report = self.calculated_signals.import_definitions(definitions, overwrite=overwrite)
+        self._refresh_generated_signal_tree()
+        return report
+
     def _apply_pending_generated_plot_state(self, key: str) -> None:
         plotted = self.plot_panel._items.get(key)
         if plotted is None:
@@ -940,6 +950,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         dialog = CalculatedSignalDialog(
             self.store.all_keys(),
             name_validator=self.calculated_signals.assert_unique_name,
+            library_definitions=self.calculated_signals.definitions,
+            import_definitions=self._import_generated_signal_definitions,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -958,6 +970,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
             name_validator=lambda name: self.calculated_signals.assert_unique_name(
                 name, except_key=key
             ),
+            library_definitions=self.calculated_signals.definitions,
+            import_definitions=self._import_generated_signal_definitions,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
