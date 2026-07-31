@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -18,30 +20,30 @@ from PySide6.QtWidgets import (
 
 
 class LoadDebugWorker(QObject):
-    """Run one read-only inspection callable away from the GUI thread."""
+    """Run read-only inspection callables away from the GUI thread.
+
+    One instance lives for the whole debug session and handles every
+    inspection, so the owning QThread is never created or destroyed per
+    inspection. Requests arrive on ``run_inspection`` as a queued signal.
+    """
 
     completed = Signal(str, str)
     failed = Signal(str, str)
 
-    def __init__(
-        self,
-        kind: str,
-        inspector: Callable[[], str],
-        parent: QObject | None = None,
+    @Slot(object)
+    def run_inspection(
+        self, payload: tuple[str, int, Callable[[], str]]
     ) -> None:
-        super().__init__(parent)
-        self.kind = kind
-        self.inspector = inspector
-
-    @Slot()
-    def run(self) -> None:
+        # The generation rides along so the payload is self-describing, but
+        # only the caller compares it — one inspection runs at a time.
+        kind, _generation, inspector = payload
         try:
-            self.completed.emit(self.kind, self.inspector())
+            self.completed.emit(kind, inspector())
         except Exception as exc:
             import traceback
 
             self.failed.emit(
-                self.kind,
+                kind,
                 f"{type(exc).__module__}.{type(exc).__name__}: {exc}\n\n"
                 f"{traceback.format_exc()}",
             )
@@ -76,12 +78,14 @@ class LoadDebugWindow(QMainWindow):
         open_database = QPushButton("Open Database")
         load_decode = QPushButton("Load + Decode")
         copy_text = QPushButton("Copy Text")
+        save_report = QPushButton("Save Report...")
         clear_text = QPushButton("Clear")
         hide_window = QPushButton("Hide")
         controls.addWidget(open_measurement)
         controls.addWidget(open_database)
         controls.addWidget(load_decode)
         controls.addWidget(copy_text)
+        controls.addWidget(save_report)
         controls.addWidget(clear_text)
         controls.addWidget(hide_window)
         layout.addLayout(controls)
@@ -112,6 +116,7 @@ class LoadDebugWindow(QMainWindow):
         open_database.clicked.connect(self.openDatabaseRequested.emit)
         load_decode.clicked.connect(self.loadDecodeRequested.emit)
         copy_text.clicked.connect(self.copy_all)
+        save_report.clicked.connect(self.save_report_as)
         clear_text.clicked.connect(self.clear_report)
         hide_window.clicked.connect(self.hide)
 
@@ -145,6 +150,25 @@ class LoadDebugWindow(QMainWindow):
     def copy_all(self) -> None:
         QApplication.clipboard().setText(self.report.toPlainText())
         self.state_label.setText("Debug text copied to the clipboard.")
+
+    def save_report_as(self) -> None:
+        """Write the report out, only ever on an explicit click.
+
+        The report is otherwise session-only — nothing about debug mode
+        touches the disk on its own.
+        """
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Debug Report", "canscope_debug_report.txt",
+            "Text files (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.report.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            self.state_label.setText(f"Could not save the report: {exc}")
+            return
+        self.state_label.setText(f"Debug report saved to {path}")
 
     def closeEvent(self, event) -> None:
         # Closing the report window only hides it; Ctrl+Alt+D owns the mode.

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +65,10 @@ from core.debug_inspector import (
 
 
 class MainWindow(QMainWindow):
+    # Carries (kind, generation, inspector) to the debug worker. ``object``
+    # is what lets PySide6 marshal the callable across the thread boundary.
+    debugInspectionRequested = Signal(object)
+
     def __init__(self, app_name: str, version: str, parent: QWidget | None = None, splash=None) -> None:
         super().__init__(parent)
         self.app_name = app_name
@@ -119,16 +124,23 @@ class MainWindow(QMainWindow):
         # Hidden, session-only CAN load forensics (Ctrl+Alt+D).
         self._debug_mode = False
         self._debug_window: LoadDebugWindow | None = None
+        # One thread and one worker for the whole debug session; never
+        # recreated per inspection.
         self._debug_thread: QThread | None = None
         self._debug_worker: LoadDebugWorker | None = None
+        self._debug_busy = False
         self._debug_generation = 0
         self._debug_active_generation = -1
-        self._debug_active_kind = ''
         self._debug_pending_inspections: list[
             tuple[str, int, Callable[[], str]]
         ] = []
         self._debug_runtime_lines: list[str] = []
         self._debug_measurement_summary = ''
+        # Auto-launch on a load/database failure. Suppress with
+        # CANSCOPE_AUTO_DEBUG=0; the guard flag stops an inspector that
+        # fails from re-triggering the launcher.
+        self._debug_auto_launching = False
+        self._debug_auto_launched = False
 
         self._splash_status('Initialising plot panel...')
         self._build_ui()
@@ -358,42 +370,103 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
     def toggle_debug_mode(self) -> None:
         """Toggle the hidden, session-only CAN load forensic mode."""
-        self._debug_mode = not self._debug_mode
-        self.debug_mode_label.setVisible(self._debug_mode)
-
         if self._debug_mode:
-            if self._debug_window is None:
-                self._debug_window = LoadDebugWindow(self)
-                self._debug_window.openMeasurementRequested.connect(
-                    self.choose_blf
-                )
-                self._debug_window.openDatabaseRequested.connect(
-                    self.choose_dbc
-                )
-                self._debug_window.loadDecodeRequested.connect(
-                    lambda: self.load_data()
-                )
+            self._exit_debug_mode()
+        else:
+            self._enter_debug_mode()
+
+    def _enter_debug_mode(self, *, inspect_current: bool = True) -> None:
+        """Turn the forensic mode on. Shared by Ctrl+Alt+D and auto-launch.
+
+        ``inspect_current`` is off for auto-launch, which queues its own
+        inspections after appending the failure banner.
+        """
+        self._debug_mode = True
+        self.debug_mode_label.setVisible(True)
+        if self._debug_window is None:
+            self._debug_window = LoadDebugWindow(self)
+            self._debug_window.openMeasurementRequested.connect(
+                self.choose_blf
+            )
+            self._debug_window.openDatabaseRequested.connect(
+                self.choose_dbc
+            )
+            self._debug_window.loadDecodeRequested.connect(
+                lambda: self.load_data()
+            )
+        self._show_debug_window()
+        self._log('CAN load debug mode enabled (session-only).')
+        self._update_status(
+            'Debug mode enabled',
+            'Open the issue measurement and database; inspection starts automatically',
+        )
+        if inspect_current and self.measurement_path:
+            self._queue_measurement_debug_inspection(
+                self.measurement_path
+            )
+            if not self.channel_config.is_empty():
+                self._queue_database_debug_inspection()
+
+    def _exit_debug_mode(self) -> None:
+        """Turn the forensic mode off, however it was turned on."""
+        self._debug_mode = False
+        self.debug_mode_label.setVisible(False)
+        self._debug_auto_launched = False
+        self._debug_generation += 1
+        self._debug_pending_inspections.clear()
+        self._shutdown_debug_worker()
+        if self._debug_window is not None:
+            self._debug_window.hide()
+        self._log('CAN load debug mode disabled; normal mode restored.')
+        self._update_status('Normal mode', self._next_step_message())
+
+    def _show_debug_window(self) -> None:
+        if self._debug_window is not None:
             self._debug_window.showMaximized()
             self._debug_window.raise_()
             self._debug_window.activateWindow()
-            self._log('CAN load debug mode enabled (session-only).')
-            self._update_status(
-                'Debug mode enabled',
-                'Open the issue measurement and database; inspection starts automatically',
-            )
-            if self.measurement_path:
-                self._queue_measurement_debug_inspection(
-                    self.measurement_path
+
+    def _auto_launch_debug(self, reason: str, detail: str) -> None:
+        """Open the forensic report by itself when a load or database fails.
+
+        Debug mode is otherwise manual, so the report a failure needs is only
+        collected if the user happened to press Ctrl+Alt+D beforehand.
+        """
+        if os.environ.get('CANSCOPE_AUTO_DEBUG', '1') == '0':
+            return
+        if self._debug_auto_launching:
+            # A failure raised by the inspector itself must not re-enter here.
+            return
+        self._debug_auto_launching = True
+        try:
+            if not self._debug_mode:
+                self._enter_debug_mode(inspect_current=False)
+                self._debug_auto_launched = True
+                self._log(
+                    f'CAN load debug mode opened automatically: {reason}'
                 )
+                # Collect only when we opened the window ourselves. With
+                # debug mode already on the report holds an inspection and
+                # the runtime log; re-queueing would clear both.
+                if self.measurement_path:
+                    self._queue_measurement_debug_inspection(
+                        self.measurement_path
+                    )
                 if not self.channel_config.is_empty():
                     self._queue_database_debug_inspection()
-        else:
-            self._debug_generation += 1
-            self._debug_pending_inspections.clear()
-            if self._debug_window is not None:
-                self._debug_window.hide()
-            self._log('CAN load debug mode disabled; normal mode restored.')
-            self._update_status('Normal mode', self._next_step_message())
+            # After queueing: _queue_measurement_debug_inspection resets the
+            # runtime lines, and _append_debug_runtime replays them once the
+            # inspection lands, so the banner survives either ordering of the
+            # two.
+            self._append_debug_runtime(
+                format_runtime_failure(
+                    f'{reason}\n{detail}' if reason else detail,
+                    self.measurement_path or self.blf_path or '',
+                )
+            )
+            self._show_debug_window()
+        finally:
+            self._debug_auto_launching = False
 
     def _queue_measurement_debug_inspection(self, path: str) -> None:
         if not self._debug_mode or self._debug_window is None:
@@ -447,67 +520,109 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._debug_window.set_busy('Inspecting database structure and CAN-ID mapping...')
         self._start_next_debug_inspection()
 
-    def _start_next_debug_inspection(self) -> None:
-        if self._debug_thread is not None or not self._debug_pending_inspections:
+    def _ensure_debug_worker(self) -> None:
+        """Create the session-long inspection thread on first use."""
+        if self._debug_thread is not None:
             return
-        kind, generation, inspector = self._debug_pending_inspections.pop(0)
-        self._debug_active_kind = kind
-        self._debug_active_generation = generation
         self._debug_thread = QThread(self)
-        self._debug_worker = LoadDebugWorker(kind, inspector)
+        self._debug_worker = LoadDebugWorker()
         self._debug_worker.moveToThread(self._debug_thread)
-        self._debug_thread.started.connect(self._debug_worker.run)
         self._debug_worker.completed.connect(
             self._on_debug_inspection_completed
         )
         self._debug_worker.failed.connect(self._on_debug_inspection_failed)
-        self._debug_worker.completed.connect(self._debug_worker.deleteLater)
-        self._debug_worker.failed.connect(self._debug_worker.deleteLater)
-        self._debug_worker.completed.connect(self._debug_thread.quit)
-        self._debug_worker.failed.connect(self._debug_thread.quit)
-        self._debug_thread.finished.connect(self._cleanup_debug_inspection)
+        # Queued so the callable is handed over on the worker thread rather
+        # than run inline on the GUI thread.
+        self.debugInspectionRequested.connect(
+            self._debug_worker.run_inspection,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._debug_thread.start()
 
+    def _start_next_debug_inspection(self) -> None:
+        if self._debug_busy or not self._debug_pending_inspections:
+            return
+        kind, generation, inspector = self._debug_pending_inspections.pop(0)
+        self._ensure_debug_worker()
+        self._debug_busy = True
+        self._debug_active_generation = generation
+        self.debugInspectionRequested.emit((kind, generation, inspector))
+
+    def _shutdown_debug_worker(self) -> None:
+        """Stop the inspection thread. GUI thread only; safe to call twice.
+
+        This is the one place ``wait()`` belongs: it runs on the GUI thread
+        after ``quit()``, never from a slot the finishing thread is driving.
+        """
+        thread = self._debug_thread
+        worker = self._debug_worker
+        # Cleared first, so a second call is a no-op even if the wait blocks.
+        self._debug_thread = None
+        self._debug_worker = None
+        self._debug_busy = False
+        # Nothing is left to run this queue, and a result already in flight
+        # must not be able to resurrect the thread on a closing window.
+        self._debug_pending_inspections.clear()
+        self._debug_active_generation = -1
+        if thread is None:
+            return
+        if worker is not None:
+            try:
+                self.debugInspectionRequested.disconnect(
+                    worker.run_inspection
+                )
+            except (RuntimeError, TypeError):
+                pass
+        thread.quit()
+        thread.wait(2000)
+        if worker is not None:
+            worker.deleteLater()
+        thread.deleteLater()
+
     def _on_debug_inspection_completed(self, kind: str, report: str) -> None:
-        if (
+        self._debug_busy = False
+        stale = (
             not self._debug_mode
             or self._debug_window is None
             or self._debug_active_generation != self._debug_generation
-        ):
-            return
-        if kind == 'measurement':
-            self._debug_measurement_summary = '\n'.join(
-                report.splitlines()[:24]
-            )
-            self._debug_window.set_report(report)
-            if self._debug_runtime_lines:
-                self._debug_window.append_report(
-                    '\n'.join(self._debug_runtime_lines)
+        )
+        if not stale:
+            if kind == 'measurement':
+                self._debug_measurement_summary = '\n'.join(
+                    report.splitlines()[:24]
                 )
-        else:
-            self._debug_window.append_report(report)
-            database_summary = [
-                line for line in report.splitlines()
-                if line.startswith((
-                    'DATABASE:',
-                    '  Assignment:',
-                    '  LOAD ',
-                    '  Messages:',
-                    '  Observed IDs:',
-                    '  Unmatched IDs:',
-                    'DATABASE STATUS:',
-                ))
-            ]
-            self._debug_window.append_report(
-                '\n' + '=' * 100 + '\n'
-                'SCREENSHOT SUMMARY - MEASUREMENT + DATABASE\n'
-                + self._debug_measurement_summary
-                + '\n\nDATABASE SUMMARY\n'
-                + '\n'.join(database_summary[:32])
-            )
-            self._debug_window.set_busy('Database inspection complete.')
+                self._debug_window.set_report(report)
+                if self._debug_runtime_lines:
+                    self._debug_window.append_report(
+                        '\n'.join(self._debug_runtime_lines)
+                    )
+            else:
+                self._debug_window.append_report(report)
+                database_summary = [
+                    line for line in report.splitlines()
+                    if line.startswith((
+                        'DATABASE:',
+                        '  Assignment:',
+                        '  LOAD ',
+                        '  Messages:',
+                        '  Observed IDs:',
+                        '  Unmatched IDs:',
+                        'DATABASE STATUS:',
+                    ))
+                ]
+                self._debug_window.append_report(
+                    '\n' + '=' * 100 + '\n'
+                    'SCREENSHOT SUMMARY - MEASUREMENT + DATABASE\n'
+                    + self._debug_measurement_summary
+                    + '\n\nDATABASE SUMMARY\n'
+                    + '\n'.join(database_summary[:32])
+                )
+                self._debug_window.set_busy('Database inspection complete.')
+        # Pump even when the result was discarded, or the queue stalls here.
+        self._start_next_debug_inspection()
 
     def _on_debug_inspection_failed(self, kind: str, error: str) -> None:
+        self._debug_busy = False
         if (
             self._debug_mode
             and self._debug_window is not None
@@ -519,14 +634,6 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._debug_window.set_busy(
                 'Inspector failed internally; the normal loader remains available.'
             )
-
-    def _cleanup_debug_inspection(self) -> None:
-        self._debug_worker = None
-        if self._debug_thread is not None:
-            self._debug_thread.deleteLater()
-            self._debug_thread = None
-        self._debug_active_kind = ''
-        self._debug_active_generation = -1
         self._start_next_debug_inspection()
 
     def _append_debug_runtime(self, message: str) -> None:
@@ -836,6 +943,25 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._update_action_states()
         self._update_status('Database configured', self._next_step_message())
         self._queue_database_debug_inspection()
+
+        # The dialog already tried to read every database for its match bars
+        # and degraded to "can't read database" on failure. Surface the ones
+        # that actually ended up assigned.
+        broken = {
+            path: message
+            for path, message in dlg.load_errors().items()
+            if path in set(self.channel_config.all_dbc_paths())
+        }
+        if broken:
+            names = ', '.join(Path(path).name for path in broken)
+            self._log(f'ERROR: database could not be read: {names}')
+            self._auto_launch_debug(
+                f'Database failed to load: {names}',
+                '\n'.join(
+                    f'{Path(path).name}: {message}'
+                    for path, message in broken.items()
+                ),
+            )
 
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
@@ -1978,15 +2104,14 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
     def _on_worker_failed(self, error_message: str) -> None:
         self._log(f'ERROR: {error_message}')
-        mpath = self.measurement_path or self.blf_path or ''
-        self._append_debug_runtime(
-            format_runtime_failure(error_message, mpath)
+        # Before the modal, so collection is already running behind it.
+        self._auto_launch_debug('Load + Decode failed', error_message)
+        QMessageBox.critical(
+            self,
+            'Load failed',
+            f'{error_message}\n\n'
+            'A forensic report is being collected in the debug window.',
         )
-        if self._debug_mode and self._debug_window is not None:
-            self._debug_window.showMaximized()
-            self._debug_window.raise_()
-            self._debug_window.activateWindow()
-        QMessageBox.critical(self, 'Load failed', error_message)
         self._update_status('Load failed', 'Review the log, verify BLF/DBC paths, and try again')
 
     def _cleanup_worker(self) -> None:
@@ -1996,6 +2121,12 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if self._thread is not None:
             self._thread.deleteLater()
             self._thread = None
+
+    def closeEvent(self, event) -> None:
+        # The debug thread is parented to this window, so letting Qt destroy
+        # it while it still runs is exactly the crash this teardown avoids.
+        self._shutdown_debug_worker()
+        super().closeEvent(event)
 
     def _on_plot_selection_changed(self, key: str) -> None:
         self._update_status(f'Selected plot: {key}', 'Delete removes selected plot rows; drag rows to reorder them')
