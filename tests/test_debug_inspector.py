@@ -5,9 +5,12 @@ import time
 
 import can
 
+import pytest
+
 from core.debug_inspector import (
     _block_header,
     _inspect_mdf4_hd_dg_cg,
+    _populate_group_data_blocks,
     format_runtime_failure,
     inspect_databases,
     inspect_measurement,
@@ -176,6 +179,81 @@ def test_known_good_fixed_width_mf4_has_no_false_vlsd_failure(tmp_path):
     assert "STORAGE fixed-width in the channel-group record" in report
     assert "vlsd_offsets=N/A" in report
     assert "PASS python-can MF4Reader" in report
+
+
+class _GroupWithLoadAllDataBlocks:
+    def __init__(self):
+        self.calls = 0
+
+    def load_all_data_blocks(self):
+        self.calls += 1
+
+
+class _GroupWithOnlyGetDataBlocks:
+    def __init__(self):
+        self.drained = 0
+
+    def get_data_blocks(self):
+        for item in ("a", "b"):
+            self.drained += 1
+            yield item
+
+
+class _GroupWithNeitherLoader:
+    pass
+
+
+def test_populate_group_data_blocks_prefers_load_all_data_blocks():
+    group = _GroupWithLoadAllDataBlocks()
+    _populate_group_data_blocks(group)
+    assert group.calls == 1
+
+
+def test_populate_group_data_blocks_falls_back_to_get_data_blocks():
+    group = _GroupWithOnlyGetDataBlocks()
+    _populate_group_data_blocks(group)
+    assert group.drained == 2
+
+
+def test_populate_group_data_blocks_raises_when_neither_method_exists():
+    with pytest.raises(AttributeError):
+        _populate_group_data_blocks(_GroupWithNeitherLoader())
+
+
+def test_missing_data_block_loader_does_not_flip_a_known_good_file_to_fail(
+    tmp_path, monkeypatch
+):
+    """Regression for a CI-only failure: an asammdf build that renamed or
+    dropped Group.load_all_data_blocks()/get_data_blocks() must not make the
+    debug inspector call a known-good file bad — that's an environment gap,
+    not evidence about the file.
+    """
+    path = tmp_path / "known_good.mf4"
+    writer = can.MF4Writer(str(path))
+    try:
+        writer.on_message_received(
+            can.Message(
+                timestamp=time.time(),
+                arbitration_id=0x123,
+                data=bytes(range(8)),
+                channel=1,
+                is_rx=True,
+            )
+        )
+    finally:
+        writer.stop()
+
+    def missing_loader(group):
+        raise AttributeError("simulated: neither loader method exists")
+
+    monkeypatch.setattr(
+        "core.debug_inspector._populate_group_data_blocks", missing_loader
+    )
+
+    report = inspect_measurement(path, app_version="test")
+
+    assert "STATUS: PASS" in report
+    assert "DATA-GROUP MAP unavailable in this asammdf build" in report
 
 
 def test_non_mdf_debug_report_is_in_memory_plain_text(tmp_path):

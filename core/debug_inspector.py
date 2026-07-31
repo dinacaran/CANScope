@@ -150,6 +150,30 @@ def _exception_text(exc: BaseException, paths: Iterable[str | Path]) -> str:
     return " <- ".join(chain)
 
 
+def _populate_group_data_blocks(group: object) -> None:
+    """Force-load every data block for a channel group, across asammdf builds.
+
+    ``Group.load_all_data_blocks`` is a thin convenience wrapper around
+    ``get_data_blocks()``; different asammdf releases have added, renamed,
+    or dropped one or the other. Raises ``AttributeError`` if neither is
+    present, which the caller treats as an environment limitation rather
+    than evidence the measurement file is bad.
+    """
+    load_all = getattr(group, "load_all_data_blocks", None)
+    if callable(load_all):
+        load_all()
+        return
+    get_blocks = getattr(group, "get_data_blocks", None)
+    if callable(get_blocks):
+        for _ in get_blocks():
+            pass
+        return
+    raise AttributeError(
+        "installed asammdf's Group exposes neither load_all_data_blocks() "
+        "nor get_data_blocks()"
+    )
+
+
 def _edge_crc32(path: Path) -> tuple[str, str]:
     chunk = 64 * 1024
     with path.open("rb") as stream:
@@ -840,46 +864,57 @@ class _Inspection:
             )
 
         try:
-            group.load_all_data_blocks()
-            data_infos = list(getattr(group, "data_blocks", []) or [])
-            expected = cycles * (
-                int(getattr(cg, "samples_byte_nr", 0) or 0)
-                + int(getattr(cg, "invalidation_bytes_nr", 0) or 0)
-            )
-            logical = sum(
-                int(getattr(info, "original_size", 0) or 0)
-                for info in data_infos
-            )
+            _populate_group_data_blocks(group)
+        except AttributeError as exc:
+            # The installed asammdf build doesn't expose either loader
+            # method under this name; that's an environment gap, not
+            # evidence the file itself is bad, so it stays out of
+            # self.failures/self.warnings and never flips the overall
+            # STATUS.
             self.lines.append(
-                f"  DATA-GROUP MAP blocks={len(data_infos)} "
-                f"logical_bytes={logical:,} expected_record_bytes={expected:,}"
+                f"  DATA-GROUP MAP unavailable in this asammdf build: {exc}"
             )
-            for info in data_infos[:_MAX_BLOCK_LINKS]:
+        else:
+            try:
+                data_infos = list(getattr(group, "data_blocks", []) or [])
+                expected = cycles * (
+                    int(getattr(cg, "samples_byte_nr", 0) or 0)
+                    + int(getattr(cg, "invalidation_bytes_nr", 0) or 0)
+                )
+                logical = sum(
+                    int(getattr(info, "original_size", 0) or 0)
+                    for info in data_infos
+                )
                 self.lines.append(
-                    "    "
-                    f"address={_address(getattr(info, 'address', 0))} "
-                    f"original={getattr(info, 'original_size', '?')} "
-                    f"compressed={getattr(info, 'compressed_size', '?')} "
-                    f"type={getattr(info, 'block_type', '?')} "
-                    f"param={getattr(info, 'param', '?')} "
-                    f"location={getattr(info, 'location', '?')}"
+                    f"  DATA-GROUP MAP blocks={len(data_infos)} "
+                    f"logical_bytes={logical:,} expected_record_bytes={expected:,}"
                 )
-            if cycles and logical < expected:
-                self.probe(
-                    f"G{group_index} record-byte coverage",
-                    "WARN",
-                    f"logical={logical:,}, expected-at-least={expected:,}",
-                )
-            elif cycles:
-                self.probe(
-                    f"G{group_index} record-byte coverage",
-                    "PASS",
-                    f"logical={logical:,}, expected={expected:,}",
-                )
-        except Exception as exc:
-            detail = _exception_text(exc, [self.path])
-            self.lines.append(f"  DATA-GROUP MAP FAIL {detail}")
-            self.probe(f"G{group_index} data-group map", "FAIL", detail)
+                for info in data_infos[:_MAX_BLOCK_LINKS]:
+                    self.lines.append(
+                        "    "
+                        f"address={_address(getattr(info, 'address', 0))} "
+                        f"original={getattr(info, 'original_size', '?')} "
+                        f"compressed={getattr(info, 'compressed_size', '?')} "
+                        f"type={getattr(info, 'block_type', '?')} "
+                        f"param={getattr(info, 'param', '?')} "
+                        f"location={getattr(info, 'location', '?')}"
+                    )
+                if cycles and logical < expected:
+                    self.probe(
+                        f"G{group_index} record-byte coverage",
+                        "WARN",
+                        f"logical={logical:,}, expected-at-least={expected:,}",
+                    )
+                elif cycles:
+                    self.probe(
+                        f"G{group_index} record-byte coverage",
+                        "PASS",
+                        f"logical={logical:,}, expected={expected:,}",
+                    )
+            except Exception as exc:
+                detail = _exception_text(exc, [self.path])
+                self.lines.append(f"  DATA-GROUP MAP FAIL {detail}")
+                self.probe(f"G{group_index} data-group map", "FAIL", detail)
 
         backend = getattr(source, "_mdf", source)
         master_index = getattr(backend, "masters_db", {}).get(group_index)
