@@ -29,6 +29,21 @@ is guarded so the application starts normally without the package.
 A bare `config/` rule meant any new file under `config/` silently failed to
 stage. The rule now covers `config/diagnostics/` only.
 
+### Fixed — Debug mode's inspection thread no longer risks an intermittent crash.
+
+Each measurement/database inspection used to create and tear down its own
+QThread, deleting it from inside its own `finished` signal — a race that could
+abort the process. Debug mode now uses one worker thread for the whole
+session instead of one per inspection.
+
+### Added — A load or database failure opens the debug report automatically.
+
+Previously the forensic report was only collected if Ctrl+Alt+D had already
+been pressed. Now a failed Load + Decode, or a database that fails to parse,
+opens the debug window and starts collecting on its own (disable with
+`CANSCOPE_AUTO_DEBUG=0`). The report remains session-only; a new
+"Save Report..." button writes it to disk only when clicked.
+
 ## [v00.00.54] — 2026-07-27: Update: forensic debug mode added
 ## [v00.00.53] — 2026-07-26: bug fix: .arxml loading failure
 ### changed - auto retrieval of plotted signal without user action
