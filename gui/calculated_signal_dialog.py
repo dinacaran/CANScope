@@ -437,7 +437,12 @@ class CalculatedSignalDialog(QDialog):
 
 
 class FormulaLibraryPickerDialog(QDialog):
-    """Lists formulas loaded from a formula-library file for reuse or import."""
+    """Lists formulas loaded from a formula-library file for reuse or import.
+
+    Both buttons import: *Import Selected* takes the ticked rows, *Import All*
+    takes every row regardless of its tick. Double-clicking a row instead loads
+    that one formula into the editor behind this dialog (`use_requested`).
+    """
 
     use_requested = Signal(object)
 
@@ -479,17 +484,23 @@ class FormulaLibraryPickerDialog(QDialog):
         if self._definitions:
             self.table.selectRow(0)
 
-        self.use_button = QPushButton("Use Selected")
-        self.use_button.setEnabled(bool(self._definitions))
-        self.import_button = QPushButton("Import All Checked")
+        self.import_selected_button = QPushButton("Import Selected")
+        self.import_selected_button.setToolTip("Import only the formulas you have ticked")
+        self.import_all_button = QPushButton("Import All")
+        self.import_all_button.setToolTip("Import every formula in this file, ticked or not")
         if self._import_definitions is None:
-            self.import_button.setEnabled(False)
-            self.import_button.setToolTip("Importing into this measurement is not available")
+            self.import_selected_button.setToolTip(
+                "Importing into this measurement is not available"
+            )
+            self.import_all_button.setToolTip("Importing into this measurement is not available")
+        self.import_all_button.setEnabled(
+            self._import_definitions is not None and bool(self._definitions)
+        )
         self.close_button = QPushButton("Close")
 
         buttons = QHBoxLayout()
-        buttons.addWidget(self.use_button)
-        buttons.addWidget(self.import_button)
+        buttons.addWidget(self.import_selected_button)
+        buttons.addWidget(self.import_all_button)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
 
@@ -498,12 +509,22 @@ class FormulaLibraryPickerDialog(QDialog):
         layout.addWidget(self.table, stretch=1)
         layout.addLayout(buttons)
 
-        self.table.itemSelectionChanged.connect(
-            lambda: self.use_button.setEnabled(bool(self.table.selectedItems()))
-        )
-        self.use_button.clicked.connect(self._on_use_selected)
-        self.import_button.clicked.connect(self._on_import_checked)
+        # Wired after the table is populated so the initial setItem calls do not
+        # fire it.
+        self.table.itemChanged.connect(self._sync_import_selected_enabled)
+        self._sync_import_selected_enabled()
+        # Both buttons import now, so double-clicking a row is the remaining way
+        # to pull one formula into the editor behind this dialog.
+        self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
+        self.import_selected_button.clicked.connect(self._on_import_selected)
+        self.import_all_button.clicked.connect(self._on_import_all)
         self.close_button.clicked.connect(self.close)
+
+    @Slot()
+    def _sync_import_selected_enabled(self) -> None:
+        self.import_selected_button.setEnabled(
+            self._import_definitions is not None and bool(self._checked_definitions())
+        )
 
     def _checked_definitions(self) -> list[CalculatedSignalDefinition]:
         result = []
@@ -513,21 +534,30 @@ class FormulaLibraryPickerDialog(QDialog):
                 result.append(definition)
         return result
 
-    @Slot()
-    def _on_use_selected(self) -> None:
-        row = self.table.currentRow()
+    @Slot(object)
+    def _on_row_double_clicked(self, item: QTableWidgetItem) -> None:
+        row = item.row()
         if row < 0 or row >= len(self._definitions):
             return
         self.use_requested.emit(self._definitions[row])
         self.accept()
 
     @Slot()
-    def _on_import_checked(self) -> None:
-        if self._import_definitions is None:
-            return
+    def _on_import_selected(self) -> None:
         checked = self._checked_definitions()
         if not checked:
             QMessageBox.information(self, "Import formulas", "Check at least one formula to import.")
+            return
+        self._import(checked)
+
+    @Slot()
+    def _on_import_all(self) -> None:
+        if not self._definitions:
+            return
+        self._import(list(self._definitions))
+
+    def _import(self, checked: list[CalculatedSignalDefinition]) -> None:
+        if self._import_definitions is None:
             return
 
         missing = 0
