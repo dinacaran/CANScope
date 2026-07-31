@@ -49,6 +49,24 @@ OWNER_ONLY: tuple[str, ...] = (
     "app.py",                  # guards APP_NAME / APP_VERSION
 )
 
+# The release and enforcement machinery itself.
+#
+# build.yml runs with `contents: write` on a `v*.*.*` tag push. A contributor
+# cannot push that tag — only the owner can — but a merged PR that edited the
+# workflow gets to run its own steps under the owner's next release tag, with
+# the release token. Guarding `.github/` closes that merge-then-ride-the-tag
+# path.
+#
+# `tools/` is here for the same reason one step removed: without it, a PR could
+# edit this very file to delete entries from the lists above, and the guard
+# would pass its own diff. CODEOWNERS covers both paths, but it only *requests*
+# review — "Require review from Code Owners" is deliberately off, since a lone
+# owner cannot self-approve. So CI is the only enforcement point.
+PROTECTED_CI: tuple[str, ...] = (
+    ".github/",                # workflows, CODEOWNERS, PR template
+    "tools/",                  # this guard, the version check, git hooks
+)
+
 GROUPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     (
         "Validated loading/decoding pipeline",
@@ -66,6 +84,13 @@ GROUPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         OWNER_ONLY,
         "The owner bumps APP_VERSION and writes CHANGELOG.md at release time. "
         "Please drop these changes from your PR.",
+    ),
+    (
+        "CI, release, and policy enforcement",
+        PROTECTED_CI,
+        "Workflows run with write access on a release tag, and this guard "
+        "cannot be trusted to police edits to itself. Open an issue first; "
+        "the owner makes these changes directly.",
     ),
 )
 
