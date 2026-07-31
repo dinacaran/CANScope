@@ -18,30 +18,30 @@ from PySide6.QtWidgets import (
 
 
 class LoadDebugWorker(QObject):
-    """Run one read-only inspection callable away from the GUI thread."""
+    """Run read-only inspection callables away from the GUI thread.
+
+    One instance lives for the whole debug session and handles every
+    inspection, so the owning QThread is never created or destroyed per
+    inspection. Requests arrive on ``run_inspection`` as a queued signal.
+    """
 
     completed = Signal(str, str)
     failed = Signal(str, str)
 
-    def __init__(
-        self,
-        kind: str,
-        inspector: Callable[[], str],
-        parent: QObject | None = None,
+    @Slot(object)
+    def run_inspection(
+        self, payload: tuple[str, int, Callable[[], str]]
     ) -> None:
-        super().__init__(parent)
-        self.kind = kind
-        self.inspector = inspector
-
-    @Slot()
-    def run(self) -> None:
+        # The generation rides along so the payload is self-describing, but
+        # only the caller compares it — one inspection runs at a time.
+        kind, _generation, inspector = payload
         try:
-            self.completed.emit(self.kind, self.inspector())
+            self.completed.emit(kind, inspector())
         except Exception as exc:
             import traceback
 
             self.failed.emit(
-                self.kind,
+                kind,
                 f"{type(exc).__module__}.{type(exc).__name__}: {exc}\n\n"
                 f"{traceback.format_exc()}",
             )
