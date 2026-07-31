@@ -32,6 +32,9 @@ performance work, and dependency bumps.
 | `core/signal_store.py` | Data source for the entire app |
 | `requirements.txt` | Loading/decoding dependency versions |
 | `CANScope.spec` | PyInstaller build spec — changes break the portable build |
+| `CHANGELOG.md`, `app.py` | Release metadata — the owner writes these at release time |
+| `.github/` | Workflows run with write access on a release tag |
+| `tools/` | The guard cannot police edits to itself |
 
 The full policy is in /docs/PR_policy.md. It is enforced automatically by
 `tools/check_protected_paths.py`, which runs on every PR. You can check your
