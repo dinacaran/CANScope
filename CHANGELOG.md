@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v00.00.55] — 2026-07-31:
 
 ### Added — Calculated signals can be used as inputs to other calculated signals.
 
