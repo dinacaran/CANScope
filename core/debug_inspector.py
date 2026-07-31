@@ -13,11 +13,39 @@ from datetime import datetime
 from importlib import metadata
 from pathlib import Path
 from typing import Iterable, Mapping
+import gc
 import platform
 import struct
 import sys
 import traceback
 import zlib
+
+
+def _collect_failed_mdf_open() -> None:
+    """Finalise the wreckage of an ``asammdf.MDF`` constructor that raised.
+
+    A constructor that fails part-way leaves behind an MDF4 we never get a
+    handle on, and its ``__del__`` calls ``close()``, which reads attributes
+    ``__init__`` never assigned. Left alone it is finalised at some arbitrary
+    later collection — potentially inside a Qt paint or at interpreter
+    shutdown, where this codebase has a history of native crashes. Collecting
+    it here pins that to a known-safe point. The hook drops only the
+    AttributeError that the upstream ``__del__`` raises; anything else is
+    passed on. Inspecting corrupt files is this module's normal workload, so
+    this path is common rather than exceptional.
+    """
+    previous = sys.unraisablehook
+
+    def _ignore_broken_del(unraisable) -> None:
+        if isinstance(unraisable.exc_value, AttributeError):
+            return
+        previous(unraisable)
+
+    sys.unraisablehook = _ignore_broken_del
+    try:
+        gc.collect()
+    finally:
+        sys.unraisablehook = previous
 
 
 _MDF4_ID = struct.Struct("<8s8s8s4sH30s2H")
@@ -1232,11 +1260,16 @@ def inspect_measurement(
                 source.close()
             except Exception:
                 pass
+        else:
+            # The open failed. Only now, with the handler's traceback released,
+            # is the half-built MDF4 it left behind actually unreachable.
+            _collect_failed_mdf_open()
 
     body.extend(inspection.lines)
 
     # Exercise the exact python-can path independently after closing the first
     # MDF handle.  Only one message is requested.
+    reader = None
     try:
         import can
 
@@ -1269,6 +1302,11 @@ def inspect_measurement(
         detail = _exception_text(exc, [path])
         inspection.probe("python-can MF4Reader", "FAIL", detail)
         body.append(f"\nPYTHON-CAN PROBE\n  FAIL {detail}")
+    finally:
+        if reader is None:
+            # MF4Reader builds an MDF internally, so a constructor that raises
+            # strands one the same way a direct open does.
+            _collect_failed_mdf_open()
 
     return inspection.result_text(body)
 
