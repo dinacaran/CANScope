@@ -9,7 +9,7 @@ import pytest
 from PySide6.QtCore import qInstallMessageHandler
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from gui.main_window import MainWindow
 
@@ -186,3 +186,217 @@ def test_closing_the_window_mid_inspection_tears_down_cleanly(
     assert window._debug_worker is None
     assert window._debug_busy is False
     assert not [m for m in messages if THREAD_DESTROYED_WARNING in m]
+
+
+# ── Auto-launch on failure ─────────────────────────────────────────────────
+
+
+def _prepared_window(monkeypatch, measurement) -> MainWindow:
+    """A window with a measurement selected and the failure modal stubbed."""
+    monkeypatch.setattr(
+        QMessageBox, "critical", lambda *args, **kwargs: None
+    )
+    window = MainWindow("CANScope", "test")
+    window.measurement_path = str(measurement)
+    return window
+
+
+def test_load_failure_auto_opens_the_debug_window_with_debug_mode_off(
+    qapp, monkeypatch, tmp_path
+):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+    window = _prepared_window(monkeypatch, measurement)
+    assert window._debug_mode is False
+    assert window._debug_window is None
+
+    window._on_worker_failed("MDF wrong signal data block refence")
+    _wait_for_debug_worker(window, qapp)
+
+    assert window._debug_mode is True
+    assert window._debug_auto_launched is True
+    assert window._debug_window is not None
+
+    report = window._debug_window.report.toPlainText()
+    # Both the failure banner and the measurement inspection are present.
+    assert "LOAD + DECODE RESULT: FAIL" in report
+    assert "Load + Decode failed" in report
+    assert "File: issue.csv" in report
+    assert not list(tmp_path.glob("*.json"))
+    assert not list(tmp_path.glob("debug*.txt"))
+
+    window.toggle_debug_mode()
+    assert window._debug_auto_launched is False
+    window.close()
+
+
+def test_load_failure_with_debug_mode_already_on_does_not_restart_the_report(
+    qapp, monkeypatch, tmp_path
+):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+    window = _prepared_window(monkeypatch, measurement)
+    window.toggle_debug_mode()
+    window._queue_measurement_debug_inspection(str(measurement))
+    _wait_for_debug_worker(window, qapp)
+
+    existing_window = window._debug_window
+    generation_before = window._debug_generation
+
+    window._on_worker_failed("decode blew up")
+    _wait_for_debug_worker(window, qapp)
+
+    # Same window, same report generation: the banner is appended, the
+    # existing inspection is not thrown away and re-run.
+    assert window._debug_window is existing_window
+    assert window._debug_generation == generation_before
+    assert window._debug_auto_launched is False
+    report = window._debug_window.report.toPlainText()
+    assert "File: issue.csv" in report
+    assert "LOAD + DECODE RESULT: FAIL" in report
+
+    window.toggle_debug_mode()
+    window.close()
+
+
+def test_canscope_auto_debug_zero_suppresses_auto_launch(
+    qapp, monkeypatch, tmp_path
+):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+    monkeypatch.setenv("CANSCOPE_AUTO_DEBUG", "0")
+    window = _prepared_window(monkeypatch, measurement)
+
+    window._on_worker_failed("decode blew up")
+    qapp.processEvents()
+
+    assert window._debug_mode is False
+    assert window._debug_window is None
+    assert window._debug_thread is None
+    assert not list(tmp_path.glob("*.txt"))
+    assert not list(tmp_path.glob("*.json"))
+    window.close()
+
+
+def test_a_failing_inspector_does_not_re_enter_the_auto_launcher(
+    qapp, monkeypatch, tmp_path
+):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+
+    def exploding_inspect(path, app_version=""):
+        raise RuntimeError("inspector exploded")
+
+    monkeypatch.setattr(
+        "gui.main_window.inspect_measurement", exploding_inspect
+    )
+    window = _prepared_window(monkeypatch, measurement)
+
+    launches = []
+    original = window._auto_launch_debug
+
+    def counting_auto_launch(reason, detail):
+        launches.append(reason)
+        return original(reason, detail)
+
+    monkeypatch.setattr(window, "_auto_launch_debug", counting_auto_launch)
+
+    window._on_worker_failed("decode blew up")
+    _wait_for_debug_worker(window, qapp)
+
+    assert launches == ["Load + Decode failed"]
+    report = window._debug_window.report.toPlainText()
+    assert "DEBUG INSPECTOR INTERNAL FAILURE" in report
+    assert "inspector exploded" in report
+
+    window.toggle_debug_mode()
+    window.close()
+
+
+def test_auto_launch_is_not_reentrant(qapp, monkeypatch, tmp_path):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+    window = _prepared_window(monkeypatch, measurement)
+
+    calls = []
+    original_append = window._append_debug_runtime
+
+    def reentering_append(message):
+        calls.append(message)
+        # Stand in for anything on the banner path that itself fails and
+        # tries to launch the report again.
+        window._auto_launch_debug("recursive", "should be ignored")
+        original_append(message)
+
+    monkeypatch.setattr(window, "_append_debug_runtime", reentering_append)
+
+    window._auto_launch_debug("first", "detail")
+    _wait_for_debug_worker(window, qapp)
+
+    assert len(calls) == 1
+    assert "should be ignored" not in "".join(calls)
+
+    window.toggle_debug_mode()
+    window.close()
+
+
+def test_dbc_manager_records_databases_it_cannot_read(qapp, tmp_path):
+    broken_dbc = tmp_path / "broken.dbc"
+    broken_dbc.write_text("this is not a database at all\n", encoding="utf-8")
+
+    from core.channel_config import ChannelConfig
+    from gui.dbc_manager import DBCManagerDialog
+
+    # Building the dialog computes match quality for every assigned row,
+    # which is where the unreadable database is noticed.
+    dlg = DBCManagerDialog(
+        channel_config=ChannelConfig.from_single_dbc(str(broken_dbc)),
+        channels_in_file=[1],
+        ids_per_channel={1: {0x100}},
+    )
+    assert str(broken_dbc) in dlg.load_errors()
+    dlg.deleteLater()
+    qapp.processEvents()
+
+
+def test_unreadable_database_auto_launches_the_debug_report(
+    qapp, monkeypatch, tmp_path
+):
+    measurement = tmp_path / "issue.csv"
+    measurement.write_text("time,value\n0,1\n", encoding="utf-8")
+    broken_dbc = tmp_path / "broken.dbc"
+    broken_dbc.write_text("this is not a database at all\n", encoding="utf-8")
+
+    from core.channel_config import ChannelConfig
+    from gui.dbc_manager import DBCManagerDialog
+
+    class _AcceptingDialog:
+        DialogCode = DBCManagerDialog.DialogCode
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def exec(self):
+            return DBCManagerDialog.DialogCode.Accepted
+
+        def result_config(self):
+            return ChannelConfig.from_single_dbc(str(broken_dbc))
+
+        def load_errors(self):
+            return {str(broken_dbc): "Failed to load database file"}
+
+    monkeypatch.setattr("gui.main_window.DBCManagerDialog", _AcceptingDialog)
+    window = _prepared_window(monkeypatch, measurement)
+    assert window._debug_mode is False
+
+    window.choose_dbc()
+    _wait_for_debug_worker(window, qapp)
+
+    assert window._debug_mode is True
+    assert window._debug_auto_launched is True
+    report = window._debug_window.report.toPlainText()
+    assert "broken.dbc" in report
+    assert "Database failed to load" in report
+
+    window.toggle_debug_mode()
+    window.close()

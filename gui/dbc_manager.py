@@ -193,6 +193,10 @@ class DBCManagerDialog(QDialog):
         self._data_provider    = data_provider  # callable for refresh
         self._rows: list[_DBCRow] = []
         self._file_match_data = self._normalise_file_match_data(ids_per_channel)
+        # Databases that would not parse, keyed by path. _compute_match is
+        # the only place that tries to read them, so it is where this is
+        # filled in; the caller uses it to launch the forensic report.
+        self._load_errors: dict[str, str] = {}
 
         # ── Config name ───────────────────────────────────────────────────
         name_row = QHBoxLayout()
@@ -298,6 +302,10 @@ class DBCManagerDialog(QDialog):
 
     # ── Public result ─────────────────────────────────────────────────────
 
+    def load_errors(self) -> dict[str, str]:
+        """Return {dbc_path: message} for databases that would not parse."""
+        return dict(self._load_errors)
+
     def result_config(self) -> ChannelConfig:
         """Return the ChannelConfig as configured by the user."""
         cfg = ChannelConfig(name=self._name_edit.text().strip() or "Unnamed")
@@ -401,8 +409,10 @@ class DBCManagerDialog(QDialog):
             dbc_ids, dbc_pgn_by_id = _load_database_match_data(
                 str(path), stat.st_mtime_ns, stat.st_size
             )
-        except Exception:
+        except Exception as exc:
+            self._load_errors[dbc_path] = str(exc)
             return 0.0, "can't read database", ALL_CHANNELS_KEY
+        self._load_errors.pop(dbc_path, None)
 
         if not dbc_ids or not self._ids_per_channel:
             return 0.0, "0 / 0 IDs", ALL_CHANNELS_KEY
