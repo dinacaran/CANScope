@@ -9,7 +9,7 @@
 # Default
 *                           @dinacaran
 
-# Validated loading/decoding pipeline — see CLAUDE.md
+# Validated loading/decoding pipeline — see docs/PR_Policy.md
 /core/load_worker.py        @dinacaran
 /core/channel_config.py     @dinacaran
 /core/dbc_decoder.py        @dinacaran
@@ -30,4 +30,4 @@
 # CI and policy
 /.github/                   @dinacaran
 /tools/                     @dinacaran
-/CLAUDE.md                  @dinacaran
+/docs/PR_Policy.md          @dinacaran

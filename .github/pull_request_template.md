@@ -10,7 +10,7 @@
 
 - [ ] `python -m pytest tests/` passes locally
 - [ ] `python app.py` launches and loads a real measurement file with no regression
-- [ ] No files from the protected list in `CLAUDE.md` are touched
+- [ ] No files from the protected list in `docs/PR_Policy.md` are touched
       (loading/decoding pipeline, `core/signal_store.py`, `CANScope.spec`, `requirements.txt`)
 - [ ] `APP_VERSION` in `app.py` and `CHANGELOG.md` are **not** modified —
       the owner updates those at release time

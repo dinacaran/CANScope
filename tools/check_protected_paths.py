@@ -1,7 +1,7 @@
 """
 Fail if a change touches files the project owner has declared protected.
 
-The lists below are transcribed from CLAUDE.md. They exist so the rule is
+The lists below are transcribed from docs/PR_Policy.md. They exist so the rule is
 enforced by CI rather than depending on a contributor (human or AI agent)
 having read the doc.
 
@@ -59,7 +59,7 @@ GROUPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     (
         "Protected core files",
         PROTECTED_OTHER,
-        "These are listed under 'What NOT to Modify Without Instruction' in CLAUDE.md.",
+        "These are listed under 'What NOT to Modify Without Instruction' in docs/PR_Policy.md.",
     ),
     (
         "Owner-only release metadata",
@@ -127,7 +127,7 @@ def main(argv: list[str]) -> int:
         print(f"    {note}\n", file=sys.stderr)
 
     print(
-        "See CLAUDE.md for the full policy. If this change is intentional and\n"
+        "See docs/PR_Policy.md for the full policy. If this change is intentional and\n"
         "approved, the project owner can apply the `approved-pipeline-change`\n"
         "label to this PR to skip this check.",
         file=sys.stderr,
