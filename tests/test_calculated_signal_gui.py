@@ -516,7 +516,7 @@ def test_library_buttons_disabled_without_callables(qapp):
         dialog.close()
 
 
-def test_load_library_use_selected_fills_fields_in_create_mode(qapp, monkeypatch, tmp_path):
+def test_load_library_double_click_fills_fields_in_create_mode(qapp, monkeypatch, tmp_path):
     signal_key = "CH1::Message::A"
     picked = [CalculatedSignalDefinition("Picked", f"`{signal_key}` * 2", "rpm")]
     path = tmp_path / "lib.formulas.json"
@@ -533,8 +533,7 @@ def test_load_library_use_selected_fills_fields_in_create_mode(qapp, monkeypatch
         qapp.processEvents()
         picker = dialog._library_picker
         assert picker is not None
-        picker.table.selectRow(0)
-        picker.use_button.click()
+        picker.table.itemDoubleClicked.emit(picker.table.item(0, 1))
         qapp.processEvents()
 
         assert dialog.name_edit.text() == "Picked"
@@ -545,7 +544,7 @@ def test_load_library_use_selected_fills_fields_in_create_mode(qapp, monkeypatch
         dialog.close()
 
 
-def test_load_library_use_selected_leaves_name_untouched_in_edit_mode(qapp, monkeypatch, tmp_path):
+def test_load_library_double_click_leaves_name_untouched_in_edit_mode(qapp, monkeypatch, tmp_path):
     signal_key = "CH1::Message::A"
     picked = [CalculatedSignalDefinition("Picked", f"`{signal_key}` * 2", "rpm")]
     path = tmp_path / "lib.formulas.json"
@@ -565,8 +564,7 @@ def test_load_library_use_selected_leaves_name_untouched_in_edit_mode(qapp, monk
         qapp.processEvents()
         picker = dialog._library_picker
         assert picker is not None
-        picker.table.selectRow(0)
-        picker.use_button.click()
+        picker.table.itemDoubleClicked.emit(picker.table.item(0, 1))
         qapp.processEvents()
 
         assert dialog.name_edit.text() == "Original"
@@ -609,7 +607,7 @@ def test_import_checked_warns_about_missing_signal_references(qapp, monkeypatch,
         qapp.processEvents()
         picker = dialog._library_picker
         picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
-        picker.import_button.click()
+        picker.import_selected_button.click()
         qapp.processEvents()
 
         assert calls == [False]
@@ -650,7 +648,7 @@ def test_import_checked_reports_collisions_and_offers_replace(qapp, monkeypatch,
         qapp.processEvents()
         picker = dialog._library_picker
         picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
-        picker.import_button.click()
+        picker.import_selected_button.click()
         qapp.processEvents()
 
         assert len(calls) == 2
@@ -658,6 +656,73 @@ def test_import_checked_reports_collisions_and_offers_replace(qapp, monkeypatch,
         assert calls[1][1] is True
         assert calls[1][0][0].name == "Existing"
         assert informed[-1] == "1 imported, 0 skipped"
+    finally:
+        dialog.close()
+
+
+def test_import_all_imports_unchecked_formulas_too(qapp, monkeypatch, tmp_path):
+    calls = []
+
+    def fake_import(definitions, overwrite):
+        calls.append([d.name for d in definitions])
+        return ImportReport(imported=[d.name for d in definitions], skipped=[], errors=[])
+
+    signal_key = "CH1::Message::A"
+    library_defs = [
+        CalculatedSignalDefinition("First", f"`{signal_key}` + 1", "V"),
+        CalculatedSignalDefinition("Second", f"`{signal_key}` * 2", "V"),
+    ]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, library_defs)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        library_definitions=lambda: [],
+        import_definitions=fake_import,
+    )
+    try:
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+        # Only one row ticked — "Import All" must ignore the ticks entirely.
+        picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        picker.import_all_button.click()
+        qapp.processEvents()
+
+        assert calls == [["First", "Second"]]
+    finally:
+        dialog.close()
+
+
+def test_import_selected_is_disabled_until_a_row_is_checked(qapp, monkeypatch, tmp_path):
+    signal_key = "CH1::Message::A"
+    library_defs = [CalculatedSignalDefinition("First", f"`{signal_key}` + 1", "V")]
+    path = tmp_path / "lib.formulas.json"
+    save_formula_library(path, library_defs)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+
+    dialog = CalculatedSignalDialog(
+        [signal_key],
+        library_definitions=lambda: [],
+        import_definitions=lambda defs, overwrite: ImportReport([], [], []),
+    )
+    try:
+        dialog.load_library_button.click()
+        qapp.processEvents()
+        picker = dialog._library_picker
+
+        assert not picker.import_selected_button.isEnabled()
+        assert picker.import_all_button.isEnabled()
+
+        picker.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        qapp.processEvents()
+        assert picker.import_selected_button.isEnabled()
+
+        picker.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        qapp.processEvents()
+        assert not picker.import_selected_button.isEnabled()
     finally:
         dialog.close()
 
