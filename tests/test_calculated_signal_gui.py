@@ -6,9 +6,13 @@ import time
 import pytest
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
-from core.calculated_signals import CalculatedSignalDefinition, ImportReport
+from core.calculated_signals import (
+    TIME_SIGNAL_KEY,
+    CalculatedSignalDefinition,
+    ImportReport,
+)
 from core.calculated_signals import parse_formula
 from core.formula_library import load_formula_library, save_formula_library
 from core.signal_store import SignalSeries
@@ -345,6 +349,7 @@ def test_picker_lists_measurement_and_generated_sections(qapp):
 
         assert rows == [
             ("Measurement signals", True, False),
+            (TIME_SIGNAL_KEY, False, False),
             (measurement_key, False, False),
             ("Generated signals", True, False),
             (generated_key, False, False),
@@ -365,6 +370,22 @@ def test_picker_hides_the_generated_header_when_there_are_none(qapp):
         assert ("Generated signals", True, True) in _picker_rows(dialog)
     finally:
         dialog.close()
+
+
+def test_time_signal_can_drive_a_generated_signal(window, qapp):
+    definition = CalculatedSignalDefinition(
+        "ElapsedMilliseconds",
+        f"`{TIME_SIGNAL_KEY}` * 1000",
+        "ms",
+    )
+
+    window._queue_calculation(definition, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+
+    result = window.calculated_signals.cached_series(definition.key)
+    assert result is not None
+    assert list(result.timestamps) == [0.0, 1.0, 2.0]
+    assert list(result.values) == [0.0, 1000.0, 2000.0]
 
 
 def test_excluded_keys_are_absent_from_the_picker_in_edit_mode(qapp):
@@ -427,6 +448,7 @@ def test_search_filters_both_sections_and_hides_empty_headers(qapp):
         dialog.search_edit.setText("speed")
         assert _picker_rows(dialog) == [
             ("Measurement signals", True, False),
+            (TIME_SIGNAL_KEY, False, True),
             (measurement_key, False, False),
             ("Generated signals", True, False),
             (generated_key, False, False),
@@ -500,6 +522,47 @@ def test_editing_a_signal_invalidates_and_recalculates_plotted_dependents(window
     # Plotted: recalculated straight away.  Not plotted: left for the lazy path.
     assert list(window.calculated_signals.cached_series(second.key).values) == [101.0, 201.0, 301.0]
     assert window.calculated_signals.cached_series(third.key) is None
+
+
+def test_rename_generated_signal_preserves_plot_and_updates_dependants(
+    window, qapp, monkeypatch
+):
+    source_key = window.store.all_keys()[0]
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    window._queue_calculation(first, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+    second = CalculatedSignalDefinition("Second", f"`{first.key}` + 1", "V")
+    window._queue_calculation(second, "create", plot_after=False)
+    _wait_for_calculation(window, qapp)
+    window.add_signal_to_plot(first.key)
+    window.add_signal_to_plot(second.key)
+    plotted = window.plot_panel._items[first.key]
+    plotted.group = "Generated"
+    dependent_cache = window.calculated_signals.cached_series(second.key)
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *args, **kwargs: ("Renamed", True),
+    )
+
+    window.rename_generated_signal(first.key)
+
+    new_key = "CH?::Generate Signals::Renamed"
+    assert not window.calculated_signals.contains_key(first.key)
+    assert window.calculated_signals.contains_key(new_key)
+    assert window.calculated_signals.definition(second.key).formula == f"`{new_key}` + 1"
+    assert window.calculated_signals.cached_series(second.key) is dependent_cache
+    assert window.plot_panel.plotted_keys() == [new_key, second.key]
+    assert window.plot_panel._items[new_key] is plotted
+    assert plotted.key == new_key
+    assert plotted.series.signal_name == "Renamed"
+    assert plotted.group == "Generated"
+    assert all(
+        first.key not in snapshot
+        for snapshot, _current_key in window.plot_panel._undo_stack
+    )
+    generated_root = window.signal_tree.tree.topLevelItem(0)
+    assert generated_root.child(0).text(0) == "Renamed"
 
 
 def test_delete_is_blocked_while_another_signal_depends_on_it(window, qapp, monkeypatch):

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from core.calculated_signals import (
     _FUNCTIONS,
+    TIME_SIGNAL_KEY,
     CalculatedSignalDefinition,
     CalculatedSignalError,
     FunctionSpec,
@@ -135,6 +136,12 @@ def _formula_help_text() -> str:
         "parenthesized: (a > 0) & (b > 0), not a > 0 & b > 0.\n"
         "Domain errors such as sqrt of a negative number or log of zero also "
         "produce NaN, the same as division by zero.\n"
+        "lag(signal, samples) counts samples on that source signal; samples must "
+        "be a nonnegative whole number. delay(signal, seconds) uses zero-order "
+        "hold at t - seconds. Both produce NaN before enough history exists.\n"
+        "rolling_sum(signal, samples) includes the current source sample and "
+        "requires a complete positive-size window. integral(signal) accumulates "
+        "value x elapsed seconds using zero-order hold and starts at zero.\n"
         "pi and e are available as constants."
     )
     return "\n\n".join(sections)
@@ -224,7 +231,10 @@ class CalculatedSignalDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._signal_keys = list(signal_keys)
+        # Time is a synthetic measurement input whose values are the elapsed
+        # timestamps in seconds. Keep it first so it is easy to find.
+        self._signal_keys = [TIME_SIGNAL_KEY]
+        self._signal_keys.extend(key for key in signal_keys if key != TIME_SIGNAL_KEY)
         # Excluded keys are the signal itself plus everything downstream of it, so a
         # formula built in this dialog can never close a dependency cycle.
         self._excluded_keys = set(excluded_keys)
