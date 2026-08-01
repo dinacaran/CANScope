@@ -83,6 +83,187 @@ def test_union_timebase_uses_zero_order_hold_after_all_sources_start():
     assert estimate_output_points(definition, sources) == 4
 
 
+def test_lag_steps_back_through_source_samples_on_an_irregular_timebase():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Lagged", f"lag(`{key}`, 1)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, 20.0, 30.0], equal_nan=True
+    )
+
+
+def test_delay_uses_zero_order_hold_at_t_minus_seconds():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Delayed", f"delay(`{key}`, 1.0)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, 20.0, 30.0], equal_nan=True
+    )
+
+
+def test_delay_reads_history_even_when_the_current_source_value_is_nan():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0], [10.0, np.nan, 30.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Delayed", f"delay(`{key}`, 1)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, np.nan], equal_nan=True
+    )
+
+
+def test_missing_temporal_history_stays_nan_through_comparisons():
+    key = "CH1::M::X"
+    temporal_sources = {key: _series(key, [0.0, 1.0], [10.0, 20.0])}
+
+    result = calculate_series(
+        CalculatedSignalDefinition("DelayedPositive", f"delay(`{key}`, 1) > 0"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_values(), [np.nan, 1.0], equal_nan=True)
+
+
+def test_lag_and_delay_follow_the_shared_output_grid():
+    x_key = "CH1::M::X"
+    clock_key = "CH1::M::Clock"
+    temporal_sources = {
+        x_key: _series(x_key, [0.0, 2.0, 4.0], [10.0, 20.0, 30.0]),
+        clock_key: _series(clock_key, [1.0, 3.0], [0.0, 0.0]),
+    }
+    definition = CalculatedSignalDefinition(
+        "Temporal",
+        f"delay(`{x_key}`, 1) + lag(`{x_key}`, 1) + (`{clock_key}` * 0)",
+    )
+
+    result = calculate_series(definition, temporal_sources)
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 20.0, 30.0, 40.0], equal_nan=True
+    )
+
+
+def test_rolling_sum_uses_complete_windows_of_source_samples():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [1.0, 2.0, 3.0, 4.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_sum(`{key}`, 3)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, 6.0, 9.0], equal_nan=True
+    )
+
+
+def test_rolling_sum_recovers_after_nan_leaves_the_window():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0], [1.0, np.nan, 3.0, 4.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_sum(`{key}`, 2)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, np.nan, 7.0], equal_nan=True
+    )
+
+
+def test_integral_uses_zero_order_hold_on_irregular_timestamps():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Integral", f"integral(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_values(), [0.0, 5.0, 35.0, 125.0])
+
+
+def test_integral_uses_partial_intervals_and_stops_at_final_source_sample():
+    x_key = "CH1::M::X"
+    clock_key = "CH1::M::Clock"
+    temporal_sources = {
+        x_key: _series(x_key, [0.0, 2.0, 4.0], [10.0, 20.0, 30.0]),
+        clock_key: _series(clock_key, [1.0, 3.0, 5.0], [0.0, 0.0, 0.0]),
+    }
+    definition = CalculatedSignalDefinition(
+        "Integral", f"integral(`{x_key}`) + (`{clock_key}` * 0)"
+    )
+
+    result = calculate_series(definition, temporal_sources)
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [1.0, 2.0, 3.0, 4.0, 5.0])
+    np.testing.assert_allclose(result.numpy_values(), [10.0, 20.0, 40.0, 60.0, 60.0])
+
+
+def test_integral_is_nan_from_the_first_nonfinite_source_sample():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0], [10.0, np.nan, 30.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Integral", f"integral(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [0.0, np.nan, np.nan], equal_nan=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("formula", "message"),
+    [
+        ("lag({x}, 1.5)", "whole number"),
+        ("lag({x}, -1)", "negative"),
+        ("delay({x}, -0.1)", "negative"),
+        ("delay({x}, {x})", "single numeric value"),
+        ("rolling_sum({x}, 0)", "greater than zero"),
+        ("rolling_sum({x}, 1.5)", "whole number"),
+    ],
+)
+def test_temporal_functions_reject_invalid_offsets(formula, message):
+    with pytest.raises(CalculatedSignalError, match=message):
+        _calc1(formula, [1.0, 2.0, 3.0])
+
+
+def test_temporal_functions_require_a_direct_signal_reference(sources):
+    key = "CH1::Message::A"
+    with pytest.raises(CalculatedSignalError, match="direct signal reference"):
+        parse_formula(f"lag(abs(`{key}`), 1)", sources)
+
+
 def test_division_by_zero_and_nonfinite_inputs_become_nan():
     a_key = "CH1::M::A"
     b_key = "CH1::M::B"
@@ -380,6 +561,44 @@ def test_manager_persists_definitions_but_not_cached_samples(sources):
     assert restored.cached_series(definition.key) is None
     with pytest.raises(CalculatedSignalError, match="already exists"):
         restored.commit(CalculatedSignalDefinition("scaled", definition.formula))
+
+
+def test_manager_rename_updates_key_cache_and_dependent_formulas(sources):
+    manager = CalculatedSignalManager()
+    source_key = "CH1::Message::A"
+    first = CalculatedSignalDefinition("First", f"`{source_key}` * 10", "V")
+    first_series = calculate_series(first, sources)
+    manager.commit(first, first_series)
+    second = CalculatedSignalDefinition(
+        "Second", f"`  {first.key}  ` + 1", "V"
+    )
+    second_series = calculate_series(second, {first.key: first_series})
+    manager.commit(second, second_series)
+
+    new_key = manager.rename(first.key, "Renamed")
+
+    assert new_key == "CH?::Generate Signals::Renamed"
+    assert not manager.contains_key(first.key)
+    assert manager.definition(new_key).name == "Renamed"
+    assert manager.cached_series(new_key) is first_series
+    assert first_series.key == new_key
+    assert manager.definition(second.key).formula == f"`{new_key}` + 1"
+    assert manager.dependencies_of(second.key) == [new_key]
+    assert manager.cached_series(second.key) is second_series
+
+
+def test_manager_rejects_duplicate_rename_without_changing_definitions():
+    manager = CalculatedSignalManager()
+    first = CalculatedSignalDefinition("First", "`CH1::M::A` + 1")
+    second = CalculatedSignalDefinition("Second", "`CH1::M::A` + 2")
+    manager.commit(first)
+    manager.commit(second)
+    before = manager.to_config()
+
+    with pytest.raises(CalculatedSignalError, match="already exists"):
+        manager.rename(first.key, "second")
+
+    assert manager.to_config() == before
 
 
 def test_import_definitions_merges_without_clearing_existing(sources):

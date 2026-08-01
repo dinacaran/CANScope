@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -40,10 +41,12 @@ from PySide6.QtWidgets import (
 from core.export import ExportService, ExportTimebase
 from core.calculated_signals import (
     LARGE_OUTPUT_WARNING_POINTS,
+    TIME_SIGNAL_KEY,
     CalculatedSignalDefinition,
     CalculatedSignalError,
     CalculatedSignalManager,
     ImportReport,
+    build_time_signal,
     formula_references,
     parse_formula,
 )
@@ -180,6 +183,7 @@ class MainWindow(QMainWindow):
         self.measurement_box.setReadOnly(True)
 
         self.signal_tree.signalActivated.connect(self.add_signals_to_plot)
+        self.signal_tree.generatedRenameRequested.connect(self.rename_generated_signal)
         self.signal_tree.generatedEditRequested.connect(self.edit_generated_signal)
         self.signal_tree.generatedDeleteRequested.connect(self.delete_generated_signal)
         self.plot_panel.selectionChanged.connect(self._on_plot_selection_changed)
@@ -1115,6 +1119,55 @@ QToolButton:pressed { background-color: #1a2a3a; }
             return
         self._queue_calculation(dialog.definition(), "edit", plot_after=False)
 
+    def rename_generated_signal(self, key: str) -> None:
+        definition = self.calculated_signals.definition(key)
+        if definition is None:
+            return
+        if self._calc_thread is not None or self._calc_queue:
+            QMessageBox.information(
+                self,
+                "Calculation in progress",
+                "Wait for generated-signal calculations to finish before renaming.",
+            )
+            return
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename generated signal",
+            "New signal name:",
+            text=definition.name,
+        )
+        if not accepted:
+            return
+        try:
+            new_key = self.calculated_signals.rename(key, new_name)
+        except CalculatedSignalError as exc:
+            QMessageBox.warning(self, "Cannot rename generated signal", str(exc))
+            return
+        if new_key == key:
+            return
+
+        self.plot_panel.rename_series_key(key, new_key)
+        self._pending_plot_keys = [
+            new_key if pending_key == key else pending_key
+            for pending_key in self._pending_plot_keys
+        ]
+        for state in (
+            self._pending_plot_colors,
+            self._pending_plot_visible,
+            self._pending_plot_groups,
+            self._pending_plot_axis_visible,
+            self._pending_plot_own_axis,
+        ):
+            if key in state:
+                state[new_key] = state.pop(key)
+
+        self._refresh_generated_signal_tree()
+        self._log(f"Renamed generated signal: {definition.name} -> {new_name.strip()}")
+        self._update_status(
+            f"Renamed generated signal to {new_name.strip()}",
+            "Dependent formulas and saved configuration use the new name.",
+        )
+
     def delete_generated_signal(self, key: str) -> None:
         definition = self.calculated_signals.definition(key)
         if definition is None:
@@ -1167,6 +1220,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
         generated ones, which SignalStore knows nothing about."""
         resolved = {}
         for key in references:
+            if key == TIME_SIGNAL_KEY:
+                continue
             if self.calculated_signals.contains_key(key):
                 series = self.calculated_signals.cached_series(key)
             else:
@@ -1174,6 +1229,17 @@ QToolButton:pressed { background-color: #1a2a3a; }
             if series is None:
                 raise CalculatedSignalError(f"Signal not available: {key}")
             resolved[key] = series
+        if TIME_SIGNAL_KEY in references:
+            # When other inputs are referenced, their timestamps define the
+            # useful time grid. A time-only formula spans the full measurement.
+            time_bases = resolved.values()
+            if not resolved and self.store is not None:
+                time_bases = (
+                    series
+                    for key in self.store.all_keys()
+                    if (series := self.store.get_series(key)) is not None
+                )
+            resolved[TIME_SIGNAL_KEY] = build_time_signal(time_bases)
         return resolved
 
     def _uncomputed_prerequisites(self, references) -> list[CalculatedSignalDefinition]:
@@ -1211,19 +1277,33 @@ QToolButton:pressed { background-color: #1a2a3a; }
         try:
             if operation == "create":
                 self.calculated_signals.assert_unique_name(definition.name)
-            available = self.store.all_keys() + self.calculated_signals.keys()
+            available = [
+                TIME_SIGNAL_KEY,
+                *self.store.all_keys(),
+                *self.calculated_signals.keys(),
+            ]
             parsed = parse_formula(definition.formula, available)
             prerequisites = self._uncomputed_prerequisites(parsed.references)
             # Inputs that are not calculated yet contribute no known length; each of
             # them is queued in its own right and is not warned about separately.
             estimated_points = 0
             for key in parsed.references:
+                if key == TIME_SIGNAL_KEY:
+                    continue
                 if self.calculated_signals.contains_key(key):
                     series = self.calculated_signals.cached_series(key)
                 else:
                     series = self.store.get_series(key)
                 if series is not None:
                     estimated_points += len(series.timestamps)
+            if parsed.references == (TIME_SIGNAL_KEY,):
+                # A time-only formula uses the union of every decoded time
+                # base. The sum is a conservative preflight estimate.
+                estimated_points = sum(
+                    len(series.timestamps)
+                    for key in self.store.all_keys()
+                    if (series := self.store.get_series(key)) is not None
+                )
         except CalculatedSignalError as exc:
             QMessageBox.warning(self, "Invalid generated signal", str(exc))
             return

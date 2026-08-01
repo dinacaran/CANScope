@@ -39,6 +39,7 @@ class SignalTree(QTreeWidget):
 
 class SignalTreeWidget(QWidget):
     signalActivated = Signal(list)
+    generatedRenameRequested = Signal(str)
     generatedEditRequested = Signal(str)
     generatedDeleteRequested = Signal(str)
     MIME_TYPE = SignalTree.MIME_TYPE
@@ -241,12 +242,26 @@ class SignalTreeWidget(QWidget):
             return
         if key and key not in keys:
             keys = [key]
+        menu = self._build_context_menu(item, key, keys)
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def _build_context_menu(
+        self,
+        item: QTreeWidgetItem | None,
+        key: str | None,
+        keys: list[str],
+    ) -> QMenu:
         menu = QMenu(self.tree)
         plot_action = QAction(f"Plot selected signal(s) ({len(keys)})", self.tree)
         plot_action.triggered.connect(lambda: self.signalActivated.emit(keys))
         menu.addAction(plot_action)
         if key and item is not None and item.data(0, self._GENERATED_ROLE):
             menu.addSeparator()
+            rename_action = QAction("Rename generated signal", self.tree)
+            rename_action.triggered.connect(
+                lambda _checked=False, generated_key=key: self.generatedRenameRequested.emit(generated_key)
+            )
+            menu.addAction(rename_action)
             edit_action = QAction("Edit generated signal", self.tree)
             edit_action.triggered.connect(
                 lambda _checked=False, generated_key=key: self.generatedEditRequested.emit(generated_key)
@@ -257,7 +272,7 @@ class SignalTreeWidget(QWidget):
                 lambda _checked=False, generated_key=key: self.generatedDeleteRequested.emit(generated_key)
             )
             menu.addAction(delete_action)
-        menu.exec(self.tree.viewport().mapToGlobal(position))
+        return menu
 
     def selected_signal_keys(self) -> list[str]:
         keys: list[str] = []

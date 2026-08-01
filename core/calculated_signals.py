@@ -13,6 +13,7 @@ from core.signal_store import SignalSeries
 
 
 GENERATED_GROUP = "Generate Signals"
+TIME_SIGNAL_KEY = "Time"
 LARGE_OUTPUT_WARNING_POINTS = 5_000_000
 _REFERENCE_RE = re.compile(r"`([^`]+)`")
 
@@ -140,7 +141,8 @@ class FunctionSpec:
     category: str
     signature: str
     description: str
-    implementation: Callable[..., object]
+    implementation: Callable[..., object] | None
+    temporal: bool = False
 
 
 _FUNCTIONS: dict[str, FunctionSpec] = {}
@@ -153,7 +155,9 @@ def _register(
     category: str,
     signature: str,
     description: str,
-    implementation: Callable[..., object],
+    implementation: Callable[..., object] | None,
+    *,
+    temporal: bool = False,
 ) -> None:
     _FUNCTIONS[name.lower()] = FunctionSpec(
         name=name,
@@ -163,6 +167,7 @@ def _register(
         signature=signature,
         description=description,
         implementation=implementation,
+        temporal=temporal,
     )
 
 
@@ -226,6 +231,27 @@ _register(
     "then_value where condition is nonzero, else_value elsewhere", _if,
 )
 
+_register(
+    "lag", 2, 2, "Time", "lag(signal, samples)",
+    "Value from an earlier source sample; missing history gives NaN",
+    None, temporal=True,
+)
+_register(
+    "delay", 2, 2, "Time", "delay(signal, seconds)",
+    "Value at t - seconds using zero-order hold; missing history gives NaN",
+    None, temporal=True,
+)
+_register(
+    "rolling_sum", 2, 2, "Time", "rolling_sum(signal, samples)",
+    "Sum of the current and previous source samples; incomplete windows give NaN",
+    None, temporal=True,
+)
+_register(
+    "integral", 1, 1, "Time", "integral(signal)",
+    "Cumulative time integral using zero-order hold",
+    None, temporal=True,
+)
+
 
 def _arity_text(spec: FunctionSpec) -> str:
     if spec.min_args == spec.max_args:
@@ -274,6 +300,20 @@ class _FormulaValidator(ast.NodeVisitor):
             raise CalculatedSignalError(
                 f"{spec.name}() expects {_arity_text(spec)}: {spec.signature}. Got {arg_count}."
             )
+        if spec.temporal and (
+            not isinstance(node.args[0], ast.Name)
+            or node.args[0].id not in self._permitted_names
+        ):
+            raise CalculatedSignalError(
+                f"{spec.name}() expects a direct signal reference as its first argument"
+            )
+        if len(node.args) > 1 and spec.temporal and any(
+            isinstance(part, ast.Name) and part.id in self._permitted_names
+            for part in ast.walk(node.args[1])
+        ):
+            raise CalculatedSignalError(
+                f"{spec.name}() expects a single numeric value as its second argument"
+            )
         # Only the arguments are visited: falling through to visit_Name on the
         # function name itself would reject it, since a function name is not a
         # signal token.
@@ -313,6 +353,16 @@ def validate_name(name: str) -> str:
 def formula_references(formula: str) -> list[str]:
     """Backtick-delimited keys in a formula, even one that does not parse yet."""
     return [match.strip() for match in _REFERENCE_RE.findall(formula)]
+
+
+def _replace_formula_reference(formula: str, old_key: str, new_key: str) -> str:
+    """Rewrite one exact backtick-delimited reference, preserving all others."""
+    return _REFERENCE_RE.sub(
+        lambda match: f"`{new_key}`"
+        if match.group(1).strip() == old_key
+        else match.group(0),
+        formula,
+    )
 
 
 def parse_formula(
@@ -412,22 +462,192 @@ def _aligned_inputs(
     return grid, aligned, all_inputs_finite
 
 
-def _evaluate_node(node: ast.AST, values: Mapping[str, np.ndarray]):
+@dataclass(frozen=True, slots=True)
+class _EvaluationContext:
+    grid: np.ndarray
+    aligned_values: Mapping[str, np.ndarray]
+    source_by_token: Mapping[str, SignalSeries]
+    temporal_inputs_finite: np.ndarray
+
+
+def _current_value_tokens(node: ast.AST) -> set[str]:
+    """Signal tokens read at the current grid time, outside lag/delay inputs."""
+    tokens: set[str] = set()
+
+    def visit(current: ast.AST) -> None:
+        if isinstance(current, ast.Call) and isinstance(current.func, ast.Name):
+            spec = _FUNCTIONS.get(current.func.id.lower())
+            if spec is not None and spec.temporal:
+                # The first argument is read from its original timebase by the
+                # temporal evaluator, not from the current aligned value.
+                for argument in current.args[1:]:
+                    visit(argument)
+                return
+        if isinstance(current, ast.Name) and current.id.startswith("__signal_"):
+            tokens.add(current.id)
+        for child in ast.iter_child_nodes(current):
+            visit(child)
+
+    visit(node)
+    return tokens
+
+
+def _scalar_temporal_argument(
+    node: ast.AST,
+    context: _EvaluationContext,
+    function_name: str,
+) -> float:
+    value = np.asarray(_evaluate_node(node, context), dtype=np.float64)
+    if value.ndim != 0:
+        raise CalculatedSignalError(
+            f"{function_name}() expects a single numeric value as its second argument"
+        )
+    scalar = float(value)
+    if not np.isfinite(scalar):
+        raise CalculatedSignalError(
+            f"{function_name}() expects a finite second argument"
+        )
+    if scalar < 0:
+        raise CalculatedSignalError(
+            f"{function_name}() does not accept a negative second argument"
+        )
+    return scalar
+
+
+def _evaluate_temporal_call(
+    node: ast.Call,
+    context: _EvaluationContext,
+    spec: FunctionSpec,
+) -> np.ndarray:
+    signal_node = node.args[0]
+    # The validator guarantees this is a direct, permitted signal token.
+    if not isinstance(signal_node, ast.Name):  # pragma: no cover - defensive
+        raise CalculatedSignalError(
+            f"{spec.name}() expects a direct signal reference as its first argument"
+        )
+    source = context.source_by_token[signal_node.id]
+    source_timestamps = source.numpy_timestamps()
+    source_values = source.numpy_values()
+    result = np.full(context.grid.size, np.nan, dtype=np.float64)
+    function_name = spec.name.lower()
+
+    if function_name == "integral":
+        # Prefix area at source sample i is the integral over all completed
+        # intervals before i. Each interval holds its left value.
+        deltas = np.diff(source_timestamps)
+        with np.errstate(over="ignore", invalid="ignore"):
+            increments = source_values[:-1] * deltas
+            prefix_area = np.empty(source_values.size, dtype=np.float64)
+            prefix_area[0] = 0.0
+            prefix_area[1:] = np.cumsum(increments, dtype=np.float64)
+
+        # Do not invent area after the last source sample. At intermediate
+        # grid points, include the partial zero-order-held interval.
+        query_times = np.minimum(context.grid, source_timestamps[-1])
+        source_indices = np.searchsorted(
+            source_timestamps, query_times, side="right"
+        ) - 1
+        valid = source_indices >= 0
+        if np.any(valid):
+            indices = source_indices[valid]
+            with np.errstate(over="ignore", invalid="ignore"):
+                result[valid] = (
+                    prefix_area[indices]
+                    + source_values[indices]
+                    * (query_times[valid] - source_timestamps[indices])
+                )
+            # Once a non-finite source sample is encountered, the cumulative
+            # quantity is unknown from that sample onward.
+            finite_through_sample = np.logical_and.accumulate(
+                np.isfinite(source_values) & np.isfinite(source_timestamps)
+            )
+            result[valid] = np.where(
+                finite_through_sample[indices], result[valid], np.nan
+            )
+        context.temporal_inputs_finite[:] &= np.isfinite(result)
+        return result
+
+    amount = _scalar_temporal_argument(node.args[1], context, spec.name)
+
+    if function_name in {"lag", "rolling_sum"}:
+        if not amount.is_integer():
+            raise CalculatedSignalError(
+                f"{spec.name}() sample count must be a whole number"
+            )
+        sample_count = int(amount)
+        source_indices = np.searchsorted(
+            source_timestamps, context.grid, side="right"
+        ) - 1
+        if function_name == "lag":
+            if sample_count >= source_values.size:
+                context.temporal_inputs_finite[:] = False
+                return result
+            source_indices -= sample_count
+        else:
+            if sample_count < 1:
+                raise CalculatedSignalError(
+                    "rolling_sum() sample count must be greater than zero"
+                )
+            if sample_count > source_values.size:
+                context.temporal_inputs_finite[:] = False
+                return result
+            safe_values = np.where(np.isfinite(source_values), source_values, 0.0)
+            invalid_values = (~np.isfinite(source_values)).astype(np.int64)
+            with np.errstate(over="ignore", invalid="ignore"):
+                prefix_sum = np.concatenate(
+                    ([0.0], np.cumsum(safe_values, dtype=np.float64))
+                )
+            prefix_invalid = np.concatenate(
+                ([0], np.cumsum(invalid_values, dtype=np.int64))
+            )
+            valid = source_indices >= sample_count - 1
+            if np.any(valid):
+                ends = source_indices[valid] + 1
+                starts = ends - sample_count
+                window_values = prefix_sum[ends] - prefix_sum[starts]
+                window_invalid = (
+                    prefix_invalid[ends] - prefix_invalid[starts]
+                )
+                result[valid] = np.where(
+                    window_invalid == 0, window_values, np.nan
+                )
+            context.temporal_inputs_finite[:] &= np.isfinite(result)
+            return result
+    elif function_name == "delay":
+        with np.errstate(over="ignore", invalid="ignore"):
+            query_times = context.grid - amount
+        source_indices = np.searchsorted(
+            source_timestamps, query_times, side="right"
+        ) - 1
+    else:  # pragma: no cover - registry invariant
+        raise CalculatedSignalError(f"Unknown temporal function: {spec.name}")
+
+    valid = source_indices >= 0
+    result[valid] = source_values[source_indices[valid]]
+    context.temporal_inputs_finite[:] &= np.isfinite(result)
+    return result
+
+
+def _evaluate_node(node: ast.AST, context: _EvaluationContext):
     if isinstance(node, ast.Expression):
-        return _evaluate_node(node.body, values)
+        return _evaluate_node(node.body, context)
     if isinstance(node, ast.Name):
         if node.id in _CONSTANTS:
             return _CONSTANTS[node.id]
-        return values[node.id]
+        return context.aligned_values[node.id]
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Call):
         spec = _FUNCTIONS[node.func.id.lower()]
-        args = [_evaluate_node(arg, values) for arg in node.args]
+        if spec.temporal:
+            return _evaluate_temporal_call(node, context, spec)
+        args = [_evaluate_node(arg, context) for arg in node.args]
+        if spec.implementation is None:  # pragma: no cover - registry invariant
+            raise CalculatedSignalError(f"Function is not executable: {spec.name}")
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             return spec.implementation(*args)
     if isinstance(node, ast.UnaryOp):
-        operand = _evaluate_node(node.operand, values)
+        operand = _evaluate_node(node.operand, context)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             if isinstance(node.op, ast.UAdd):
                 return +operand
@@ -437,8 +657,8 @@ def _evaluate_node(node: ast.AST, values: Mapping[str, np.ndarray]):
                 return np.logical_not(np.asarray(operand) != 0)
             return _bitwise_invert(operand)  # ast.Invert
     if isinstance(node, ast.BinOp):
-        left = _evaluate_node(node.left, values)
-        right = _evaluate_node(node.right, values)
+        left = _evaluate_node(node.left, context)
+        right = _evaluate_node(node.right, context)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             if isinstance(node.op, ast.Add):
                 return np.add(left, right)
@@ -463,17 +683,19 @@ def _evaluate_node(node: ast.AST, values: Mapping[str, np.ndarray]):
             if isinstance(node.op, ast.RShift):
                 return _bitwise_shift(left, right, np.right_shift)
     if isinstance(node, ast.BoolOp):
-        operands = [np.asarray(_evaluate_node(item, values)) != 0 for item in node.values]
+        operands = [
+            np.asarray(_evaluate_node(item, context)) != 0 for item in node.values
+        ]
         reducer = np.logical_and if isinstance(node.op, ast.And) else np.logical_or
         result = operands[0]
         for operand in operands[1:]:
             result = reducer(result, operand)
         return result
     if isinstance(node, ast.Compare):
-        left = _evaluate_node(node.left, values)
+        left = _evaluate_node(node.left, context)
         combined = None
         for operator, comparator in zip(node.ops, node.comparators):
-            right = _evaluate_node(comparator, values)
+            right = _evaluate_node(comparator, context)
             if isinstance(operator, ast.Lt):
                 current = np.less(left, right)
             elif isinstance(operator, ast.LtE):
@@ -499,20 +721,63 @@ def _to_double_array(data: np.ndarray) -> array.array:
     return result
 
 
+def build_time_signal(source_series: Iterable[SignalSeries]) -> SignalSeries:
+    """Build the synthetic elapsed-time input used by calculated formulas.
+
+    Its samples cover the union of the supplied measurement time bases, and
+    each value is the timestamp itself in seconds.
+    """
+    time_bases = [
+        series.numpy_timestamps()
+        for series in source_series
+        if len(series.timestamps) > 0
+    ]
+    if not time_bases:
+        raise CalculatedSignalError("Time signal has no samples")
+    grid = np.unique(np.concatenate(time_bases))
+    return SignalSeries(
+        channel=None,
+        message_name="Measurement",
+        message_id=0,
+        signal_name=TIME_SIGNAL_KEY,
+        unit="s",
+        timestamps=_to_double_array(grid),
+        values=_to_double_array(grid),
+    )
+
+
 def calculate_series(
     definition: CalculatedSignalDefinition,
     source_series: Mapping[str, SignalSeries],
 ) -> SignalSeries:
     name = validate_name(definition.name)
     parsed = parse_formula(definition.formula, source_series.keys())
-    grid, aligned, all_inputs_finite = _aligned_inputs(parsed.references, source_series)
+    grid, aligned, _all_inputs_finite = _aligned_inputs(
+        parsed.references, source_series
+    )
 
-    result = np.asarray(_evaluate_node(parsed.tree, aligned), dtype=np.float64)
+    context = _EvaluationContext(
+        grid=grid,
+        aligned_values=aligned,
+        source_by_token={
+            f"__signal_{index}": source_series[key]
+            for index, key in enumerate(parsed.references)
+        },
+        temporal_inputs_finite=np.ones(grid.size, dtype=bool),
+    )
+    result = np.asarray(_evaluate_node(parsed.tree, context), dtype=np.float64)
     if result.ndim == 0:
         result = np.full(grid.size, float(result), dtype=np.float64)
     else:
         result = np.broadcast_to(result, grid.shape).astype(np.float64, copy=True)
-    result[~all_inputs_finite | ~np.isfinite(result)] = np.nan
+    current_inputs_finite = np.ones(grid.size, dtype=bool)
+    for token in _current_value_tokens(parsed.tree):
+        current_inputs_finite &= np.isfinite(aligned[token])
+    result[
+        ~current_inputs_finite
+        | ~context.temporal_inputs_finite
+        | ~np.isfinite(result)
+    ] = np.nan
 
     return SignalSeries(
         channel=None,
@@ -666,6 +931,50 @@ class CalculatedSignalManager:
             self._cache.pop(definition.key, None)
         else:
             self._cache[definition.key] = series
+
+    def rename(self, key: str, new_name: str) -> str:
+        """Rename a definition and atomically rewrite every dependent formula."""
+        existing = self._definitions.get(key)
+        if existing is None:
+            raise CalculatedSignalError(f"Generated signal not found: {key}")
+        cleaned = validate_name(new_name)
+        self.assert_unique_name(cleaned, except_key=key)
+        renamed = CalculatedSignalDefinition(
+            name=cleaned,
+            formula=existing.formula,
+            unit=existing.unit,
+        )
+        new_key = renamed.key
+        if new_key == key:
+            return key
+
+        definitions: dict[str, CalculatedSignalDefinition] = {}
+        for current_key, definition in self._definitions.items():
+            if current_key == key:
+                updated = renamed
+                updated_key = new_key
+            else:
+                updated = CalculatedSignalDefinition(
+                    name=definition.name,
+                    formula=_replace_formula_reference(
+                        definition.formula, key, new_key
+                    ),
+                    unit=definition.unit,
+                )
+                updated_key = current_key
+            definitions[updated_key] = updated
+
+        cache: dict[str, SignalSeries] = {}
+        for current_key, series in self._cache.items():
+            if current_key == key:
+                series.signal_name = cleaned
+                cache[new_key] = series
+            else:
+                cache[current_key] = series
+
+        self._definitions = definitions
+        self._cache = cache
+        return new_key
 
     def delete(self, key: str) -> None:
         self._cache.pop(key, None)

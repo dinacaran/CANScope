@@ -153,3 +153,28 @@ def test_generated_signals_participate_in_search(signal_tree):
 
     signal_tree.search_edit.setText("NoSuchSignal")
     assert all(item.text(0) != "Generate Signals" for item in _channels(signal_tree))
+
+
+def test_generated_signal_context_menu_offers_rename(signal_tree):
+    key = "CH?::Generate Signals::ScaledSpeed"
+    signal_tree.set_generated_signals([(key, "ScaledSpeed", "formula")])
+    signal_tree.resize(500, 600)
+    signal_tree.show()
+    QApplication.processEvents()
+    generated_item = signal_tree.tree.topLevelItem(0).child(0)
+    requested = []
+    signal_tree.generatedRenameRequested.connect(requested.append)
+    menu = signal_tree._build_context_menu(
+        generated_item,
+        key,
+        [key],
+    )
+    rename_action = next(
+        action
+        for action in menu.actions()
+        if action.text() == "Rename generated signal"
+    )
+
+    rename_action.trigger()
+
+    assert requested == [key]

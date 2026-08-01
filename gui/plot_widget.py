@@ -779,6 +779,43 @@ class PlotPanel(QWidget):
         self._refresh_table_and_cursors()
         return True
 
+    def rename_series_key(self, old_key: str, new_key: str) -> bool:
+        """Rename a plotted key without losing order, styling, view, or history."""
+        if old_key not in self._items:
+            return False
+        if new_key in self._items:
+            raise ValueError(f"A plotted signal already uses key: {new_key}")
+
+        selected = [
+            new_key if key == old_key else key for key in self.selected_keys()
+        ]
+        plotted = self._items[old_key]
+        plotted.key = new_key
+        self._items = {
+            (new_key if key == old_key else key): item
+            for key, item in self._items.items()
+        }
+        if self._current_key == old_key:
+            self._current_key = new_key
+
+        renamed_history = []
+        for snapshot, current_key in self._undo_stack:
+            if old_key in snapshot:
+                snapshot[old_key].key = new_key
+                snapshot = {
+                    (new_key if key == old_key else key): item
+                    for key, item in snapshot.items()
+                }
+            if current_key == old_key:
+                current_key = new_key
+            renamed_history.append((snapshot, current_key))
+        self._undo_stack = renamed_history
+
+        self._rebuild_curves(preserve_selection=False, preserve_y_range=True)
+        if selected:
+            self._restore_selection(selected)
+        return True
+
     def forget_series(self, key: str) -> None:
         """Remove a series and purge it from undo history to release its data."""
         self.remove_series(key)
