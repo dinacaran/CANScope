@@ -1,6 +1,6 @@
 # Changelog
 
-## [v00.00.56] — 2026-08-01: Update: calculated signal formula — time base, trigonometry, bitwise, and IF function
+## [v00.00.56] — 2026-08-02: Update: calculated signal formula — time base, trigonometry, bitwise, and IF function
 
 ## [v00.00.55] — 2026-07-31:
 
