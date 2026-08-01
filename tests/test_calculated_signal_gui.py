@@ -280,12 +280,30 @@ def test_formula_help_has_valid_example_for_every_supported_operation(qapp):
 
     assert len(sections["Arithmetic"]) == 7
     assert len(sections["Comparisons"]) == 6
-    assert len(sections["Logical"]) == 2
+    assert len(sections["Logical"]) == 3
+    assert len(sections["Bitwise"]) == 7
+    assert "Math" in sections
+    assert "Conditional" in sections
 
+    checked = 0
     for examples in sections.values():
         for labelled_example in examples:
-            formula = labelled_example.split(":", 1)[1].strip()
-            parse_formula(formula, [_FORMULA_HELP_SIGNAL])
+            # Hand-written entries are one "Label: expression" line; entries
+            # generated from _FUNCTIONS are multi-line, with the runnable part
+            # on its own "Example: ..." line.
+            for line in labelled_example.splitlines():
+                stripped = line.strip()
+                if "Example:" in stripped:
+                    formula = stripped.split("Example:", 1)[1].strip()
+                elif ":" in stripped:
+                    formula = stripped.split(":", 1)[1].strip()
+                else:
+                    continue
+                if not formula:
+                    continue
+                parse_formula(formula, [_FORMULA_HELP_SIGNAL])
+                checked += 1
+    assert checked > 0
 
 
 def test_help_button_displays_formula_examples(qapp):

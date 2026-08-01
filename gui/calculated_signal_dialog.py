@@ -24,8 +24,10 @@ from PySide6.QtWidgets import (
 )
 
 from core.calculated_signals import (
+    _FUNCTIONS,
     CalculatedSignalDefinition,
     CalculatedSignalError,
+    FunctionSpec,
     ImportReport,
     calculate_series,
     formula_references,
@@ -39,10 +41,22 @@ from core.signal_store import SignalSeries
 _FORMULA_HELP_SIGNAL = "CH1::Message1::Signal1"
 
 
-def _formula_help_examples() -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Return one valid example for every formula operation supported by v1."""
+def _function_example(spec: FunctionSpec) -> str:
+    """A runnable call for this function: the signal first, small integers after."""
     signal = f"`{_FORMULA_HELP_SIGNAL}`"
-    return (
+    fillers = ["2", "3", "4"]
+    args = [signal, *fillers[: spec.max_args - 1]]
+    return f"{spec.name}({', '.join(args)})"
+
+
+def _formula_help_examples() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """One valid example for every formula operation, hand-written operators first.
+
+    The function-derived sections are generated from core.calculated_signals._FUNCTIONS
+    so this text and the registry cannot drift apart; see test_calculated_signals.py.
+    """
+    signal = f"`{_FORMULA_HELP_SIGNAL}`"
+    sections: list[tuple[str, tuple[str, ...]]] = [
         (
             "Arithmetic",
             (
@@ -71,9 +85,35 @@ def _formula_help_examples() -> tuple[tuple[str, tuple[str, ...]], ...]:
             (
                 f"AND:               ({signal} > 0) AND ({signal} < 100)",
                 f"OR:                ({signal} == 0) OR ({signal} >= 100)",
+                f"NOT:               NOT ({signal} > 0)",
             ),
         ),
-    )
+        (
+            "Bitwise",
+            (
+                f"AND:               {signal} & 15",
+                f"OR:                {signal} | 1",
+                f"XOR:               {signal} ^ 255",
+                f"Left shift:        {signal} << 2",
+                f"Right shift:       {signal} >> 2",
+                f"NOT (invert):      ~{signal}",
+                f"With a comparison: ({signal} > 0) & ({signal} < 100)",
+            ),
+        ),
+    ]
+
+    by_category: dict[str, list[str]] = {}
+    for spec in _FUNCTIONS.values():
+        entry = (
+            f"{spec.signature}\n"
+            f"    {spec.description}\n"
+            f"    Example: {_function_example(spec)}\n"
+        )
+        by_category.setdefault(spec.category, []).append(entry)
+    for category in sorted(by_category):
+        sections.append((category, tuple(by_category[category])))
+
+    return tuple(sections)
 
 
 def _formula_help_text() -> str:
@@ -85,7 +125,17 @@ def _formula_help_text() -> str:
         "Use the measurement signal picker to insert exact references.\n"
         "AND and OR are case-insensitive. Zero is false; nonzero is true.\n"
         "Comparison and logical results are numeric 0 or 1.\n"
-        "Division by zero and nonfinite results produce NaN (a plot gap)."
+        "Division by zero and nonfinite results produce NaN (a plot gap).\n"
+        "Function names are case-insensitive; NOT is too. IF is written uppercase "
+        "for consistency with AND/OR/NOT — lowercase if(...) is rejected with a "
+        "hint, since if is a Python keyword.\n"
+        "mod(a, b) takes the sign of b, matching Python's % (not C's fmod).\n"
+        "~ inverts a 64-bit signed integer, so ~0 is -1.\n"
+        "Mixing a bitwise operator with a comparison needs both sides "
+        "parenthesized: (a > 0) & (b > 0), not a > 0 & b > 0.\n"
+        "Domain errors such as sqrt of a negative number or log of zero also "
+        "produce NaN, the same as division by zero.\n"
+        "pi and e are available as constants."
     )
     return "\n\n".join(sections)
 
@@ -104,7 +154,12 @@ class FormulaHelpDialog(QDialog):
         )
         intro.setWordWrap(True)
 
-        self.examples_edit = QPlainTextEdit(_formula_help_text())
+        self._full_help_text = _formula_help_text()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search functions and examples...")
+
+        self.examples_edit = QPlainTextEdit(self._full_help_text)
         self.examples_edit.setReadOnly(True)
         self.examples_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
@@ -113,8 +168,22 @@ class FormulaHelpDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
+        layout.addWidget(self.search_edit)
         layout.addWidget(self.examples_edit, stretch=1)
         layout.addWidget(close_box)
+
+        self.search_edit.textChanged.connect(self._filter_examples)
+
+    @Slot(str)
+    def _filter_examples(self, text: str) -> None:
+        needle = text.strip().casefold()
+        if not needle:
+            self.examples_edit.setPlainText(self._full_help_text)
+            return
+        matches = [
+            line for line in self._full_help_text.splitlines() if needle in line.casefold()
+        ]
+        self.examples_edit.setPlainText("\n".join(matches) if matches else "No matches.")
 
 
 class CalculationWorker(QObject):
