@@ -4,7 +4,9 @@
 *.log
 docs_int/
 claude.md
+CLAUDE.md
 docs/Internals/
+TODO.md
 
 # ── Diagnostics feature — developed in the private repo only ──────────────
 core/diagnostics/
