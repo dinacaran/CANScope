@@ -83,6 +83,44 @@ def test_union_timebase_uses_zero_order_hold_after_all_sources_start():
     assert estimate_output_points(definition, sources) == 4
 
 
+def test_abs_repairs_out_of_order_measurement_timestamps():
+    key = "CH1::M::X"
+    unsorted_sources = {
+        key: _series(
+            key,
+            [0.0, 1.0, 2.0, 0.0],
+            [-10.0, -20.0, -30.0, -40.0],
+        )
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Absolute", f"abs(`{key}`)"),
+        unsorted_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [0.0, 1.0, 2.0])
+    # Stable sorting keeps the reset-tail value paired with timestamp zero;
+    # zero-order hold uses the last sample when timestamps are duplicated.
+    np.testing.assert_allclose(result.numpy_values(), [40.0, 20.0, 30.0])
+
+
+def test_temporal_formula_uses_repaired_timestamp_order():
+    key = "CH1::M::X"
+    unsorted_sources = {
+        key: _series(key, [2.0, 0.0, 1.0], [30.0, 10.0, 20.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Lagged", f"lag(`{key}`, 1)"),
+        unsorted_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [0.0, 1.0, 2.0])
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, 20.0], equal_nan=True
+    )
+
+
 def test_lag_steps_back_through_source_samples_on_an_irregular_timebase():
     key = "CH1::M::X"
     temporal_sources = {

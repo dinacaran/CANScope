@@ -483,6 +483,64 @@ def test_predecoded_mdf_publishes_metadata_before_one_global_array_batch(
     assert list(rows[1][3]) == ["Off", "On"]
 
 
+def test_mixed_mdf_classification_and_metadata_prefer_decoded_groups(
+    tmp_path, monkeypatch
+):
+    select_calls = []
+    decoded_signal = SimpleNamespace(
+        timestamps=np.array([0.0, 1.0]),
+        samples=np.array([800.0, 900.0]),
+        unit="rpm",
+    )
+    raw_group = SimpleNamespace(
+        channels=[
+            SimpleNamespace(name="Timestamp", channel_type=1),
+            SimpleNamespace(name="CAN_DataFrame", channel_type=0),
+            SimpleNamespace(name="CAN_DataFrame.ID", channel_type=0),
+        ],
+        channel_group=SimpleNamespace(acq_name="CAN1"),
+    )
+    decoded_group = SimpleNamespace(
+        channels=[
+            SimpleNamespace(name="Time", channel_type=1),
+            SimpleNamespace(name="EngineSpeed", channel_type=0, unit="rpm"),
+        ],
+        channel_group=SimpleNamespace(acq_name="Powertrain"),
+    )
+
+    class _MDF:
+        groups = [raw_group, decoded_group]
+
+        def select(self, specs, raw=False):
+            select_calls.append((list(specs), raw))
+            return [decoded_signal]
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "asammdf",
+        SimpleNamespace(MDF=lambda *_args, **_kwargs: _MDF()),
+    )
+    path = tmp_path / "mixed.mf4"
+    path.write_bytes(b"test")
+    MDFReader._content_cache.clear()
+
+    content = MDFReader.content_info(path)
+
+    assert content.has_raw_can is True
+    assert content.has_decoded_signals is True
+    assert content.is_mixed is True
+    assert MDFReader._channel_metadata(_MDF()) == [
+        ("Powertrain", "EngineSpeed", "rpm")
+    ]
+    rows = list(MDFReader._iter_arrays(_MDF(), batch_all_groups=True))
+    assert select_calls == [([("EngineSpeed", 1, 1)], False)]
+    assert len(rows) == 1
+    assert rows[0][0] == ("Powertrain", "EngineSpeed", "rpm")
+
+
 def test_predecoded_mdf_avoids_incremental_tree_rebuild_queue(tmp_path):
     class _Reader:
         metadata_first_arrays = True

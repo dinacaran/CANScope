@@ -51,7 +51,12 @@ from core.calculated_signals import (
     parse_formula,
 )
 from core.load_worker import LoadWorker
-from core.readers import dbc_required_for, prescan_measurement, ALL_SUFFIXES
+from core.readers import (
+    ALL_SUFFIXES,
+    dbc_required_for,
+    has_mixed_mdf_content,
+    prescan_measurement,
+)
 from core.channel_config import ChannelConfig, ALL_CHANNELS_KEY
 from gui.dbc_manager import DBCManagerDialog
 from core.signal_store import SignalStore
@@ -106,6 +111,7 @@ class MainWindow(QMainWindow):
             list[int],
             dict[int, set[int]],
         ] | None = None
+        self._mixed_mdf_notices_shown: set[str] = set()
         self._thread: QThread | None = None
         self._worker: LoadWorker | None = None
         self._pending_plot_keys: list[str] = []
@@ -674,15 +680,17 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._reset_for_new_measurement()
         self._temporary_plot_handoff = temporary_handoff
         needs_dbc = dbc_required_for(path)
+        mixed_mdf = has_mixed_mdf_content(path)
         self._log(f'Selected measurement file: {path}')
         if not needs_dbc:
             self._log('Database not required for this format.')
+        self._show_mixed_mdf_notice(path, mixed_mdf=mixed_mdf)
 
         # Lightweight pre-scan: extract channel numbers + arb IDs
         # so the DBC Manager can show real channels before Load+Decode
         self._prescan_cache = None
         self._channel_data_cache = None
-        if needs_dbc:
+        if needs_dbc or mixed_mdf:
             self._update_status('Scanning channels…', 'Reading measurement file header')
             QApplication.processEvents()
             try:
@@ -700,6 +708,35 @@ QToolButton:pressed { background-color: #1a2a3a; }
             'Measurement file selected', self._next_step_message()
         )
         self._queue_measurement_debug_inspection(path)
+
+    def _show_mixed_mdf_notice(
+        self,
+        path: str,
+        *,
+        mixed_mdf: bool | None = None,
+    ) -> None:
+        """Explain decoded-first routing once for a mixed MDF measurement."""
+        if not self.channel_config.is_empty() or path in self._mixed_mdf_notices_shown:
+            return
+        if mixed_mdf is None:
+            mixed_mdf = has_mixed_mdf_content(path)
+        if not mixed_mdf:
+            return
+
+        self._mixed_mdf_notices_shown.add(path)
+        message = (
+            'This MDF file contains both existing decoded signals and raw CAN frames.\n\n'
+            'CANScope will load and plot the decoded signals without requiring a database. '
+            'The embedded raw CAN frames will not be decoded or shown in CAN Trace during '
+            'this load.\n\n'
+            'To decode and view the CAN frames, open Database Manager, assign a DBC or '
+            'ARXML file, and load the measurement again.'
+        )
+        self._log(
+            'Mixed MDF detected: decoded signals will be loaded first; configure a '
+            'DBC/ARXML and reload to use embedded raw CAN frames.'
+        )
+        QMessageBox.information(self, 'Mixed MDF content detected', message)
 
     @staticmethod
     def _application_root() -> Path:
@@ -1699,6 +1736,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             QMessageBox.warning(self, 'Missing file', 'Please select a measurement file first.')
             self._update_status('Waiting for input', self._next_step_message())
             return
+        self._show_mixed_mdf_notice(mpath)
         # Database required only for CAN-raw formats
         if dbc_required_for(mpath) and self.channel_config.is_empty():
             reply = QMessageBox.question(
@@ -2309,6 +2347,11 @@ QToolButton:pressed { background-color: #1a2a3a; }
             if suffix in ('.mf4', '.mdf'):
                 return "MDF bus log detected — database required. Click 'Open Database' to configure."
             return "Database required — click 'Open Database' to configure channel mapping."
+        if has_mixed_mdf_content(mpath) and self.channel_config.is_empty():
+            return (
+                "Decoded MDF signals are ready; add a database and reload to use "
+                "embedded CAN frames."
+            )
         return "Click 'Load + Decode', then select signal(s) to plot."
 
     def _update_measurement_tab(self, channels: str = '', frames: str = '', decoded: str = '', samples: str = '') -> None:

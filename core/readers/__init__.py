@@ -109,9 +109,9 @@ def dbc_required_for(path: str) -> bool:
     Return True when the measurement file needs a DBC to decode signals.
 
     For .blf / .asc: always True.
-    For .mf4 / .mdf: True only when the file contains raw CAN bus frames
-        (ASAM MDF bus logging format, detected by CAN_DataFrame.* channels).
-        Pre-decoded MDF files return False.
+    For .mf4 / .mdf: True only for raw-only CAN bus recordings. Mixed MDFs
+        containing existing decoded signals can load those signals without a
+        database, so they return False.
     For .csv: True for raw CAN-frame exports; False for decoded signal CSV.
     """
     suffix = Path(path).suffix.lower()
@@ -119,11 +119,20 @@ def dbc_required_for(path: str) -> bool:
         return True
     if suffix in ('.mf4', '.mdf'):
         from core.readers.mdf_reader import MDFReader
-        return MDFReader.is_bus_logging(path)
+        content = MDFReader.content_info(path)
+        return content.has_raw_can and not content.has_decoded_signals
     if suffix == '.csv':
         from core.readers.csv_reader import is_can_bus_logging_csv
         return is_can_bus_logging_csv(path)
     return False
+
+
+def has_mixed_mdf_content(path: str) -> bool:
+    """Return whether an MDF contains decoded signals and raw CAN frames."""
+    if Path(path).suffix.lower() not in ('.mf4', '.mdf'):
+        return False
+    from core.readers.mdf_reader import MDFReader
+    return MDFReader.content_info(path).is_mixed
 
 
 def reader_factory(
@@ -135,9 +144,11 @@ def reader_factory(
 
     MDF4 / MDF routing
     ------------------
-    A fast probe (< 50 ms) checks for ``CAN_DataFrame.*`` channels:
-    - Bus logging MDF  → ``MDFCANReader`` (raw frames + DBC, same as BLF/ASC)
-    - Pre-decoded MDF  → ``MDFReader``    (vectorised channel arrays, no DBC)
+    A metadata-only probe distinguishes decoded, raw-only, and mixed MDFs:
+    - Raw-only MDF → ``MDFCANReader`` and a database is required.
+    - Decoded MDF → ``MDFReader`` without a database.
+    - Mixed MDF without a database → ``MDFReader`` (decoded signals win).
+    - Mixed MDF with a database → ``MDFCANReader`` for CAN decode/trace.
 
     Raises
     ------
@@ -162,8 +173,11 @@ def reader_factory(
 
     if suffix in ('.mf4', '.mdf'):
         from core.readers.mdf_reader import MDFReader
-        if MDFReader.is_bus_logging(measurement_path):
-            # Bus logging — raw CAN frames → needs DBC or ARXML
+        content = MDFReader.content_info(measurement_path)
+        if content.has_raw_can and (
+            not content.has_decoded_signals or dbc_path
+        ):
+            # Raw-only, or mixed with an explicitly configured database.
             if not dbc_path:
                 raise ValueError(
                     "This MDF file contains raw CAN bus frames.\n"
@@ -173,7 +187,7 @@ def reader_factory(
             from core.readers.mdf_can_reader import MDFCANReader
             return MDFCANReader(measurement_path, dbc_path)
         else:
-            # Pre-decoded engineering values — no DBC needed
+            # Decoded-only, or mixed with no database: prefer existing signals.
             return MDFReader(measurement_path)
 
     if suffix == '.csv':
@@ -206,6 +220,7 @@ __all__ = [
     "UnsupportedFormatError",
     "reader_factory",
     "dbc_required_for",
+    "has_mixed_mdf_content",
     "prescan_measurement",
     "CAN_RAW_SUFFIXES",
     "ALL_SUFFIXES",

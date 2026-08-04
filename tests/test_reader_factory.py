@@ -1,10 +1,19 @@
 """Tests for core/readers/__init__.py — reader_factory and dbc_required_for."""
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
-from core.readers import reader_factory, dbc_required_for, UnsupportedFormatError
+from core.readers import (
+    UnsupportedFormatError,
+    dbc_required_for,
+    has_mixed_mdf_content,
+    reader_factory,
+)
 from core.readers.csv_reader import CSVRawCANReader, CSVSignalReader
+from core.readers.mdf_reader import MDFContentInfo
 
 
 # ── Missing-DBC errors ─────────────────────────────────────────────────────
@@ -76,3 +85,34 @@ def test_dbc_required_for_asc(asc_path):
 
 def test_dbc_required_for_csv_false(narrow_csv_path):
     assert dbc_required_for(str(narrow_csv_path)) is False
+
+
+def test_mixed_mdf_does_not_require_database(monkeypatch, tmp_path):
+    path = tmp_path / "mixed.mf4"
+    path.write_bytes(b"")
+    mixed = MDFContentInfo(has_raw_can=True, has_decoded_signals=True)
+    monkeypatch.setattr(
+        "core.readers.mdf_reader.MDFReader.content_info",
+        staticmethod(lambda _path: mixed),
+    )
+
+    assert has_mixed_mdf_content(str(path)) is True
+    assert dbc_required_for(str(path)) is False
+    monkeypatch.setitem(sys.modules, "asammdf", SimpleNamespace())
+    from core.readers.mdf_reader import MDFReader
+    assert isinstance(reader_factory(str(path)), MDFReader)
+
+
+def test_raw_only_mdf_still_requires_database(monkeypatch, tmp_path):
+    path = tmp_path / "raw-only.mf4"
+    path.write_bytes(b"")
+    raw_only = MDFContentInfo(has_raw_can=True, has_decoded_signals=False)
+    monkeypatch.setattr(
+        "core.readers.mdf_reader.MDFReader.content_info",
+        staticmethod(lambda _path: raw_only),
+    )
+
+    assert has_mixed_mdf_content(str(path)) is False
+    assert dbc_required_for(str(path)) is True
+    with pytest.raises(ValueError, match="DBC or ARXML"):
+        reader_factory(str(path))

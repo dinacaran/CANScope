@@ -1433,6 +1433,31 @@ class PlotPanel(QWidget):
         curve.setClipToView(True)
         curve.setDownsampling(auto=True, method='peak')   # kwarg is 'method', not 'mode'
 
+    @staticmethod
+    def _curve_connect_mask(ts: np.ndarray, vs: np.ndarray) -> np.ndarray:
+        """Return the pyqtgraph mask for safe adjacent-sample connections.
+
+        ``connect[i]`` controls the segment from sample *i* to *i + 1*.
+        Besides the usual non-finite gaps, break the curve whenever time moves
+        backwards.  Some measurement channels contain a timestamp reset or an
+        out-of-order tail sample; joining across it draws a misleading diagonal
+        from the end of the recording back to its first point.
+
+        An explicit array is required here: ``connect='finite'`` considers both
+        sides of a timestamp reset valid and therefore joins them.
+        """
+        connect = np.zeros(ts.size, dtype=np.bool_)
+        if ts.size < 2:
+            return connect
+
+        finite = np.isfinite(ts) & np.isfinite(vs)
+        connect[:-1] = (
+            finite[:-1]
+            & finite[1:]
+            & (ts[1:] >= ts[:-1])
+        )
+        return connect
+
     def _apply_curve_style(self, plotted: PlottedSignal,
                            selected: bool = False,
                            set_data: bool = True) -> None:
@@ -1474,7 +1499,8 @@ class PlotPanel(QWidget):
             # protocol and returns a writable view — required by pyqtgraph.
             ts = np.asarray(plotted.series.timestamps, dtype=np.float64)
             vs = np.asarray(plotted.series.values,     dtype=np.float64)
-            plotted.curve.setData(ts, vs, pen=pen, connect='finite')
+            connect = self._curve_connect_mask(ts, vs)
+            plotted.curve.setData(ts, vs, pen=pen, connect=connect)
         else:
             plotted.curve.setPen(pen)
 

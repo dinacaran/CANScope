@@ -426,12 +426,24 @@ def estimate_output_points(
     return sum(len(source_series[key].timestamps) for key in parsed.references)
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceArrays:
+    timestamps: np.ndarray
+    values: np.ndarray
+
+
 def _aligned_inputs(
     references: Sequence[str],
     source_series: Mapping[str, SignalSeries],
-) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    dict[str, _SourceArrays],
+]:
     timestamps: dict[str, np.ndarray] = {}
     values: dict[str, np.ndarray] = {}
+    prepared_sources: dict[str, _SourceArrays] = {}
     for key in references:
         series = source_series[key]
         ts = series.numpy_timestamps()
@@ -441,9 +453,17 @@ def _aligned_inputs(
         if ts.size != vs.size:
             raise CalculatedSignalError(f"Timestamp/value length mismatch: {key}")
         if ts.size > 1 and np.any(ts[1:] < ts[:-1]):
-            raise CalculatedSignalError(f"Timestamps are not sorted: {key}")
+            # A few measurement formats can contain an out-of-order sample or
+            # timestamp-reset tail. Keep every value paired with its timestamp
+            # and repair the time base for searchsorted/alignment. Stable order
+            # also gives deterministic last-sample-wins behaviour at duplicate
+            # timestamps, matching the existing zero-order hold semantics.
+            order = np.argsort(ts, kind="stable")
+            ts = ts[order]
+            vs = vs[order]
         timestamps[key] = ts
         values[key] = vs
+        prepared_sources[key] = _SourceArrays(ts, vs)
 
     grid = np.unique(np.concatenate([timestamps[key] for key in references]))
     first_common_time = max(float(timestamps[key][0]) for key in references)
@@ -459,14 +479,14 @@ def _aligned_inputs(
         held = values[key][idx]
         aligned[f"__signal_{index}"] = held
         all_inputs_finite &= np.isfinite(held)
-    return grid, aligned, all_inputs_finite
+    return grid, aligned, all_inputs_finite, prepared_sources
 
 
 @dataclass(frozen=True, slots=True)
 class _EvaluationContext:
     grid: np.ndarray
     aligned_values: Mapping[str, np.ndarray]
-    source_by_token: Mapping[str, SignalSeries]
+    source_by_token: Mapping[str, _SourceArrays]
     temporal_inputs_finite: np.ndarray
 
 
@@ -526,8 +546,8 @@ def _evaluate_temporal_call(
             f"{spec.name}() expects a direct signal reference as its first argument"
         )
     source = context.source_by_token[signal_node.id]
-    source_timestamps = source.numpy_timestamps()
-    source_values = source.numpy_values()
+    source_timestamps = source.timestamps
+    source_values = source.values
     result = np.full(context.grid.size, np.nan, dtype=np.float64)
     function_name = spec.name.lower()
 
@@ -752,7 +772,7 @@ def calculate_series(
 ) -> SignalSeries:
     name = validate_name(definition.name)
     parsed = parse_formula(definition.formula, source_series.keys())
-    grid, aligned, _all_inputs_finite = _aligned_inputs(
+    grid, aligned, _all_inputs_finite, prepared_sources = _aligned_inputs(
         parsed.references, source_series
     )
 
@@ -760,7 +780,7 @@ def calculate_series(
         grid=grid,
         aligned_values=aligned,
         source_by_token={
-            f"__signal_{index}": source_series[key]
+            f"__signal_{index}": prepared_sources[key]
             for index, key in enumerate(parsed.references)
         },
         temporal_inputs_finite=np.ones(grid.size, dtype=bool),

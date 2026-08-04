@@ -1,5 +1,28 @@
 # Changelog
 
+## [v00.00.57] — 2026-08-04: Plot timestamp and mixed MDF loading fixes
+
+### Fixed — Plots no longer connect the final point back to the first point.
+
+Curve segments now break when timestamps reset or move backwards, preventing
+the misleading diagonal line that could appear across a plot.
+
+### Fixed — Generated signals accept measurement channels with out-of-order timestamps.
+
+Source timestamps and values are now stably sorted together before formula
+alignment, so functions such as `abs()` no longer intermittently report
+"Timestamps are not sorted" for affected measurements. Temporal formulas use
+the same repaired ordering.
+
+### Changed — Mixed MDF files prioritize their existing decoded signals.
+
+MF4/MDF measurements containing both decoded engineering signals and raw CAN
+frames now load and plot the decoded signals without requiring a database.
+CANScope displays a notice explaining that the embedded raw frames require a
+DBC or ARXML assignment and a measurement reload. Raw-only MDF files continue
+to require a database, and raw frame fields are excluded from decoded-signal
+plots.
+
 ## [v00.00.56] — 2026-08-02: Update: calculated signal formula — time base, trigonometry, bitwise, and IF function
 
 ## [v00.00.55] — 2026-07-31:

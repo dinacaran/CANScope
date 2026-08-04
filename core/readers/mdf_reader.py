@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -14,6 +15,18 @@ class MDFImportError(RuntimeError):
 
 class MDFReadError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class MDFContentInfo:
+    """Structural content discovered from MDF channel metadata."""
+
+    has_raw_can: bool = False
+    has_decoded_signals: bool = False
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.has_raw_can and self.has_decoded_signals
 
 
 def _is_text(arr) -> bool:
@@ -116,9 +129,9 @@ class MDFReader:
     Pure numeric channels yield ``disp_list=[]`` and the LoadWorker passes
     ``has_labels=False``, skipping the O(n) Python list allocation entirely.
 
-    is_bus_logging cache (Bottleneck 4)
-    ------------------------------------
-    ``is_bus_logging()`` results are cached by resolved path so repeated calls
+    MDF content cache (Bottleneck 4)
+    --------------------------------
+    Metadata classification is cached by resolved path so repeated calls
     from ``dbc_required_for()``, ``reader_factory()``, and ``prescan_measurement()``
     open the file header only once.
 
@@ -145,10 +158,9 @@ class MDFReader:
         "bus-logged MF4/MDF, BLF, or ASC file to view CAN Trace."
     )
 
-    # Cached results of is_bus_logging() keyed by resolved absolute path.
-    # Eliminates repeated header opens when dbc_required_for / reader_factory /
-    # prescan_measurement all call is_bus_logging for the same file.
-    _bus_logging_cache: dict[str, bool] = {}
+    # Cache the complete classification so dbc_required_for(), reader_factory(),
+    # the GUI notice, and pre-scan share one metadata-only MDF open.
+    _content_cache: dict[str, MDFContentInfo] = {}
 
     def __init__(self, mdf_path: str | Path) -> None:
         try:
@@ -165,11 +177,25 @@ class MDFReader:
 
         fmt = "MF4" if self._path.suffix.lower() == ".mf4" else "MDF"
         self.source_description = f"{fmt}  ({self._path.name}) — asammdf"
+        content = self.content_info(self._path)
         self.load_messages: list[str] = [
             f"asammdf: opening {fmt} file…",
             "No database required — signals are pre-decoded.",
             "Using metadata-first global channel-array fast path.",
         ]
+        if content.is_mixed:
+            self.load_messages.insert(
+                2,
+                "Mixed MDF: loading existing decoded signals; embedded raw CAN "
+                "frames require a DBC/ARXML and a reload.",
+            )
+            self.raw_trace_unavailable_reason = (
+                "This MDF contains both decoded signals and raw CAN frames. "
+                "CANScope loaded the existing decoded signals without a database, "
+                "so the embedded raw frames are not available in CAN Trace. "
+                "Configure a DBC or ARXML database and load the measurement again "
+                "to decode and view those CAN frames."
+            )
 
     # ── Protocol iterator (fallback, not used by LoadWorker fast path) ────
 
@@ -234,6 +260,8 @@ class MDFReader:
         """Return the complete pre-decoded hierarchy without reading samples."""
         rows = []
         for group_idx, group in enumerate(mdf.groups):
+            if MDFReader._is_raw_can_group(group):
+                continue
             group_name = MDFReader._group_name(mdf, group_idx)
             for ch_idx, channel in enumerate(group.channels):
                 channel_name = getattr(channel, "name", None) or f"Ch{ch_idx}"
@@ -248,6 +276,59 @@ class MDFReader:
     # ── Internal ──────────────────────────────────────────────────────────
 
     @staticmethod
+    def _is_raw_can_group(group) -> bool:
+        """Return whether *group* contains an ASAM raw CAN frame structure."""
+        for channel in getattr(group, "channels", ()):
+            name = str(getattr(channel, "name", "") or "")
+            if name == "CAN_DataFrame" or name.startswith("CAN_DataFrame."):
+                return True
+        return False
+
+    @staticmethod
+    def _group_has_decoded_signals(group) -> bool:
+        for channel in getattr(group, "channels", ()):
+            if getattr(channel, "channel_type", -1) == 1:
+                continue
+            name = str(getattr(channel, "name", "") or "")
+            if name.lower() in ("time", "t", "timestamp", "timestamps"):
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def content_info(mdf_path: str | Path) -> MDFContentInfo:
+        """Classify an MDF as raw-only, decoded-only, mixed, or empty."""
+        resolved = str(Path(mdf_path).resolve())
+        cached = MDFReader._content_cache.get(resolved)
+        if cached is not None:
+            return cached
+
+        has_raw_can = False
+        has_decoded_signals = False
+        try:
+            import asammdf
+            mdf = asammdf.MDF(str(mdf_path))
+            try:
+                for group in mdf.groups:
+                    if MDFReader._is_raw_can_group(group):
+                        has_raw_can = True
+                    elif MDFReader._group_has_decoded_signals(group):
+                        has_decoded_signals = True
+                    if has_raw_can and has_decoded_signals:
+                        break
+            finally:
+                try:
+                    mdf.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        result = MDFContentInfo(has_raw_can, has_decoded_signals)
+        MDFReader._content_cache[resolved] = result
+        return result
+
+    @staticmethod
     def is_bus_logging(mdf_path: str | Path) -> bool:
         """
         Probe an MDF file to determine if it contains raw CAN bus frames
@@ -258,36 +339,10 @@ class MDFReader:
         group metadata — no sample data loaded.  Cost: < 50 ms on first call;
         subsequent calls for the same path return the cached result instantly.
 
-        Returns True  → file has CAN_DataFrame channels → needs DBC.
-        Returns False → file has pre-decoded signals   → no DBC needed.
+        Returns True when the file contains CAN_DataFrame channels. Callers
+        use :meth:`content_info` to distinguish raw-only from mixed files.
         """
-        resolved = str(Path(mdf_path).resolve())
-        if resolved in MDFReader._bus_logging_cache:
-            return MDFReader._bus_logging_cache[resolved]
-
-        result = False
-        try:
-            import asammdf
-            mdf = asammdf.MDF(str(mdf_path))
-            try:
-                for group in mdf.groups:
-                    for ch in group.channels:
-                        name = getattr(ch, "name", "") or ""
-                        if name.startswith("CAN_DataFrame."):
-                            result = True
-                            break
-                    if result:
-                        break
-            finally:
-                try:
-                    mdf.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        MDFReader._bus_logging_cache[resolved] = result
-        return result
+        return MDFReader.content_info(mdf_path).has_raw_can
 
     @staticmethod
     def _iter_arrays(
@@ -314,6 +369,10 @@ class MDFReader:
         groups_channels: dict[int, list[tuple[int, str]]] = {}
         for group_idx in range(len(mdf.groups)):
             group   = mdf.groups[group_idx]
+            # For a mixed MDF loaded without a database, expose only existing
+            # engineering signals. Raw frame fields are not plot channels.
+            if MDFReader._is_raw_can_group(group):
+                continue
             ch_list = []
             for ch_idx in range(len(group.channels)):
                 ch      = group.channels[ch_idx]

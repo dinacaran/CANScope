@@ -149,6 +149,25 @@ def test_decoded_mdf_keeps_can_trace_action_discoverable(window):
     )
 
 
+def test_mixed_mdf_notice_explains_decoded_first_loading(window, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QMessageBox
+
+    path = str(tmp_path / "mixed.mf4")
+    monkeypatch.setattr(
+        "gui.main_window.has_mixed_mdf_content",
+        lambda _path: True,
+    )
+
+    window._show_mixed_mdf_notice(path)
+    window._show_mixed_mdf_notice(path)
+
+    QMessageBox.information.assert_called_once()
+    title, message = QMessageBox.information.call_args[0][1:]
+    assert title == "Mixed MDF content detected"
+    assert "load and plot the decoded signals" in message
+    assert "assign a DBC or ARXML" in message
+
+
 def test_load_mf4_bus_logging_without_database_warns(window, monkeypatch, tmp_path):
     """A bus-logging MF4 (raw CAN frames) still needs a database, same as BLF."""
     mf4 = tmp_path / "buslog.mf4"
