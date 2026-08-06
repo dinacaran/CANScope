@@ -251,6 +251,12 @@ _register(
     "Cumulative time integral using zero-order hold",
     None, temporal=True,
 )
+_register(
+    "diag", 3, 3, "Diagnostic", "diag(event, increment, decrement)",
+    "Counter starting at 0; increment while event is nonzero, otherwise "
+    "decrement without going below 0",
+    None, temporal=True,
+)
 
 
 def _arity_text(spec: FunctionSpec) -> str:
@@ -307,13 +313,19 @@ class _FormulaValidator(ast.NodeVisitor):
             raise CalculatedSignalError(
                 f"{spec.name}() expects a direct signal reference as its first argument"
             )
-        if len(node.args) > 1 and spec.temporal and any(
-            isinstance(part, ast.Name) and part.id in self._permitted_names
-            for part in ast.walk(node.args[1])
-        ):
-            raise CalculatedSignalError(
-                f"{spec.name}() expects a single numeric value as its second argument"
-            )
+        if spec.temporal:
+            for argument in node.args[1:]:
+                if any(
+                    isinstance(part, ast.Name) and part.id in self._permitted_names
+                    for part in ast.walk(argument)
+                ):
+                    if spec.name.lower() == "diag":
+                        raise CalculatedSignalError(
+                            "diag() expects fixed numeric increment and decrement steps"
+                        )
+                    raise CalculatedSignalError(
+                        f"{spec.name}() expects a single numeric value as its second argument"
+                    )
         # Only the arguments are visited: falling through to visit_Name on the
         # function name itself would reject it, since a function name is not a
         # signal token.
@@ -516,20 +528,21 @@ def _scalar_temporal_argument(
     node: ast.AST,
     context: _EvaluationContext,
     function_name: str,
+    argument_label: str = "second argument",
 ) -> float:
     value = np.asarray(_evaluate_node(node, context), dtype=np.float64)
     if value.ndim != 0:
         raise CalculatedSignalError(
-            f"{function_name}() expects a single numeric value as its second argument"
+            f"{function_name}() expects a single numeric value as its {argument_label}"
         )
     scalar = float(value)
     if not np.isfinite(scalar):
         raise CalculatedSignalError(
-            f"{function_name}() expects a finite second argument"
+            f"{function_name}() expects a finite {argument_label}"
         )
     if scalar < 0:
         raise CalculatedSignalError(
-            f"{function_name}() does not accept a negative second argument"
+            f"{function_name}() does not accept a negative {argument_label}"
         )
     return scalar
 
@@ -550,6 +563,35 @@ def _evaluate_temporal_call(
     source_values = source.values
     result = np.full(context.grid.size, np.nan, dtype=np.float64)
     function_name = spec.name.lower()
+
+    if function_name == "diag":
+        increment = _scalar_temporal_argument(
+            node.args[1], context, spec.name, "increment step"
+        )
+        decrement = _scalar_temporal_argument(
+            node.args[2], context, spec.name, "decrement step"
+        )
+
+        # This is a sample counter, not a time integral: update it exactly once
+        # for every event-source sample, then hold that count on any shared
+        # output-grid timestamps introduced by other formula inputs.
+        finite_source = np.isfinite(source_timestamps) & np.isfinite(source_values)
+        with np.errstate(over="ignore", invalid="ignore"):
+            changes = np.where(source_values != 0, increment, -decrement)
+            raw_count = np.cumsum(changes, dtype=np.float64)
+            # Reflect the cumulative sum at zero. This is equivalent to
+            # counter = max(0, counter + change) for every source sample.
+            running_floor = np.minimum.accumulate(np.minimum(raw_count, 0.0))
+            source_counts = raw_count - running_floor
+        source_counts[~np.logical_and.accumulate(finite_source)] = np.nan
+
+        source_indices = np.searchsorted(
+            source_timestamps, context.grid, side="right"
+        ) - 1
+        valid = source_indices >= 0
+        result[valid] = source_counts[source_indices[valid]]
+        context.temporal_inputs_finite[:] &= np.isfinite(result)
+        return result
 
     if function_name == "integral":
         # Prefix area at source sample i is the integral over all completed

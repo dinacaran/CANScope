@@ -288,6 +288,7 @@ def test_formula_help_has_valid_example_for_every_supported_operation(qapp):
     assert len(sections["Bitwise"]) == 7
     assert "Math" in sections
     assert "Conditional" in sections
+    assert "Diagnostic" in sections
 
     checked = 0
     for examples in sections.values():
@@ -324,6 +325,7 @@ def test_help_button_displays_formula_examples(qapp):
         assert "Arithmetic" in help_text
         assert "Comparisons" in help_text
         assert "Logical" in help_text
+        assert "diag(event, increment, decrement)" in help_text
         assert f"`{_FORMULA_HELP_SIGNAL}` + 100" in help_text
         assert signal_key not in help_text
     finally:

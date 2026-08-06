@@ -36,7 +36,7 @@ MDF and CSV content is detected automatically. Database Manager supports per-cha
 - Fast bulk loading and decoding for BLF, ASC, MDF/MF4, and CSV measurements.
 - Searchable channel/message/signal tree with multi-select plotting and drag-and-drop.
 - Indexed **CAN Trace** viewer for raw frames, filtering, and on-demand signal decode.
-- Formula-based **New Signal** generation with arithmetic, comparisons, and logical expressions; generated definitions are saved in configurations.
+- Formula-based **New Signal** generation with arithmetic, comparisons, logical expressions, temporal operations, and a stateful diagnostic counter; generated definitions are saved in configurations.
 - CSV and Excel (`.xlsx`) export using a selected signal's timestamps or a manually entered recurrence time.
 - JSON configuration save/load for measurement paths, database mapping, generated signals, plotted order, groups, colors, visibility, axes, cursors, and display settings.
 - YAML rule-based diagnostics for expressions, ranges, fault flags, and message loss; optional GitHub Models analysis is available through `Ctrl+Shift+A`.

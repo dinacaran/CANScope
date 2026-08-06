@@ -280,6 +280,70 @@ def test_integral_is_nan_from_the_first_nonfinite_source_sample():
     )
 
 
+def test_diag_counts_true_and_false_event_samples_without_going_below_zero():
+    key = "CH1::M::FaultEvent"
+    diagnostic_sources = {
+        key: _series(
+            key,
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0],
+        )
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("FaultCounter", f"diag(`{key}`, 2, 1)"),
+        diagnostic_sources,
+    )
+
+    # Any nonzero event is true. False events decrement, clamped at zero.
+    np.testing.assert_allclose(
+        result.numpy_values(), [2.0, 4.0, 3.0, 2.0, 1.0, 3.0, 2.0]
+    )
+
+
+def test_diag_holds_between_event_samples_on_a_shared_output_grid():
+    event_key = "CH1::M::FaultEvent"
+    clock_key = "CH1::M::Clock"
+    diagnostic_sources = {
+        event_key: _series(event_key, [0.0, 2.0, 4.0], [1.0, 0.0, 1.0]),
+        clock_key: _series(clock_key, [1.0, 3.0, 5.0], [0.0, 0.0, 0.0]),
+    }
+    definition = CalculatedSignalDefinition(
+        "FaultCounter", f"diag(`{event_key}`, 3, 2) + (`{clock_key}` * 0)"
+    )
+
+    result = calculate_series(definition, diagnostic_sources)
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [1.0, 2.0, 3.0, 4.0, 5.0])
+    np.testing.assert_allclose(result.numpy_values(), [3.0, 1.0, 1.0, 4.0, 4.0])
+
+
+def test_diag_output_can_be_compared_with_a_fault_threshold():
+    assert np.array_equal(
+        _calc1("diag({x}, 2, 1) >= 4", [1.0, 1.0, 0.0, 1.0]),
+        [0.0, 1.0, 0.0, 1.0],
+    )
+
+
+def test_diag_is_nan_from_the_first_nonfinite_event_sample():
+    result = _calc1("diag({x}, 1, 1)", [1.0, np.nan, 1.0])
+    np.testing.assert_allclose(result, [1.0, np.nan, np.nan], equal_nan=True)
+
+
+@pytest.mark.parametrize(
+    ("formula", "message"),
+    [
+        ("diag({x}, -1, 1)", "negative increment step"),
+        ("diag({x}, 1, -1)", "negative decrement step"),
+        ("diag({x}, {x}, 1)", "fixed numeric increment"),
+        ("diag({x}, 1, {x})", "fixed numeric increment"),
+    ],
+)
+def test_diag_rejects_invalid_steps(formula, message):
+    with pytest.raises(CalculatedSignalError, match=message):
+        _calc1(formula, [1.0, 0.0])
+
+
 @pytest.mark.parametrize(
     ("formula", "message"),
     [

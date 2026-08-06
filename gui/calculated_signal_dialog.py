@@ -142,6 +142,10 @@ def _formula_help_text() -> str:
         "rolling_sum(signal, samples) includes the current source sample and "
         "requires a complete positive-size window. integral(signal) accumulates "
         "value x elapsed seconds using zero-order hold and starts at zero.\n"
+        "diag(event, increment, decrement) starts at zero and updates once per "
+        "event sample. Nonzero is true and increments the counter; zero decrements "
+        "it, without allowing the result below zero. Use a comparison such as "
+        "diag(event, 2, 1) >= 10 to produce a fault flag.\n"
         "pi and e are available as constants."
     )
     return "\n\n".join(sections)

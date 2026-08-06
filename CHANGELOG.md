@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## [v00.00.58] — 2026-08-06: MultiStack plotting and diagnostic counter
+
+### Added — Diagnostic counter formula.
+
+`diag(event, increment, decrement)` creates a stateful counter that increments
+for each nonzero event sample and decrements for each zero event sample without
+going below zero. The result can be compared with a threshold to generate a
+fault flag.
 
 ### Added — MultiStack plot mode.
 
