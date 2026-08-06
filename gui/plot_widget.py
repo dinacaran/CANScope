@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMenu,
+    QMessageBox,
     QStackedWidget,
     QStyle,
     QStyledItemDelegate,
@@ -103,6 +104,7 @@ class PlottedSignal:
     axis_visible: bool = True   # multi-axis mode: show/hide the Y axis for this signal
     unit_group: str = ''        # multi-axis mode: normalized unit-group key
     own_axis: bool = False      # multi-axis mode: detach onto individual Y axis
+    multistack_id: int = -1     # MultiStack row; -1 means not assigned yet
 
 
 
@@ -339,6 +341,7 @@ class _ReorderTable(QTableWidget):
 class PlotPanel(QWidget):
     selectionChanged = Signal(str)
     signalDropped = Signal(list)
+    signalDroppedToStack = Signal(list, int)
     backgroundColorChanged = Signal(str)
     signalColorChanged = Signal(str, str)
 
@@ -372,8 +375,11 @@ class PlotPanel(QWidget):
         self._xrange_vb: Any = None
         self._multi_axis = False
         self._stacked_mode = False
+        self._multistack_mode = False
         self._extra_axes: list[tuple[Any, Any]] = []
         self._stacked_plots: list[pg.PlotItem] = []
+        self._stacked_row_keys: list[list[str]] = []
+        self._stacked_stack_ids: list[int] = []
         self._stacked_vlines: list[pg.InfiniteLine] = []   # legacy (unused)
         # Per-row cursor line instances for stacked mode
         # (one InfiniteLine per row — they cannot be shared across scenes)
@@ -431,6 +437,30 @@ class PlotPanel(QWidget):
         # ── Stacked plot (GraphicsLayoutWidget) ──────────────────────────
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground(self._background_color)
+        self.glw.setAcceptDrops(True)
+        self.glw.viewport().setAcceptDrops(True)
+        self.glw.dragEnterEvent = self._stacked_drag_enter
+        self.glw.dragMoveEvent = self._stacked_drag_move
+        self.glw.dragLeaveEvent = self._stacked_drag_leave
+        self.glw.dropEvent = self._stacked_drop
+
+        # MultiStack-only drop cue.  This is a child overlay rather than a
+        # GraphicsLayout row so showing it cannot resize or shift any plots.
+        self._new_stack_drop_indicator = QLabel(
+            'Create new stack', self.glw.viewport()
+        )
+        self._new_stack_drop_indicator.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self._new_stack_drop_indicator.setStyleSheet(
+            'QLabel { color: white; background-color: rgba(61, 158, 240, 210); '
+            'border: 1px solid #8dccff; border-radius: 4px; '
+            'font-weight: 600; padding: 2px 8px; }'
+        )
+        self._new_stack_drop_indicator.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self._new_stack_drop_indicator.hide()
 
         # ── View switcher ─────────────────────────────────────────────────
         self.view_stack = QStackedWidget()
@@ -567,6 +597,356 @@ class PlotPanel(QWidget):
         else:
             event.ignore()
 
+    def _stacked_drag_enter(self, event) -> None:
+        mime = event.mimeData()
+        if mime.hasFormat(SignalTreeWidget.MIME_TYPE):
+            event.acceptProposedAction()
+        elif (self._multistack_mode and
+              mime.hasFormat(_ReorderTable._ROW_REORDER_MIME)):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _stacked_drag_move(self, event) -> None:
+        mime = event.mimeData()
+        if (self._multistack_mode and
+                mime.hasFormat(_ReorderTable._ROW_REORDER_MIME)):
+            event.acceptProposedAction()
+            is_new_stack, _before_stack, indicator_y = (
+                self._stacked_new_stack_target(event)
+            )
+            if is_new_stack:
+                self._show_new_stack_drop_indicator(indicator_y)
+            else:
+                self._hide_new_stack_drop_indicator()
+            return
+        self._hide_new_stack_drop_indicator()
+        self._stacked_drag_enter(event)
+
+    def _stacked_drag_leave(self, event) -> None:
+        self._hide_new_stack_drop_indicator()
+
+    def _show_new_stack_drop_indicator(self, y: int) -> None:
+        indicator = self._new_stack_drop_indicator
+        viewport = self.glw.viewport()
+        height = 26
+        width = max(120, viewport.width() - 16)
+        top = max(0, min(int(y) - height // 2, viewport.height() - height))
+        indicator.setGeometry(8, top, width, height)
+        indicator.show()
+        indicator.raise_()
+
+    def _hide_new_stack_drop_indicator(self) -> None:
+        self._new_stack_drop_indicator.hide()
+
+    def _stacked_new_stack_target(
+        self, event
+    ) -> tuple[bool, int | None, int]:
+        """Return a between-row MultiStack target for an internal drag.
+
+        The second result is the stack that the new row should be inserted
+        before; ``None`` means append after the final row.  The final result is
+        the viewport Y coordinate used by the temporary visual cue.
+        """
+        if not self._multistack_mode or not self._stacked_plots:
+            return False, None, 0
+        try:
+            local = event.position().toPoint()
+            scene_pos = self.glw.mapToScene(local)
+        except Exception:
+            return False, None, 0
+
+        rows: list[tuple[QRectF, int]] = []
+        for row, plot in enumerate(self._stacked_plots):
+            if row >= len(self._stacked_stack_ids):
+                continue
+            rows.append((plot.sceneBoundingRect(), self._stacked_stack_ids[row]))
+        if not rows:
+            return False, None, 0
+
+        boundaries: list[tuple[float, int | None]] = [
+            (rows[0][0].top(), rows[0][1])
+        ]
+        for index in range(1, len(rows)):
+            previous_rect = rows[index - 1][0]
+            next_rect, next_stack = rows[index]
+            boundaries.append((
+                (previous_rect.bottom() + next_rect.top()) / 2.0,
+                next_stack,
+            ))
+        boundaries.append((rows[-1][0].bottom(), None))
+
+        boundary_y, before_stack = min(
+            boundaries, key=lambda entry: abs(scene_pos.y() - entry[0])
+        )
+        # Keep the target narrow enough that dropping in the body of a plot
+        # continues to mean "add to this stack".
+        if abs(scene_pos.y() - boundary_y) > 18.0:
+            return False, None, local.y()
+        try:
+            indicator_y = self.glw.mapFromScene(
+                QPointF(scene_pos.x(), boundary_y)
+            ).y()
+        except Exception:
+            indicator_y = local.y()
+        return True, before_stack, indicator_y
+
+    def _stacked_drop_target(self, event) -> int | None:
+        """Return the MultiStack row ID underneath a GraphicsLayout drop."""
+        try:
+            local = event.position().toPoint()
+            scene_pos = self.glw.mapToScene(local)
+        except Exception:
+            return None
+        for row, plot in enumerate(self._stacked_plots):
+            if plot.sceneBoundingRect().contains(scene_pos):
+                if row < len(self._stacked_stack_ids):
+                    return self._stacked_stack_ids[row]
+                return None
+        return None
+
+    @staticmethod
+    def _decode_signal_mime(mime, mime_type: str) -> list[str]:
+        payload = bytes(mime.data(mime_type)).decode('utf-8')
+        return [part.strip() for part in payload.splitlines() if part.strip()]
+
+    def _stacked_drop(self, event) -> None:
+        self._hide_new_stack_drop_indicator()
+        mime = event.mimeData()
+        if mime.hasFormat(SignalTreeWidget.MIME_TYPE):
+            keys = self._decode_signal_mime(mime, SignalTreeWidget.MIME_TYPE)
+            if not keys:
+                event.ignore()
+                return
+            target_stack = self._stacked_drop_target(event)
+            if self._multistack_mode and target_stack is not None:
+                self.signalDroppedToStack.emit(keys, target_stack)
+            else:
+                self.signalDropped.emit(keys)
+            event.acceptProposedAction()
+            return
+
+        if (self._multistack_mode and
+                mime.hasFormat(_ReorderTable._ROW_REORDER_MIME)):
+            keys = self._decode_signal_mime(mime, _ReorderTable._ROW_REORDER_MIME)
+            is_new_stack, before_stack, _indicator_y = (
+                self._stacked_new_stack_target(event)
+            )
+            if is_new_stack:
+                if self.move_signals_to_new_stack(
+                    keys, before_stack, at_drop_position=True
+                ):
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+                return
+            target_stack = self._stacked_drop_target(event)
+            if target_stack is not None and self.move_signals_to_stack(keys, target_stack):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return
+        event.ignore()
+
+    @staticmethod
+    def _normalized_unit(unit: str | None) -> str:
+        return (unit or '').strip().casefold()
+
+    def multistack_units_mismatch(
+        self,
+        keys: list[str],
+        target_stack: int,
+        extra_units: list[str] | None = None,
+    ) -> bool:
+        """Return whether a proposed row would contain unlike units."""
+        units = {
+            self._normalized_unit(plotted.series.unit)
+            for plotted in self._items.values()
+            if plotted.multistack_id == target_stack and plotted.visible
+        }
+        units.update(
+            self._normalized_unit(self._items[key].series.unit)
+            for key in keys if key in self._items
+        )
+        units.update(self._normalized_unit(unit) for unit in (extra_units or []))
+        return len(units) > 1
+
+    def confirm_multistack_units(
+        self,
+        keys: list[str],
+        target_stack: int,
+        extra_units: list[str] | None = None,
+    ) -> bool:
+        """Ask before overlaying signals with different units in one stack."""
+        if not self.multistack_units_mismatch(keys, target_stack, extra_units):
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('MultiStack unit warning')
+        box.setText('To have proper scale, drop signal with same unit.')
+        continue_button = box.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is continue_button
+
+    def move_signals_to_stack(
+        self,
+        keys: list[str],
+        target_stack: int,
+        *,
+        confirm_units: bool = True,
+    ) -> bool:
+        """Move already-plotted signals into a MultiStack row."""
+        if not self._multistack_mode:
+            return False
+        moved = [key for key in keys if key in self._items]
+        if not moved:
+            return False
+        if not any(item.multistack_id == target_stack for item in self._items.values()):
+            return False
+        changed = [key for key in moved
+                   if self._items[key].multistack_id != target_stack]
+        if not changed:
+            return True
+        if confirm_units and not self.confirm_multistack_units(changed, target_stack):
+            return False
+        self._push_undo()
+        for key in changed:
+            self._items[key].multistack_id = target_stack
+        self._rebuild_curves(preserve_selection=True)
+        self._restore_selection(moved)
+        return True
+
+    def can_move_signals_to_new_stack(self, keys: list[str]) -> bool:
+        """Return whether detaching *keys* would create a different stack."""
+        if not self._multistack_mode:
+            return False
+        moved = {key for key in keys if key in self._items}
+        if not moved:
+            return False
+        source_stacks = {self._items[key].multistack_id for key in moved}
+        if len(source_stacks) != 1:
+            return True
+        source_stack = next(iter(source_stacks))
+        source_members = {
+            key for key, item in self._items.items()
+            if item.multistack_id == source_stack
+        }
+        return moved != source_members
+
+    def _confirm_new_multistack_units(self, keys: list[str]) -> bool:
+        units = {
+            self._normalized_unit(self._items[key].series.unit)
+            for key in keys if key in self._items
+        }
+        if len(units) <= 1:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('MultiStack unit warning')
+        box.setText('To have proper scale, drop signal with same unit.')
+        continue_button = box.addButton(
+            'Continue', QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is continue_button
+
+    def _multistack_y_ranges_by_signal(self) -> dict[str, list[float]]:
+        ranges: dict[str, list[float]] = {}
+        for row, keys in enumerate(self._stacked_row_keys):
+            if row >= len(self._stacked_plots):
+                continue
+            try:
+                y_range = list(self._stacked_plots[row].vb.viewRange()[1])
+            except Exception:
+                continue
+            for key in keys:
+                ranges[key] = y_range
+        return ranges
+
+    def _restore_multistack_y_ranges_by_signal(
+        self, ranges: dict[str, list[float]], rebuild_seq: int
+    ) -> None:
+        def restore() -> None:
+            if self._rebuild_seq != rebuild_seq:
+                return
+            for row, keys in enumerate(self._stacked_row_keys):
+                if row >= len(self._stacked_plots):
+                    continue
+                y_range = next((ranges[key] for key in keys if key in ranges), None)
+                if not y_range:
+                    continue
+                try:
+                    plot = self._stacked_plots[row]
+                    plot.setYRange(y_range[0], y_range[1], padding=0)
+                    plot.vb.enableAutoRange(x=False, y=False)
+                    plot.vb.setAutoVisible(x=False, y=False)
+                except Exception:
+                    pass
+
+        restore()
+        QTimer.singleShot(0, restore)
+
+    def move_signals_to_new_stack(
+        self,
+        keys: list[str],
+        before_stack: int | None = None,
+        *,
+        at_drop_position: bool = False,
+    ) -> bool:
+        """Detach selected signals into one new MultiStack row.
+
+        ``before_stack`` is supplied by the between-row drop target.  For the
+        context-menu command, the new row is inserted immediately below the
+        first selected signal's current row.
+        """
+        requested = set(keys)
+        moved = [key for key in self._items if key in requested]
+        if not self.can_move_signals_to_new_stack(moved):
+            return False
+        if not self._confirm_new_multistack_units(moved):
+            return False
+
+        y_ranges = self._multistack_y_ranges_by_signal()
+        old_order = sorted({item.multistack_id for item in self._items.values()})
+        source_stack = self._items[moved[0]].multistack_id
+        if before_stack is None and not at_drop_position:
+            source_index = old_order.index(source_stack)
+            if source_index + 1 < len(old_order):
+                before_stack = old_order[source_index + 1]
+
+        moved_set = set(moved)
+        groups: list[tuple[int | None, list[str]]] = []
+        for stack_id in old_order:
+            members = [
+                key for key, item in self._items.items()
+                if item.multistack_id == stack_id and key not in moved_set
+            ]
+            if members:
+                groups.append((stack_id, members))
+
+        insert_at = len(groups)
+        if before_stack is not None:
+            old_before_index = old_order.index(before_stack)
+            for index, (stack_id, _members) in enumerate(groups):
+                if old_order.index(stack_id) >= old_before_index:
+                    insert_at = index
+                    break
+        groups.insert(insert_at, (None, moved))
+
+        self._push_undo()
+        for new_stack_id, (_old_stack_id, members) in enumerate(groups):
+            for key in members:
+                self._items[key].multistack_id = new_stack_id
+
+        self._rebuild_curves(preserve_selection=True)
+        self._restore_selection(moved)
+        self._restore_multistack_y_ranges_by_signal(
+            y_ranges, self._rebuild_seq
+        )
+        return True
+
     # ── Public setters ────────────────────────────────────────────────────
 
     def set_show_points(self, show: bool) -> None:
@@ -615,6 +995,9 @@ class PlotPanel(QWidget):
     def set_multi_axis(self, enabled: bool) -> None:
         saved_x_range = self._visible_x_range()
         self._multi_axis = bool(enabled)
+        if enabled:
+            self._stacked_mode = False
+            self._multistack_mode = False
         self.table.setColumnHidden(5, not self._multi_axis)  # Ax swatch
         self.table.setColumnHidden(6, not self._multi_axis)  # Axis checkbox
         self._rebuild_curves(
@@ -740,11 +1123,41 @@ class PlotPanel(QWidget):
         """Toggle INCA/CANdb-style stacked layout (one row per signal, shared X)."""
         saved_x_range = self._visible_x_range()
         self._stacked_mode = bool(enabled)
+        self._multistack_mode = False
+        if enabled:
+            self._multi_axis = False
         self._rebuild_curves(
             preserve_selection=True,
             preserved_x_range=saved_x_range,
             preserve_y_range=False,
         )
+
+    def set_multistack(self, enabled: bool) -> None:
+        """Toggle stacked rows that can contain multiple overlaid signals."""
+        saved_x_range = self._visible_x_range()
+        self._multistack_mode = bool(enabled)
+        self._stacked_mode = bool(enabled)
+        if enabled:
+            self._multi_axis = False
+            self._ensure_multistack_assignments()
+        self._rebuild_curves(
+            preserve_selection=True,
+            preserved_x_range=saved_x_range,
+            preserve_y_range=False,
+        )
+
+    def _next_multistack_id(self) -> int:
+        used = [item.multistack_id for item in self._items.values()
+                if item.multistack_id >= 0]
+        return (max(used) + 1) if used else 0
+
+    def _ensure_multistack_assignments(self) -> None:
+        """Give every unassigned signal its own row without changing saved rows."""
+        next_id = self._next_multistack_id()
+        for plotted in self._items.values():
+            if plotted.multistack_id < 0:
+                plotted.multistack_id = next_id
+                next_id += 1
 
     def add_series(self, key: str, series: SignalSeries, color: str | None = None) -> None:
         if key in self._items:
@@ -753,7 +1166,14 @@ class PlotPanel(QWidget):
             self._push_undo()
         color = color or next(self._color_cycle)
         was_empty = not self._items
-        self._items[key] = PlottedSignal(key=key, series=series, curve=None, color=color)
+        multistack_id = self._next_multistack_id() if self._multistack_mode else -1
+        self._items[key] = PlottedSignal(
+            key=key,
+            series=series,
+            curve=None,
+            color=color,
+            multistack_id=multistack_id,
+        )
         if self._current_key is None:
             self._current_key = key
         if not self._batch_mode:
@@ -943,6 +1363,8 @@ class PlotPanel(QWidget):
         self._stacked_c1_lines.clear()  # per-row C1 lines (each row owns its instance)
         self._stacked_c2_lines.clear()  # per-row C2 lines
         self._stacked_plots.clear()
+        self._stacked_row_keys.clear()
+        self._stacked_stack_ids.clear()
         try:
             self.glw.clear()
         except Exception:
@@ -962,7 +1384,7 @@ class PlotPanel(QWidget):
         # add/remove operations don't snap the viewport back to full extent.
         _saved_xr: list | None = preserved_x_range
         _saved_yr: list | None = None           # standard overlay: one shared Y range
-        _saved_yr_by_key: dict[str, list] = {}  # stacked: per-signal key
+        _saved_yr_by_key: dict[object, list] = {}  # stacked: per-signal/stack key
         _saved_yr_by_unit: dict[str, list] = {} # multi-axis: per-unit-group key
 
         if self._stacked_mode and self._stacked_plots:
@@ -972,13 +1394,19 @@ class PlotPanel(QWidget):
                 except Exception:
                     pass
             if preserve_y_range:
-                order = [k for k, p in self._items.items() if p.visible]
-                for i, key in enumerate(order):
-                    if i < len(self._stacked_plots):
-                        try:
-                            _saved_yr_by_key[key] = list(self._stacked_plots[i].vb.viewRange()[1])
-                        except Exception:
-                            pass
+                for i, row_keys in enumerate(self._stacked_row_keys):
+                    if i >= len(self._stacked_plots) or not row_keys:
+                        continue
+                    row_key = (
+                        self._stacked_stack_ids[i]
+                        if self._multistack_mode and i < len(self._stacked_stack_ids)
+                        else row_keys[0]
+                    )
+                    try:
+                        _saved_yr_by_key[row_key] = list(
+                            self._stacked_plots[i].vb.viewRange()[1])
+                    except Exception:
+                        pass
         elif not self._stacked_mode:
             if _saved_xr is None:
                 try:
@@ -1038,14 +1466,22 @@ class PlotPanel(QWidget):
                     except Exception:
                         pass
                 if _saved_yr_by_key and self._stacked_plots:
-                    order_after = [k for k, p in self._items.items() if p.visible]
-                    for i, key in enumerate(order_after):
-                        if i < len(self._stacked_plots) and key in _saved_yr_by_key:
-                            try:
-                                yr = _saved_yr_by_key[key]
-                                self._stacked_plots[i].setYRange(yr[0], yr[1], padding=0)
-                            except Exception:
-                                pass
+                    for i, row_keys in enumerate(self._stacked_row_keys):
+                        if i >= len(self._stacked_plots) or not row_keys:
+                            continue
+                        row_key = (
+                            self._stacked_stack_ids[i]
+                            if self._multistack_mode and i < len(self._stacked_stack_ids)
+                            else row_keys[0]
+                        )
+                        if row_key not in _saved_yr_by_key:
+                            continue
+                        try:
+                            yr = _saved_yr_by_key[row_key]
+                            self._stacked_plots[i].setYRange(
+                                yr[0], yr[1], padding=0)
+                        except Exception:
+                            pass
                 # Disable auto-range so pyqtgraph's deferred updateAutoRange()
                 # (queued by curve.setData inside _rebuild_stacked) cannot
                 # override the restored ranges. fit_to_window() re-enables it.
@@ -1310,22 +1746,29 @@ class PlotPanel(QWidget):
 
     def _rebuild_stacked(self) -> None:
         """
-        INCA/CANdb-style stacked layout.
-        - Each signal in its own row, shared X axis.
-        - Left axis label uses two-line HTML with pyqtgraph's -90° rotation:
-            Line 1: unit  → rotates to RIGHT side → inner (between tick numbers and signal name)
-            Line 2: name  → rotates to LEFT side  → outer (furthest from data)
-        - Both lines are part of the same axis label, so no TextItem tracking needed.
+        Build shared-time stacked rows.
+
+        Ordinary Stacked keeps one signal per row. MultiStack groups signals by
+        ``multistack_id`` and overlays every member of a row on one Y scale.
         """
-        # Only stack visible signals — invisible ones are completely hidden
-        order = [k for k, p in self._items.items() if p.visible]
-        n = len(order)
+        visible_keys = [key for key, item in self._items.items() if item.visible]
+        if self._multistack_mode:
+            self._ensure_multistack_assignments()
+            grouped: dict[int, list[str]] = {}
+            for key in visible_keys:
+                stack_id = self._items[key].multistack_id
+                grouped.setdefault(stack_id, []).append(key)
+            rows = [(stack_id, grouped[stack_id]) for stack_id in sorted(grouped)]
+        else:
+            rows = [(idx, [key]) for idx, key in enumerate(visible_keys)]
+
+        self._stacked_stack_ids = [stack_id for stack_id, _ in rows]
+        self._stacked_row_keys = [list(keys) for _, keys in rows]
+        n = len(rows)
         ref_plot: pg.PlotItem | None = None
 
-        for idx, key in enumerate(order):
-            plotted = self._items[key]
-            series  = plotted.series
-
+        for idx, (_stack_id, row_keys) in enumerate(rows):
+            first = self._items[row_keys[0]]
             # Use custom axis: bottom-anchored, row-clipped label
             _left_ax = _StackedLeftAxis('left')
             p: pg.PlotItem = self.glw.addPlot(
@@ -1335,19 +1778,21 @@ class PlotPanel(QWidget):
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMenuEnabled(False)
 
-            # Left axis: unit (inner) then signal name (outer), separated by <br>.
-            # pyqtgraph rotates the label -90° (CCW), so line 1 → right (inner) and
-            # line 2 → left (outer). This puts the unit between tick numbers and name.
-            if series.unit:
-                # Signal name first → outer (left after -90° rotation)
-                # Unit second → inner (right after -90° rotation, between tick numbers and name)
-                ylabel = (f'{series.signal_name}' +
-                          f'<br><span style="font-size:80%">({series.unit})</span>')
+            names = ', '.join(self._items[key].series.signal_name for key in row_keys)
+            units = []
+            for key in row_keys:
+                unit = (self._items[key].series.unit or '').strip()
+                if unit and unit not in units:
+                    units.append(unit)
+            if units:
+                ylabel = (
+                    f'{names}<br><span style="font-size:80%">'
+                    f'({" / ".join(units)})</span>'
+                )
             else:
-                ylabel = series.signal_name
-            # Fix 2: vertical-align middle via CSS on the axis label
-            p.setLabel('left', ylabel, color=plotted.color)
-            p.getAxis('left').setTextPen(pg.mkPen(plotted.color))
+                ylabel = names
+            p.setLabel('left', ylabel, color=first.color)
+            p.getAxis('left').setTextPen(pg.mkPen(first.color))
             p.getAxis('left').setWidth(85)
             p.showAxis('right', False)
             p.showAxis('top',   False)
@@ -1366,18 +1811,17 @@ class PlotPanel(QWidget):
             else:
                 p.setXLink(ref_plot)
 
-            curve = pg.PlotDataItem()
-            p.addItem(curve)
-            # NB: _configure_curve MUST run after addItem — PlotItem.addItem
-            # overwrites the item's clipToView / autoDownsample with the
-            # PlotItem's own (off-by-default) modes, so configuring beforehand
-            # would be silently wiped and the row would render every sample.
-            self._configure_curve(curve)
-            plotted.curve    = curve
-            plotted.axis     = p.getAxis('left')
-            plotted.view_box = p.vb
-
-            self._apply_curve_style(plotted)
+            for key in row_keys:
+                plotted = self._items[key]
+                curve = pg.PlotDataItem()
+                p.addItem(curve)
+                # PlotItem.addItem resets clip/downsample settings, so configure
+                # only after the curve belongs to its row.
+                self._configure_curve(curve)
+                plotted.curve = curve
+                plotted.axis = p.getAxis('left')
+                plotted.view_box = p.vb
+                self._apply_curve_style(plotted)
 
             # Each row gets its own InfiniteLine instance.
             # A QGraphicsItem can only belong to ONE scene — sharing across
@@ -1859,14 +2303,17 @@ class PlotPanel(QWidget):
             x_max += 1.0
 
         if self._stacked_mode:
-            order = [k for k, p in self._items.items() if p.visible]
-            for i, key in enumerate(order):
+            for i, row_keys in enumerate(self._stacked_row_keys):
                 if i >= len(self._stacked_plots):
                     break
-                plotted = self._items[key]
                 p = self._stacked_plots[i]
                 p.setXRange(x_min, x_max, padding=0.02)
-                vals = [v for v in plotted.series.values if v == v]
+                vals = [
+                    value
+                    for key in row_keys
+                    for value in self._items[key].series.values
+                    if value == value
+                ]
                 if vals:
                     y_min, y_max = min(vals), max(vals)
                     pad = (y_max - y_min) * 0.05 if y_min != y_max else (1.0 if y_min == 0 else abs(y_min) * 0.05)
@@ -1985,19 +2432,27 @@ class PlotPanel(QWidget):
             return y_min - pad, y_max + pad
 
         if self._stacked_mode:
-            order = [k for k, p in self._items.items() if p.visible]
-            for i, key in enumerate(order):
+            for i, row_keys in enumerate(self._stacked_row_keys):
                 if i >= len(self._stacked_plots):
                     break
-                plotted = self._items[key]
                 p = self._stacked_plots[i]
                 try:
                     xr = p.vb.viewRange()[0]
                 except Exception:
                     continue
-                result = _y_range_for_visible(plotted.series, xr[0], xr[1])
-                if result:
-                    p.setYRange(result[0], result[1], padding=0)
+                row_ranges = [
+                    result
+                    for key in row_keys
+                    if (result := _y_range_for_visible(
+                        self._items[key].series, xr[0], xr[1]
+                    )) is not None
+                ]
+                if row_ranges:
+                    p.setYRange(
+                        min(result[0] for result in row_ranges),
+                        max(result[1] for result in row_ranges),
+                        padding=0,
+                    )
 
         elif self._multi_axis:
             self._update_multi_axis_views()  # ensure geometry is current
@@ -2328,6 +2783,7 @@ class PlotPanel(QWidget):
                 group=v.group,
                 axis_visible=v.axis_visible,
                 own_axis=v.own_axis,
+                multistack_id=v.multistack_id,
             )
             for k, v in self._items.items()
         }
@@ -3097,6 +3553,9 @@ class PlotPanel(QWidget):
         grp_act.triggered.connect(self.group_selected)
         grp_act.setEnabled(has_sel)
         menu.addAction(grp_act)
+        if self._multistack_mode:
+            menu.addSeparator()
+            self._add_move_to_new_stack_action(menu, selected_keys)
         # Multi-axis: individual axis option
         if self._multi_axis:
             menu.addSeparator()
@@ -3131,6 +3590,20 @@ class PlotPanel(QWidget):
         menu.addAction(bg_act)
         menu.exec(global_pos)
 
+    def _add_move_to_new_stack_action(
+        self, menu: QMenu, selected_keys: list
+    ) -> QAction:
+        """Add the MultiStack detach command and return it for UI tests."""
+        action = QAction('Move to new stack', menu)
+        keys = [str(key) for key in selected_keys if str(key) in self._items]
+        action.setEnabled(self.can_move_signals_to_new_stack(keys))
+        action.triggered.connect(
+            lambda _checked=False, selected=list(keys):
+            self.move_signals_to_new_stack(selected)
+        )
+        menu.addAction(action)
+        return action
+
     def _toggle_name_channel(self, checked: bool) -> None:
         self._name_show_channel = bool(checked)
         self._refresh_table_and_cursors()
@@ -3155,15 +3628,14 @@ class PlotPanel(QWidget):
         if btn != Qt.MouseButton.RightButton:
             return
         pos = event.scenePos()
-        keys = list(self._items.keys())
         for i, p in enumerate(self._stacked_plots):
             if p.sceneBoundingRect().contains(pos):
-                if i < len(keys):
-                    key = keys[i]
-                    self._restore_selection([key])
+                if i < len(self._stacked_row_keys):
+                    keys = self._stacked_row_keys[i]
+                    self._restore_selection(keys)
                     # QCursor.pos() is always reliable for screen coordinates
                     from PySide6.QtGui import QCursor
-                    self._show_signal_menu([key], QCursor.pos())
+                    self._show_signal_menu(keys, QCursor.pos())
                     try:
                         event.accept()
                     except Exception:

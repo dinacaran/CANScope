@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self._pending_plot_groups:  dict[str, str]  = {}
         self._pending_plot_axis_visible: dict[str, bool] = {}
         self._pending_plot_own_axis: dict[str, bool] = {}
+        self._pending_plot_multistack: dict[str, int] = {}
         self._pending_plot_type: str | None = None
         self._temporary_plot_handoff: dict | None = None
         self._temporary_plot_config_path = (
@@ -194,6 +195,9 @@ class MainWindow(QMainWindow):
         self.signal_tree.generatedDeleteRequested.connect(self.delete_generated_signal)
         self.plot_panel.selectionChanged.connect(self._on_plot_selection_changed)
         self.plot_panel.signalDropped.connect(self.add_signals_to_plot)
+        self.plot_panel.signalDroppedToStack.connect(
+            self._add_signals_to_multistack
+        )
         self.plot_panel.backgroundColorChanged.connect(self._on_background_color_changed)
         self.plot_panel.signalColorChanged.connect(self._on_signal_color_changed)
 
@@ -202,12 +206,13 @@ class MainWindow(QMainWindow):
         button_layout.setContentsMargins(0, 0, 0, 0)
         self.btn_fit = QPushButton('Fit to Window')
         self.btn_fit_v = QPushButton('Fit Vertical')
-        self.btn_remove = QPushButton('Remove Selected')
         self.btn_multi_axis = QPushButton('Multi-Axis')
         self.btn_multi_axis.setCheckable(True)
         self.btn_stacked = QPushButton('Stacked')
         self.btn_stacked.setCheckable(True)
         self.btn_stacked.setChecked(True)  # default plot mode on app startup
+        self.btn_multistack = QPushButton('MultiStack')
+        self.btn_multistack.setCheckable(True)
         self.btn_cursor1 = QPushButton('Cursor 1')
         self.btn_cursor1.setCheckable(True)
         self.btn_cursor1.setChecked(False)  # OFF by default
@@ -218,15 +223,17 @@ class MainWindow(QMainWindow):
         self.btn_hide_line = QPushButton('Hide Line')
         self.btn_hide_line.setCheckable(True)
         self.btn_hide_line.setEnabled(False)
-        for btn in (self.btn_fit, self.btn_fit_v, self.btn_remove, self.btn_multi_axis, self.btn_stacked, self.btn_cursor1, self.btn_cursor2, self.btn_points, self.btn_hide_line):
+        for btn in (self.btn_fit, self.btn_fit_v, self.btn_multi_axis,
+                    self.btn_stacked, self.btn_multistack, self.btn_cursor1,
+                    self.btn_cursor2, self.btn_points, self.btn_hide_line):
             button_layout.addWidget(btn)
         button_layout.addStretch(1)
 
         self.btn_fit.clicked.connect(self.plot_panel.fit_to_window)
         self.btn_fit_v.clicked.connect(self.plot_panel.fit_vertical)
-        self.btn_remove.clicked.connect(self.plot_panel.remove_selected_series)
         self.btn_multi_axis.toggled.connect(self._toggle_multi_axis)
         self.btn_stacked.toggled.connect(self._toggle_stacked)
+        self.btn_multistack.toggled.connect(self._toggle_multistack)
         self.btn_cursor1.toggled.connect(self._toggle_cursor1)
         self.btn_cursor2.toggled.connect(self._toggle_cursor2)
         self.btn_points.toggled.connect(self._toggle_points)
@@ -751,7 +758,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if not keys:
             return None
 
-        if self.btn_stacked.isChecked():
+        if self.btn_multistack.isChecked():
+            plot_type = 'multistack'
+        elif self.btn_stacked.isChecked():
             plot_type = 'stacked'
         elif self.btn_multi_axis.isChecked():
             plot_type = 'multi_axis'
@@ -770,6 +779,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     'group': self.plot_panel._items[key].group,
                     'axis_visible': self.plot_panel._items[key].axis_visible,
                     'own_axis': self.plot_panel._items[key].own_axis,
+                    'multistack_id': self.plot_panel._items[key].multistack_id,
                 }
                 for key in keys
             ],
@@ -818,9 +828,13 @@ QToolButton:pressed { background-color: #1a2a3a; }
             str(signal['key']): bool(signal['own_axis'])
             for signal in signals if 'own_axis' in signal
         }
+        self._pending_plot_multistack = {
+            str(signal['key']): int(signal['multistack_id'])
+            for signal in signals if 'multistack_id' in signal
+        }
         plot_type = str(data.get('plot_type', 'normal'))
         self._pending_plot_type = (
-            plot_type if plot_type in {'normal', 'multi_axis', 'stacked'}
+            plot_type if plot_type in {'normal', 'multi_axis', 'stacked', 'multistack'}
             else 'normal'
         )
 
@@ -829,14 +843,21 @@ QToolButton:pressed { background-color: #1a2a3a; }
         plot_type = self._pending_plot_type
         if plot_type is None:
             return
-        if plot_type == 'stacked':
+        if plot_type == 'multistack':
             self.btn_multi_axis.setChecked(False)
+            self.btn_stacked.setChecked(False)
+            self.btn_multistack.setChecked(True)
+        elif plot_type == 'stacked':
+            self.btn_multi_axis.setChecked(False)
+            self.btn_multistack.setChecked(False)
             self.btn_stacked.setChecked(True)
         elif plot_type == 'multi_axis':
             self.btn_stacked.setChecked(False)
+            self.btn_multistack.setChecked(False)
             self.btn_multi_axis.setChecked(True)
         else:
             self.btn_stacked.setChecked(False)
+            self.btn_multistack.setChecked(False)
             self.btn_multi_axis.setChecked(False)
         self._pending_plot_type = None
 
@@ -855,6 +876,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._pending_plot_groups = {}
         self._pending_plot_axis_visible = {}
         self._pending_plot_own_axis = {}
+        self._pending_plot_multistack = {}
         self._pending_plot_type = None
         self.store = None
         self.diagnostics_box.clear()
@@ -1007,14 +1029,23 @@ QToolButton:pressed { background-color: #1a2a3a; }
     def _toggle_multi_axis(self, checked: bool) -> None:
         if checked:
             self.btn_stacked.setChecked(False)   # mutually exclusive
+            self.btn_multistack.setChecked(False)
         self.plot_panel.set_multi_axis(checked)
         self._update_status('Plot mode updated', 'Continue plotting or fit the view')
 
     def _toggle_stacked(self, checked: bool) -> None:
         if checked:
             self.btn_multi_axis.setChecked(False)  # mutually exclusive
+            self.btn_multistack.setChecked(False)
         self.plot_panel.set_stacked(checked)
         self._update_status('Plot mode updated', 'Continue plotting or fit the view')
+
+    def _toggle_multistack(self, checked: bool) -> None:
+        if checked:
+            self.btn_multi_axis.setChecked(False)
+            self.btn_stacked.setChecked(False)
+        self.plot_panel.set_multistack(checked)
+        self._update_status('Plot mode updated', 'Drag signals into a stack to overlay them')
 
     def _toggle_cursor1(self, checked: bool) -> None:
         self.plot_panel.set_cursor1_enabled(checked)
@@ -1116,6 +1147,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if key in self._pending_plot_own_axis:
             plotted.own_axis = self._pending_plot_own_axis.pop(key)
             changed = True
+        if key in self._pending_plot_multistack:
+            plotted.multistack_id = self._pending_plot_multistack.pop(key)
+            changed = True
         if changed:
             self.plot_panel._rebuild_curves(preserve_selection=False)
 
@@ -1194,6 +1228,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             self._pending_plot_groups,
             self._pending_plot_axis_visible,
             self._pending_plot_own_axis,
+            self._pending_plot_multistack,
         ):
             if key in state:
                 state[new_key] = state.pop(key)
@@ -1507,6 +1542,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     'group':        self.plot_panel._items[k].group,
                     'axis_visible': self.plot_panel._items[k].axis_visible,
                     'own_axis':     self.plot_panel._items[k].own_axis,
+                    'multistack_id': self.plot_panel._items[k].multistack_id,
                 }
                 for k in self.plot_panel.plotted_keys()
             ],
@@ -1517,6 +1553,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             'signal_colors': self.plot_panel.series_colors(),
             'multi_axis': self.btn_multi_axis.isChecked(),
             'stacked': self.btn_stacked.isChecked(),
+            'multistack': self.btn_multistack.isChecked(),
             'cursor1': self.btn_cursor1.isChecked(),
             'cursor2': self.btn_cursor2.isChecked(),
             'name_show_channel': self.plot_panel._name_show_channel,
@@ -1575,6 +1612,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         pending_groups       = {}
         pending_axis_visible = {}
         pending_own_axis     = {}
+        pending_multistack   = {}
         for s in signals_data:
             if isinstance(s, str):
                 pending_keys.append(s)
@@ -1590,6 +1628,8 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         pending_axis_visible[k] = bool(s['axis_visible'])
                     if 'own_axis' in s:
                         pending_own_axis[k] = bool(s['own_axis'])
+                    if 'multistack_id' in s:
+                        pending_multistack[k] = int(s['multistack_id'])
         pending_colors = dict(data.get('signal_colors') or {})
         generated_errors = self.calculated_signals.replace_definitions(
             data.get('generated_signals') or []
@@ -1614,6 +1654,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
         }
         self._pending_plot_own_axis = {
             key: value for key, value in pending_own_axis.items() if key in generated_pending
+        }
+        self._pending_plot_multistack = {
+            key: value for key, value in pending_multistack.items()
+            if key in generated_pending
         }
 
         # Fix 6: if data is already decoded, ask the user what to do
@@ -1640,11 +1684,17 @@ QToolButton:pressed { background-color: #1a2a3a; }
         if bg:
             self.plot_panel.set_background_color(str(bg))
         multi_axis = bool(data.get('multi_axis', False))
-        self.btn_multi_axis.setChecked(multi_axis)
-        # Configurations that explicitly saved a plot mode keep it. Older
-        # configurations without a ``stacked`` key use the new app default,
-        # unless they explicitly select multi-axis mode.
-        self.btn_stacked.setChecked(bool(data.get('stacked', not multi_axis)))
+        multistack = bool(data.get('multistack', False))
+        stacked = bool(data.get('stacked', not multi_axis and not multistack))
+        self.btn_multi_axis.setChecked(False)
+        self.btn_stacked.setChecked(False)
+        self.btn_multistack.setChecked(False)
+        if multistack:
+            self.btn_multistack.setChecked(True)
+        elif multi_axis:
+            self.btn_multi_axis.setChecked(True)
+        else:
+            self.btn_stacked.setChecked(stacked)
         self.btn_cursor1.setChecked(bool(data.get('cursor1', False)))
         self.btn_cursor2.setChecked(bool(data.get('cursor2', False)))
         self.plot_panel._name_show_channel = bool(data.get('name_show_channel', False))
@@ -1676,6 +1726,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                     if key in pending_own_axis:
                         self.plot_panel._items[key].own_axis = pending_own_axis[key]
                         needs_rebuild = True
+                    if key in pending_multistack:
+                        self.plot_panel._items[key].multistack_id = pending_multistack[key]
+                        needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
             return
@@ -1690,6 +1743,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
         self._pending_plot_groups       = pending_groups
         self._pending_plot_axis_visible = pending_axis_visible
         self._pending_plot_own_axis     = pending_own_axis
+        self._pending_plot_multistack   = pending_multistack
         self._update_measurement_tab()
 
         if not cfg_mpath:
@@ -1818,6 +1872,50 @@ QToolButton:pressed { background-color: #1a2a3a; }
 
         if plotted:
             self._update_status(f'Plotted {plotted} signal(s)', 'Use Fit to Window, reorder, or export selected CSV')
+
+    def _add_signals_to_multistack(self, keys, target_stack: int) -> None:
+        """Handle a signal-tree drop onto a specific MultiStack row."""
+        if isinstance(keys, str):
+            keys = [keys]
+        keys = [key for key in (keys or []) if key]
+        if not keys or not self.plot_panel._multistack_mode:
+            return
+
+        existing = [key for key in keys if key in self.plot_panel._items]
+        extra_units: list[str] = []
+        deferred_generated: list[str] = []
+        active_store = self.store
+        if active_store is None and self._worker is not None:
+            active_store = getattr(self._worker, '_live_store', None)
+        for key in keys:
+            if key in self.plot_panel._items:
+                continue
+            if self.calculated_signals.contains_key(key):
+                series = self.calculated_signals.cached_series(key)
+                if series is None:
+                    definition = self.calculated_signals.definition(key)
+                    if definition is not None:
+                        extra_units.append(definition.unit)
+                    deferred_generated.append(key)
+                    continue
+            else:
+                series = active_store.get_series(key) if active_store is not None else None
+            if series is not None:
+                extra_units.append(series.unit)
+
+        if not self.plot_panel.confirm_multistack_units(
+            existing, target_stack, extra_units
+        ):
+            return
+
+        for key in deferred_generated:
+            self._pending_plot_multistack[key] = target_stack
+        self.add_signals_to_plot(keys)
+        plotted_keys = [key for key in keys if key in self.plot_panel._items]
+        if plotted_keys:
+            self.plot_panel.move_signals_to_stack(
+                plotted_keys, target_stack, confirm_units=False
+            )
 
     def add_signal_to_plot(self, key: str, fit: bool = True) -> bool:
         # Generated signals are calculated only from a completed measurement;
@@ -2174,6 +2272,7 @@ QToolButton:pressed { background-color: #1a2a3a; }
             groups       = dict(getattr(self, '_pending_plot_groups',       {}))
             axis_visible = dict(getattr(self, '_pending_plot_axis_visible', {}))
             own_axis     = dict(getattr(self, '_pending_plot_own_axis',     {}))
+            multistack   = dict(getattr(self, '_pending_plot_multistack',   {}))
             self._pending_plot_keys = []
             self.add_signals_to_plot(wanted)
             for key, color in colors.items():
@@ -2193,6 +2292,9 @@ QToolButton:pressed { background-color: #1a2a3a; }
                         needs_rebuild = True
                     if key in own_axis:
                         self.plot_panel._items[key].own_axis = own_axis[key]
+                        needs_rebuild = True
+                    if key in multistack:
+                        self.plot_panel._items[key].multistack_id = multistack[key]
                         needs_rebuild = True
             if needs_rebuild:
                 self.plot_panel._rebuild_curves(preserve_selection=False)
@@ -2215,6 +2317,10 @@ QToolButton:pressed { background-color: #1a2a3a; }
             }
             self._pending_plot_own_axis = {
                 key: value for key, value in own_axis.items() if key in waiting_generated
+            }
+            self._pending_plot_multistack = {
+                key: value for key, value in multistack.items()
+                if key in waiting_generated
             }
         if temporary_handoff_active:
             self._temporary_plot_handoff = None

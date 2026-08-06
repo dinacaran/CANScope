@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added — MultiStack plot mode.
+
+MultiStack keeps the shared-time stacked layout while allowing multiple
+signals to be overlaid in the same stack. Signals can be dragged from the
+signal table or signal tree into any stack. Dropping a signal with a different
+unit displays a scale warning with Continue and Cancel choices.
+
+Signals can be separated again by dragging them to the highlighted
+"Create new stack" target between stacks or below the final stack. The signal
+context menu also provides "Move to new stack". Detaching preserves signal
+colors, cursor positions, and plot view ranges.
+
+### Changed — Removed the Remove Selected toolbar button.
+
+Plotted signals remain removable through their context menu.
+
 ## [v00.00.57] — 2026-08-04: Plot timestamp and mixed MDF loading fixes
 
 ### Fixed — Plots no longer connect the final point back to the first point.

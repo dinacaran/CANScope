@@ -50,6 +50,36 @@ def _mock_open_dialog(monkeypatch, in_path: Path) -> None:
                          lambda *a, **k: (str(in_path), 'JSON Files (*.json)'))
 
 
+def test_plot_toolbar_does_not_show_remove_selected_button(window):
+    from PySide6.QtWidgets import QPushButton
+
+    button_labels = {button.text() for button in window.findChildren(QPushButton)}
+    assert 'Remove Selected' not in button_labels
+
+
+def test_plot_toolbar_has_multistack_next_to_stacked(window):
+    layout = window.btn_stacked.parentWidget().layout()
+    stacked_index = layout.indexOf(window.btn_stacked)
+
+    assert window.btn_multistack.text() == 'MultiStack'
+    assert layout.indexOf(window.btn_multistack) == stacked_index + 1
+
+
+def test_multistack_plot_mode_is_mutually_exclusive(window):
+    window.btn_multistack.setChecked(True)
+
+    assert window.btn_multistack.isChecked()
+    assert not window.btn_stacked.isChecked()
+    assert not window.btn_multi_axis.isChecked()
+    assert window.plot_panel._multistack_mode
+
+    window.btn_stacked.setChecked(True)
+
+    assert window.btn_stacked.isChecked()
+    assert not window.btn_multistack.isChecked()
+    assert not window.plot_panel._multistack_mode
+
+
 # ---------------------------------------------------------------------------
 # Save
 # ---------------------------------------------------------------------------

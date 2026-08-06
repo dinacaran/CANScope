@@ -123,6 +123,7 @@ def test_opening_new_measurement_clears_stale_state_and_uses_plot_message(
                 "group": "",
                 "axis_visible": True,
                 "own_axis": False,
+                "multistack_id": -1,
             }
         ],
     }
