@@ -280,6 +280,132 @@ def test_integral_is_nan_from_the_first_nonfinite_source_sample():
     )
 
 
+def test_derivative_first_source_sample_is_nan():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0], [10.0, 20.0, 25.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, 5.0], equal_nan=True
+    )
+
+
+def test_derivative_is_nan_at_a_duplicate_source_timestamp():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 1.0, 2.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [0.0, 1.0, 2.0])
+    # dt == 0 at the duplicate timestamp; that interval is explicitly NaN,
+    # not a division-by-zero accident that happens to propagate.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, 10.0], equal_nan=True
+    )
+
+
+def test_derivative_of_a_constant_signal_is_zero_after_the_first_sample():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0], [5.0, 5.0, 5.0, 5.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 0.0, 0.0, 0.0], equal_nan=True
+    )
+
+
+def test_derivative_of_a_ramp_gives_its_known_slope():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 9.0, 11.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 2.0, 2.0, 2.0, 2.0], equal_nan=True
+    )
+
+
+def test_derivative_nan_poisoning_is_local_and_the_tail_recovers():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(
+            key, [0.0, 1.0, 2.0, 3.0, 4.0], [10.0, 20.0, np.nan, 40.0, 50.0]
+        )
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    # Only the two intervals touching the bad sample (index 2) are NaN; the
+    # interval after it recovers, unlike integral()'s cumulative poisoning.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, np.nan, np.nan, 10.0], equal_nan=True
+    )
+
+
+def test_derivative_on_nonuniform_timestamps_gives_correct_per_interval_slopes():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(),
+        [np.nan, 20.0, 20.0 / 3.0, 10.0 / 3.0],
+        equal_nan=True,
+    )
+
+
+def test_derivative_holds_zero_order_onto_the_union_grid_with_a_denser_signal():
+    x_key = "CH1::M::X"
+    clock_key = "CH1::M::Clock"
+    temporal_sources = {
+        x_key: _series(x_key, [0.0, 2.0, 4.0], [10.0, 20.0, 30.0]),
+        clock_key: _series(clock_key, [1.0, 3.0, 5.0], [0.0, 0.0, 0.0]),
+    }
+    definition = CalculatedSignalDefinition(
+        "Derivative", f"derivative(`{x_key}`) + (`{clock_key}` * 0)"
+    )
+
+    result = calculate_series(definition, temporal_sources)
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [1.0, 2.0, 3.0, 4.0, 5.0])
+    # Held constant at 5.0 (the x-source's own per-interval slope) across the
+    # denser clock grid, not interpolated or partial like integral()'s hold.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 5.0, 5.0, 5.0, 5.0], equal_nan=True
+    )
+
+
 def test_diag_counts_true_and_false_event_samples_without_going_below_zero():
     key = "CH1::M::FaultEvent"
     diagnostic_sources = {

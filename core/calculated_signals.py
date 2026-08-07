@@ -252,6 +252,15 @@ _register(
     None, temporal=True,
 )
 _register(
+    "derivative", 1, 1, "Time", "derivative(x)",
+    "Backward difference (v[i] - v[i-1]) / (t[i] - t[i-1]) on the source's own "
+    "timebase, held onto the output grid; the first source sample and "
+    "duplicate source timestamps give NaN. Unlike integral(), this is local "
+    "rather than cumulative; a bad sample poisons only the two intervals "
+    "touching it, not everything after it",
+    None, temporal=True,
+)
+_register(
     "diag", 3, 3, "Diagnostic", "diag(event, increment, decrement)",
     "Counter starting at 0; increment while event is nonzero, otherwise "
     "decrement without going below 0",
@@ -626,6 +635,25 @@ def _evaluate_temporal_call(
             result[valid] = np.where(
                 finite_through_sample[indices], result[valid], np.nan
             )
+        context.temporal_inputs_finite[:] &= np.isfinite(result)
+        return result
+
+    if function_name == "derivative":
+        # Backward difference on the source's own timebase, then held onto
+        # the output grid via zero-order hold, matching integral()'s timebase
+        # discipline. Unlike integral(), this is local, not cumulative: a
+        # plain elementwise diff means a non-finite sample poisons only the
+        # two intervals touching it, not everything downstream, so this does
+        # not use integral()'s np.logical_and.accumulate approach.
+        source_derivative = np.full(source_values.size, np.nan, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            source_derivative[1:] = np.diff(source_values) / np.diff(source_timestamps)
+
+        source_indices = np.searchsorted(
+            source_timestamps, context.grid, side="right"
+        ) - 1
+        valid = source_indices >= 0
+        result[valid] = source_derivative[source_indices[valid]]
         context.temporal_inputs_finite[:] &= np.isfinite(result)
         return result
 
