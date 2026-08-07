@@ -233,6 +233,133 @@ def test_rolling_sum_recovers_after_nan_leaves_the_window():
     )
 
 
+_ROLLING_FIXTURE_TIMESTAMPS = [0.0, 0.5, 2.0, 5.0]
+_ROLLING_FIXTURE_VALUES = [1.0, 2.0, 3.0, 4.0]
+
+
+def _rolling_sources(key: str = "CH1::M::X") -> dict[str, SignalSeries]:
+    return {
+        key: _series(key, _ROLLING_FIXTURE_TIMESTAMPS, _ROLLING_FIXTURE_VALUES)
+    }
+
+
+@pytest.mark.parametrize("sample_count", [1, 2, 3, 4])
+def test_rolling_mean_matches_rolling_sum_over_the_same_window(sample_count):
+    key = "CH1::M::X"
+    rolling_sources = _rolling_sources(key)
+
+    summed = calculate_series(
+        CalculatedSignalDefinition("S", f"rolling_sum(`{key}`, {sample_count})"),
+        rolling_sources,
+    ).numpy_values()
+    averaged = calculate_series(
+        CalculatedSignalDefinition("M", f"rolling_mean(`{key}`, {sample_count})"),
+        rolling_sources,
+    ).numpy_values()
+
+    # Same window boundaries: the two agree everywhere the sum is defined, and
+    # are NaN in exactly the same places.
+    np.testing.assert_array_equal(np.isnan(summed), np.isnan(averaged))
+    finite = ~np.isnan(summed)
+    assert finite.any()
+    np.testing.assert_allclose(averaged[finite], summed[finite] / sample_count)
+
+
+def test_rolling_mean_leading_incomplete_window_is_nan():
+    key = "CH1::M::X"
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_mean(`{key}`, 3)"),
+        _rolling_sources(key),
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, 2.0, 3.0], equal_nan=True
+    )
+
+
+def test_rolling_mean_of_one_sample_is_the_identity():
+    key = "CH1::M::X"
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_mean(`{key}`, 1)"),
+        _rolling_sources(key),
+    )
+
+    np.testing.assert_allclose(result.numpy_values(), _ROLLING_FIXTURE_VALUES)
+
+
+def test_rolling_mean_window_larger_than_the_source_is_all_nan():
+    key = "CH1::M::X"
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_mean(`{key}`, 5)"),
+        _rolling_sources(key),
+    )
+
+    assert np.all(np.isnan(result.numpy_values()))
+
+
+def test_rolling_mean_recovers_after_nan_leaves_the_window():
+    key = "CH1::M::X"
+    rolling_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0], [1.0, np.nan, 3.0, 5.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Rolling", f"rolling_mean(`{key}`, 2)"),
+        rolling_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, np.nan, 4.0], equal_nan=True
+    )
+
+
+@pytest.mark.parametrize(
+    "rolling_values",
+    [
+        pytest.param(_ROLLING_FIXTURE_VALUES, id="all-finite"),
+        # A NaN in the source is the case that pins down alias resolution in
+        # _current_value_tokens: if the alias were not recognised as temporal,
+        # its argument would also be read as a current-grid value and the
+        # sample after the NaN would be masked instead of recovering.
+        pytest.param([1.0, np.nan, 3.0, 5.0], id="nan-in-source"),
+    ],
+)
+def test_rolling_avg_alias_produces_identical_output(rolling_values):
+    key = "CH1::M::X"
+    rolling_sources = {
+        key: _series(key, _ROLLING_FIXTURE_TIMESTAMPS, rolling_values)
+    }
+
+    canonical = calculate_series(
+        CalculatedSignalDefinition("M", f"rolling_mean(`{key}`, 2)"), rolling_sources
+    )
+    aliased = calculate_series(
+        CalculatedSignalDefinition("M", f"rolling_avg(`{key}`, 2)"), rolling_sources
+    )
+
+    np.testing.assert_allclose(
+        aliased.numpy_values(), canonical.numpy_values(), equal_nan=True
+    )
+    np.testing.assert_allclose(
+        aliased.numpy_timestamps(), canonical.numpy_timestamps()
+    )
+    # Not vacuous: the last window is past the NaN and must carry a value.
+    assert np.isfinite(aliased.numpy_values()[-1])
+
+
+def test_rolling_avg_alias_is_not_listed_as_a_separate_help_entry():
+    from core.calculated_signals import _FUNCTIONS, _lookup_function
+
+    # The alias resolves, but only the canonical name owns a registry entry —
+    # the Formula Help text is generated from _FUNCTIONS.values().
+    assert _lookup_function("rolling_avg") is _FUNCTIONS["rolling_mean"]
+    assert "rolling_avg" not in _FUNCTIONS
+    assert _FUNCTIONS["rolling_mean"].aliases == ("rolling_avg",)
+
+
 def test_integral_uses_zero_order_hold_on_irregular_timestamps():
     key = "CH1::M::X"
     temporal_sources = {
@@ -277,6 +404,132 @@ def test_integral_is_nan_from_the_first_nonfinite_source_sample():
 
     np.testing.assert_allclose(
         result.numpy_values(), [0.0, np.nan, np.nan], equal_nan=True
+    )
+
+
+def test_derivative_first_source_sample_is_nan():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0], [10.0, 20.0, 25.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, 5.0], equal_nan=True
+    )
+
+
+def test_derivative_is_nan_at_a_duplicate_source_timestamp():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 1.0, 2.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [0.0, 1.0, 2.0])
+    # dt == 0 at the duplicate timestamp; that interval is explicitly NaN,
+    # not a division-by-zero accident that happens to propagate.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, np.nan, 10.0], equal_nan=True
+    )
+
+
+def test_derivative_of_a_constant_signal_is_zero_after_the_first_sample():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0], [5.0, 5.0, 5.0, 5.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 0.0, 0.0, 0.0], equal_nan=True
+    )
+
+
+def test_derivative_of_a_ramp_gives_its_known_slope():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 9.0, 11.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 2.0, 2.0, 2.0, 2.0], equal_nan=True
+    )
+
+
+def test_derivative_nan_poisoning_is_local_and_the_tail_recovers():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(
+            key, [0.0, 1.0, 2.0, 3.0, 4.0], [10.0, 20.0, np.nan, 40.0, 50.0]
+        )
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    # Only the two intervals touching the bad sample (index 2) are NaN; the
+    # interval after it recovers, unlike integral()'s cumulative poisoning.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 10.0, np.nan, np.nan, 10.0], equal_nan=True
+    )
+
+
+def test_derivative_on_nonuniform_timestamps_gives_correct_per_interval_slopes():
+    key = "CH1::M::X"
+    temporal_sources = {
+        key: _series(key, [0.0, 0.5, 2.0, 5.0], [10.0, 20.0, 30.0, 40.0])
+    }
+
+    result = calculate_series(
+        CalculatedSignalDefinition("Derivative", f"derivative(`{key}`)"),
+        temporal_sources,
+    )
+
+    np.testing.assert_allclose(
+        result.numpy_values(),
+        [np.nan, 20.0, 20.0 / 3.0, 10.0 / 3.0],
+        equal_nan=True,
+    )
+
+
+def test_derivative_holds_zero_order_onto_the_union_grid_with_a_denser_signal():
+    x_key = "CH1::M::X"
+    clock_key = "CH1::M::Clock"
+    temporal_sources = {
+        x_key: _series(x_key, [0.0, 2.0, 4.0], [10.0, 20.0, 30.0]),
+        clock_key: _series(clock_key, [1.0, 3.0, 5.0], [0.0, 0.0, 0.0]),
+    }
+    definition = CalculatedSignalDefinition(
+        "Derivative", f"derivative(`{x_key}`) + (`{clock_key}` * 0)"
+    )
+
+    result = calculate_series(definition, temporal_sources)
+
+    np.testing.assert_allclose(result.numpy_timestamps(), [1.0, 2.0, 3.0, 4.0, 5.0])
+    # Held constant at 5.0 (the x-source's own per-interval slope) across the
+    # denser clock grid, not interpolated or partial like integral()'s hold.
+    np.testing.assert_allclose(
+        result.numpy_values(), [np.nan, 5.0, 5.0, 5.0, 5.0], equal_nan=True
     )
 
 
@@ -353,6 +606,11 @@ def test_diag_rejects_invalid_steps(formula, message):
         ("delay({x}, {x})", "single numeric value"),
         ("rolling_sum({x}, 0)", "greater than zero"),
         ("rolling_sum({x}, 1.5)", "whole number"),
+        ("rolling_mean({x}, 0)", "rolling_mean.. sample count must be greater than zero"),
+        ("rolling_mean({x}, -1)", "negative"),
+        ("rolling_mean({x}, 1.5)", "rolling_mean.. sample count must be a whole number"),
+        # The alias reports the canonical name, not the spelling that was used.
+        ("rolling_avg({x}, 0)", "rolling_mean.. sample count must be greater than zero"),
     ],
 )
 def test_temporal_functions_reject_invalid_offsets(formula, message):
